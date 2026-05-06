@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "YT Private Suite Ad-Blocker",
+  "version": "1.0",
+  "description": "Block YouTube ads for local viewing",
+  "permissions": [
+    "declarativeNetRequest",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*",
+    "*://*.googlevideo.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
