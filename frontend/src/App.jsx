@@ -2,6 +2,7 @@ import { Routes, Route, Link } from 'react-router-dom';
 import './App.css';
 import Downloader from './pages/Downloader';
 import Library from './pages/Library';
+import StudyMode from './pages/StudyMode';
 import { Youtube, Download, Library as LibraryIcon } from 'lucide-react';
 
 function App() {
@@ -32,6 +33,7 @@ function App() {
           <Route path="/" element={<Downloader />} />
           <Route path="/download" element={<Downloader />} />
           <Route path="/library" element={<Library />} />
+          <Route path="/watch/:filename" element={<StudyMode />} />
         </Routes>
       </main>
     </div>

@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react';
 import { PlayCircle, Download as DownloadIcon, Trash2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 
 const API_BASE = 'http://localhost:8000/api';
 
 export default function Library() {
   const [files, setFiles] = useState([]);
+  const navigate = useNavigate();
 
   const fetchFiles = async () => {
     try {
@@ -29,6 +31,10 @@ export default function Library() {
     }
   };
 
+  const handlePlay = (filename) => {
+    navigate(`/watch/${encodeURIComponent(filename)}`);
+  };
+
   return (
     <div className="library-container">
       <h2>Your Video Library</h2>
@@ -44,7 +50,7 @@ export default function Library() {
                 <p>{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
               </div>
               <div className="actions">
-                <button className="play-btn">
+                <button onClick={() => handlePlay(file.filename)} className="play-btn">
                   <PlayCircle size={20} />
                 </button>
                 <button onClick={() => handleDelete(file.filename)} className="delete-btn">
