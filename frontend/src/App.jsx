@@ -368,7 +368,7 @@ function SectionHeader({ title, subtitle, actions }) {
 }
 
 function AboutPage() {
-  const portraitUrl = `${API_BASE}/about/photo`;
+  const portraitUrl = '/sumit_image.png';
   const [portraitFailed, setPortraitFailed] = useState(false);
 
   return (
