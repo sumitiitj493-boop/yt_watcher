@@ -1,22 +1,49 @@
-import { useState, useRef } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import ReactPlayer from 'react-player';
-import axios from 'axios';
+import { API_BASE } from '../lib/api';
 
-const API_BASE = 'http://localhost:8000/api';
+const extractVideoId = (name) => {
+  const match = name.match(/\(([A-Za-z0-9_-]{11})\)/);
+  return match ? match[1] : '';
+};
+
+const cleanTitle = (name) => (
+  name
+    .replace(/\.[^.]+$/, '')
+    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
+    .trim()
+);
 
 export default function StudyMode() {
   const { filename } = useParams();
   const [notes, setNotes] = useState([]);
   const [currentNote, setCurrentNote] = useState('');
   const playerRef = useRef(null);
+  const audioRef = useRef(null);
+  const decodedFilename = useMemo(() => {
+    if (!filename) return '';
+    try {
+      return decodeURIComponent(filename);
+    } catch {
+      return filename;
+    }
+  }, [filename]);
+
+  const ext = useMemo(() => decodedFilename.split('.').pop()?.toLowerCase() || '', [decodedFilename]);
+  const isAudio = ext === 'mp3' || ext === 'm4a';
+  const title = useMemo(() => cleanTitle(decodedFilename), [decodedFilename]);
+  const videoId = useMemo(() => extractVideoId(decodedFilename), [decodedFilename]);
+  const mediaUrl = `${API_BASE}/stream/${encodeURIComponent(decodedFilename)}`;
 
   const handleAddNote = (e) => {
     e.preventDefault();
     if (!currentNote.trim()) return;
     
     // Get current time in seconds
-    const time = playerRef.current ? Math.floor(playerRef.current.getCurrentTime()) : 0;
+    const time = isAudio
+      ? Math.floor(audioRef.current?.currentTime || 0)
+      : Math.floor(playerRef.current?.getCurrentTime() || 0);
     
     const newNote = {
       id: Date.now(),
@@ -30,32 +57,54 @@ export default function StudyMode() {
   };
 
   const seekTo = (time) => {
-    if (playerRef.current) {
-      playerRef.current.seekTo(time, 'seconds');
+    if (isAudio && audioRef.current) {
+      audioRef.current.currentTime = time;
+      return;
     }
+    playerRef.current?.seekTo(time, 'seconds');
   };
 
   return (
     <div className="study-mode">
       <div className="player-section">
-        <h2>Now Watching: {filename}</h2>
-        <div className="player-wrapper">
-          <ReactPlayer
-            ref={playerRef}
-            url={`${API_BASE}/stream/${encodeURIComponent(filename)}`}
-            width="100%"
-            height="100%"
-            controls
-            playing
-            config={{
+        <h2>{isAudio ? `Now Playing: ${title}` : `Now Watching: ${title}`}</h2>
+        {isAudio ? (
+          <div className="audio-wrapper">
+            <div className="audio-cover">
+              {videoId ? (
+                <img
+                  src={`https://img.youtube.com/vi/${videoId}/hqdefault.jpg`}
+                  alt={title}
+                />
+              ) : (
+                <div className="audio-cover-fallback" />
+              )}
+            </div>
+            <audio
+              ref={audioRef}
+              src={mediaUrl}
+              controls
+            />
+          </div>
+        ) : (
+          <div className="player-wrapper">
+            <ReactPlayer
+              ref={playerRef}
+              url={mediaUrl}
+              width="100%"
+              height="100%"
+              controls
+              playing
+              config={{
                 file: {
-                    attributes: {
-                        controlsList: "nodownload"
-                    }
-                }
-            }}
-          />
-        </div>
+                  attributes: {
+                    controlsList: 'nodownload',
+                  },
+                },
+              }}
+            />
+          </div>
+        )}
       </div>
       
       <div className="notes-section">

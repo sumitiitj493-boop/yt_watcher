@@ -1,7 +1,14 @@
-import { useState } from 'react';
-import axios from 'axios';
+import { useEffect, useMemo, useState } from 'react';
+import { api, wsBase } from '../lib/api';
 
-const API_BASE = 'http://localhost:8000/api';
+const cleanTitle = (value) => (
+  value
+    .split(/[\\/]/)
+    .pop()
+    .replace(/\.[^.]+$/, '')
+    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
+    .trim()
+);
 
 export default function Downloader() {
   const [url, setUrl] = useState('');
@@ -10,13 +17,14 @@ export default function Downloader() {
   const [taskId, setTaskId] = useState(null);
   const [status, setStatus] = useState(null);
   const [ws, setWs] = useState(null);
+  const [downloadDir, setDownloadDir] = useState('');
 
   const startDownload = async (e) => {
     e.preventDefault();
     if (!url) return;
 
     try {
-      const res = await axios.post(`${API_BASE}/download`, { url, quality, format });
+      const res = await api.post('/download', { url, quality, format });
       const newTaskId = res.data.task_id;
       setTaskId(newTaskId);
       connectWebSocket(newTaskId);
@@ -28,7 +36,7 @@ export default function Downloader() {
 
   const connectWebSocket = (id) => {
     if (ws) ws.close();
-    const socket = new WebSocket(`ws://localhost:8000/api/ws/status/${id}`);
+    const socket = new WebSocket(`${wsBase}/ws/status/${id}`);
     
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -37,9 +45,57 @@ export default function Downloader() {
         socket.close();
       }
     };
+
+    socket.onerror = () => {
+      setStatus({ status: 'error', error: 'WebSocket error' });
+    };
     
     setWs(socket);
   };
+
+  const handleCancel = async () => {
+    if (!taskId) return;
+    try {
+      await api.post(`/cancel/${taskId}`);
+    } catch (err) {
+      console.error('Cancel failed:', err);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (ws) ws.close();
+    };
+  }, [ws]);
+
+  useEffect(() => {
+    if (status?.status !== 'completed' || downloadDir) return;
+    const fetchDir = async () => {
+      try {
+        const res = await api.get('/downloads/location');
+        setDownloadDir(res.data.path || '');
+      } catch (err) {
+        console.error('Failed to fetch download path:', err);
+      }
+    };
+    fetchDir();
+  }, [status, downloadDir]);
+
+  const percentValue = useMemo(() => {
+    if (Number.isFinite(status?.progress)) {
+      return Math.min(Math.max(status.progress, 0), 100);
+    }
+    if (!status?.percent) return 0;
+    const parsed = Number.parseFloat(status.percent);
+    return Number.isNaN(parsed) ? 0 : Math.min(Math.max(parsed, 0), 100);
+  }, [status]);
+
+  const percentLabel = useMemo(() => {
+    if (Number.isFinite(status?.progress)) {
+      return `${status.progress.toFixed(1)}%`;
+    }
+    return status?.percent || '0%';
+  }, [status]);
 
   return (
     <div className="downloader-container">
@@ -75,14 +131,36 @@ export default function Downloader() {
       {status && (
         <div className="status-container">
           <h3>Status: <span className="status-label">{status.status}</span></h3>
-          {status.title && <p><strong>Title:</strong> {status.title}</p>}
+          {status.title && <p><strong>Title:</strong> {cleanTitle(status.title)}</p>}
           {(status.status === 'downloading' || status.status === 'processing') && (
             <div className="progress-wrapper">
+              <div className="progress-bar">
+                <div className="progress-fill" style={{ width: `${percentValue}%` }} />
+              </div>
               <div className="progress-stats">
-                <span>{status.percent}</span>
+                <span>{percentLabel}</span>
                 {status.speed && <span>{status.speed}</span>}
                 {status.eta && <span>ETA: {status.eta}</span>}
               </div>
+            </div>
+          )}
+          {(status.status === 'downloading' || status.status === 'processing') && (
+            <button type="button" className="cancel-btn" onClick={handleCancel}>
+              Cancel Download
+            </button>
+          )}
+          {status.status === 'completed' && downloadDir && (
+            <div className="download-location">
+              <span>Saved in: {downloadDir}</span>
+              <button
+                type="button"
+                className="open-folder-btn"
+                onClick={() => {
+                  navigator.clipboard.writeText(downloadDir);
+                }}
+              >
+                Copy Folder Path
+              </button>
             </div>
           )}
           {status.error && <p className="error">{status.error}</p>}
