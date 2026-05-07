@@ -26,6 +26,10 @@ def _clean(value: str) -> str:
     return _ANSI.sub("", value).strip()
 
 
+def _normalize_quality(value: str) -> str:
+    return str(value).strip().lower().replace("p", "")
+
+
 def _resolve_downloaded_file(ydl, info: dict, format_ext: str) -> str:
     raw_filename = ydl.prepare_filename(info)
     final_path = Path(raw_filename)
@@ -51,6 +55,7 @@ def _persist_if_terminal(task_id: str) -> None:
         save_jobs(download_tasks)
 
 def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+    quality = _normalize_quality(quality)
     # Ensure we don't crash if the task wasn't pre-seeded; prefer any existing created_at
     created_at = download_tasks.get(task_id, {}).get("created_at", time.time())
     download_tasks[task_id] = {
@@ -105,26 +110,75 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             })
             _touch_task(task_id)
 
+    quality_map = {
+        "2160": (
+            "bestvideo[height>=2160][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=2160]+bestaudio/"
+            "315+140/"
+            "272+251/"
+            "bestvideo[height>=1080]+bestaudio/"
+            "bestvideo+bestaudio"
+        ),
+        "1440": (
+            "bestvideo[height>=1440][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=1440]+bestaudio/"
+            "308+140/"
+            "271+251/"
+            "bestvideo[height>=1080]+bestaudio/"
+            "bestvideo+bestaudio"
+        ),
+        "1080": (
+            "bestvideo[height>=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=1080]+bestaudio/"
+            "137+140/"
+            "248+251/"
+            "399+140/"
+            "bestvideo+bestaudio"
+        ),
+        "720": (
+            "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=720]+bestaudio/"
+            "136+140/"
+            "247+251/"
+            "398+140/"
+            "bestvideo+bestaudio"
+        ),
+        "480": (
+            "bestvideo[height>=480][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=480]+bestaudio/"
+            "135+140/"
+            "244+251/"
+            "bestvideo+bestaudio"
+        ),
+        "360": (
+            "bestvideo[height>=360][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height>=360]+bestaudio/"
+            "134+140/"
+            "243+251/"
+            "bestvideo+bestaudio"
+        ),
+        "240": (
+            "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=240]+bestaudio/"
+            "133+140/"
+            "242+251/"
+            "bestvideo+bestaudio"
+        ),
+        "144": (
+            "bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=144]+bestaudio/"
+            "160+140/"
+            "278+251/"
+            "bestvideo+bestaudio"
+        ),
+    }
+
     if format_ext == "mp3":
         format_string = "bestaudio/best"
-    elif quality == "best":
-        format_string = "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    elif format_ext == "mp4":
-        # Extract numeric height (e.g., "1080p" → "1080")
-        quality_value = quality.replace("p", "")
-        # MP4-optimized: prefer m4a audio, but allow any format with fallback
-        format_string = (
-            f"bestvideo[height<={quality_value}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={quality_value}]+bestaudio/"
-            f"best[height<={quality_value}]"
-        )
+    elif quality in ("best", ""):
+        format_string = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
     else:
-        # Non-MP4 format: numeric height extraction + flexible fallback
-        quality_value = quality.replace("p", "")
-        format_string = (
-            f"bestvideo[height<={quality_value}]+bestaudio/"
-            f"best[height<={quality_value}]"
-        )
+        format_string = quality_map.get(quality, "bestvideo+bestaudio")
 
     ydl_opts = {
         "format": format_string,
@@ -141,11 +195,6 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             "node": {},
         },
         "remote_components": ["ejs:github"],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web"],
-            },
-        },
         # Better defaults for public social sites
         "nocheckcertificate": False,
         "geo_bypass": True,
@@ -177,10 +226,9 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
             download_tasks[task_id]["title"] = info.get("title", "Unknown")
             download_tasks[task_id]["video_id"] = info.get("id")
-            ydl.download([url])
 
         if download_tasks[task_id].get("status") == "cancelled":
             return
@@ -209,6 +257,7 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
 
 async def initiate_download(url: str, quality: str = "best", format_ext: str = "mp4"):
+    quality = _normalize_quality(quality)
     # Deduplication: if an identical task (same url+quality+format) is already
     # active (not in terminal states), return its task_id instead of creating
     # a duplicate. This prevents multiple background downloads for the same
