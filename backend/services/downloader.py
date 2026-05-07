@@ -110,16 +110,21 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     elif quality == "best":
         format_string = "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best"
     elif format_ext == "mp4":
+        # Extract numeric height (e.g., "1080p" → "1080")
+        quality_value = quality.replace("p", "")
+        # MP4-optimized: prefer m4a audio, but allow any format with fallback
         format_string = (
-            # Try AVC first, then fall back to any available codec and merge later.
-            f"bestvideo[height<={quality}][ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={quality}]+bestaudio"
-            f"/bestvideo[height<={quality}]"
-            f"/best[height<={quality}]"
-            f"/best"
+            f"bestvideo[height<={quality_value}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={quality_value}]+bestaudio/"
+            f"best[height<={quality_value}]"
         )
     else:
-        format_string = f"bestvideo[height<={quality}]+bestaudio/best"
+        # Non-MP4 format: numeric height extraction + flexible fallback
+        quality_value = quality.replace("p", "")
+        format_string = (
+            f"bestvideo[height<={quality_value}]+bestaudio/"
+            f"best[height<={quality_value}]"
+        )
 
     ydl_opts = {
         "format": format_string,
