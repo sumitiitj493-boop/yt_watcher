@@ -8611,3 +8611,29 @@ PermissionError: [WinError 32] The process cannot access the file because it is 
 2026-05-07 20:56:20,398 INFO GET /api/downloads 200 10.68ms
 2026-05-07 20:56:20,419 INFO GET /api/files 200 4.07ms
 2026-05-07 20:56:20,425 INFO GET /api/files 200 5.53ms
+2026-05-07 20:56:22,407 INFO GET /api/downloads 200 10.14ms
+2026-05-07 20:56:22,410 INFO GET /api/files 200 4.16ms
+2026-05-07 20:56:26,475 INFO GET /api/downloads 200 8.72ms
+2026-05-07 20:56:26,487 INFO GET /api/files 200 6.58ms
+2026-05-07 20:56:26,500 INFO GET /api/downloads 200 13.11ms
+2026-05-07 20:56:26,501 INFO GET /api/files 200 14.33ms
+2026-05-07 20:56:28,492 INFO GET /api/downloads 200 10.66ms
+2026-05-07 20:56:28,493 INFO GET /api/files 200 3.04ms
+2026-05-07 20:56:30,529 INFO GET /api/downloads 200 8.08ms
+2026-05-07 20:56:30,536 INFO GET /api/files 200 2.17ms
+2026-05-07 20:56:52,388 INFO GET /api/downloads 200 15.72ms
+2026-05-07 20:56:52,394 INFO GET /api/downloads 200 14.71ms
+2026-05-07 20:56:52,396 INFO GET /api/files 200 9.05ms
+2026-05-07 20:56:52,397 INFO GET /api/files 200 9.53ms
+2026-05-07 20:56:52,488 INFO GET /api/stream/1 Minute Satisfying 4k 60fps hdr video ｜ Ultra Hd Graphics video (PZ4RqtRxNEY).mp4 206 4.11ms
+2026-05-07 20:59:40,336 INFO POST /api/social-download 200 14.98ms
+2026-05-07 20:59:40,453 INFO GET /api/downloads 200 14.13ms
+2026-05-07 20:59:42,624 INFO GET /api/downloads 200 6.56ms
+2026-05-07 20:59:42,633 INFO GET /api/files 200 5.17ms
+2026-05-07 20:59:44,629 INFO GET /api/downloads 200 9.32ms
+2026-05-07 20:59:44,640 INFO GET /api/files 200 3.43ms
+2026-05-07 20:59:48,678 INFO GET /api/files 200 2.86ms
+2026-05-07 20:59:48,690 INFO GET /api/downloads 200 7.95ms
+2026-05-07 20:59:48,716 INFO GET /api/files 200 16.90ms
+2026-05-07 20:59:48,717 INFO GET /api/downloads 200 17.90ms
+2026-05-07 20:59:51,946 INFO GET /api/stream/Video by marvel_shorts4k (CoFhrgLjp73).mp4 206 3.16ms

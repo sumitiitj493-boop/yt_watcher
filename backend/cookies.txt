@@ -15,3 +15,7 @@
 .youtube.com	TRUE	/	TRUE	0	SOCS	CAI
 .youtube.com	TRUE	/	TRUE	1778169353	GPS	1
 .youtube.com	TRUE	/	TRUE	0	YSC	Fcnzhtfs5tw
+.instagram.com	TRUE	/	TRUE	1812727783	csrftoken	sTVE5EGu1XFb0TLv7G36KUln9Surj39s
+.instagram.com	TRUE	/	TRUE	1812727782	mid	afyv5gALAAGQ8tVDVCT-jf0gpv55
+.instagram.com	TRUE	/	TRUE	1809703782	ig_did	E0932BF4-8572-49D2-8976-4E4CE92BF093
+.instagram.com	TRUE	/	TRUE	1809703782	ig_nrcb	1
