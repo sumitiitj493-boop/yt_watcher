@@ -1234,12 +1234,15 @@ export default function App() {
       const previousStatus = previousStatusesRef.current.get(item.task_id);
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
         if (!autoDownloadedRef.current.has(item.task_id)) {
-          const filename = item.filename;
-          const a = document.createElement('a');
-          a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
-          a.download = filename;
-          a.click();
-          autoDownloadedRef.current.add(item.task_id);
+          const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
+          if (isRecentlyCompleted) {
+            const filename = item.filename;
+            const a = document.createElement('a');
+            a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
+            a.download = filename;
+            a.click();
+            autoDownloadedRef.current.add(item.task_id);
+          }
         }
       }
       previousStatusesRef.current.set(item.task_id, item.status);
