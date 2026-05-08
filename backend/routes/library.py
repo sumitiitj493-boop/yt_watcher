@@ -90,15 +90,18 @@ async def delete_file(filename: str):
     try:
         file_path.unlink()
     except PermissionError:
-        # Try to force writable and remove as a fallback on Windows
         try:
             os.chmod(str(file_path), stat.S_IWRITE)
             file_path.unlink()
-        except PermissionError:
-            raise HTTPException(
-                status_code=409,
-                detail={"message": "File is currently in use. Stop playback and try again.", "filename": filename},
-            )
+        except Exception:
+            import subprocess
+
+            subprocess.run(["cmd", "/c", "del", "/f", str(file_path)], capture_output=True)
+            if file_path.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Stop playback first then try again.", "filename": filename},
+                )
     _files_cache["ts"] = 0.0
     return {"message": "Deleted"}
 
