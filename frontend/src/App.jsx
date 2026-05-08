@@ -149,6 +149,9 @@ function isMediaFile(filename = '') {
   return isAudioExt(ext) || isVideoExt(ext);
 }
 
+// Module-level mobile detection so components defined above `App` can use it
+const isMobileDevice = (typeof navigator !== 'undefined') && /Android|iPhone|iPad|iPod|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
+
 function safeFetchError(error, fallback) {
   return error?.response?.data?.detail || error?.response?.data?.error?.message || error?.message || fallback;
 }
@@ -1178,10 +1181,7 @@ export default function App() {
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
   const autoDownloadedRef = useRef(new Set());
-  const isMobileDevice = useMemo(() => {
-    if (typeof navigator === 'undefined') return false;
-    return /Android|iPhone|iPad|iPod|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
-  }, []);
+  // use module-level `isMobileDevice` defined above so components declared earlier can reference it
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
   const pushToast = useCallback((message, type = 'info', duration = 3600) => {
