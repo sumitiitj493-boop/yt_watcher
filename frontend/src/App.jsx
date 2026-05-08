@@ -655,6 +655,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
               {submitting ? 'Processing…' : 'Process Link'}
             </button>
+
+            <p className="field__help field__help--inline">
+              {isMobileDevice
+                ? 'On phone, the file will appear in Library after processing. Use the Download button to save it to your device.'
+                : 'On desktop, the file auto-downloads once processing finishes, and also appears in Library.'}
+            </p>
           </form>
         </section>
       )}
@@ -719,7 +725,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
         <div className="panel__header">
           <div>
             <h2 className="panel__title">Active Downloads</h2>
-            <p className="panel__subtitle">Live progress, ETA, and cancel controls.</p>
+            <p className="panel__subtitle">
+              Live progress, ETA, and cancel controls.
+              {isMobileDevice
+                ? ' On phones, downloads are manual to avoid browser save issues.'
+                : ' Desktop downloads save automatically when finished.'}
+            </p>
           </div>
           <span className="panel__badge">{activeDownloads.length}</span>
         </div>
