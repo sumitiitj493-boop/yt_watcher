@@ -1177,7 +1177,9 @@ export default function App() {
   const [downloads, setDownloads] = useState([]);
   const [files, setFiles] = useState([]);
   const [toasts, setToasts] = useState([]);
+  const [downloadNotification, setDownloadNotification] = useState(null);
   const toastTimers = useRef([]);
+  const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
   // use module-level `isMobileDevice` defined above so components declared earlier can reference it
@@ -1258,11 +1260,34 @@ export default function App() {
 
     for (const item of downloads) {
       const previousStatus = previousStatusesRef.current.get(item.task_id);
+
+      // update notification UI if this is the task we're tracking
+      if (downloadNotification && item.task_id === downloadNotification.taskId) {
+        const progress = Number.isFinite(item.progress)
+          ? Number(item.progress)
+          : Number.parseFloat(String(item.percent || '0').replace('%', '')) || 0;
+        setDownloadNotification((prev) => prev ? ({ ...prev, filename: item.filename || prev.filename, progress, status: item.status }) : prev);
+
+        if (item.status === 'completed' && item.filename && !notifiedDownloadedRef.current.has(item.task_id)) {
+          notifiedDownloadedRef.current.add(item.task_id);
+          try {
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = `${API_BASE}/files/download/${encodeURIComponent(item.filename)}`;
+            a.download = item.filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { try { document.body.removeChild(a); } catch (e) {} }, 1000);
+          } catch (e) {
+            console.warn('download notification failed to trigger browser save', e);
+          }
+          setTimeout(() => setDownloadNotification(null), 1500);
+        }
+      }
+
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
         const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
         if (isRecentlyCompleted) {
-          // Do NOT trigger any browser download or programmatic click.
-          // Instead show a success toast and, on desktop, redirect to Library after 2s.
           pushToast('Video saved to your PC Library', 'success', 4000);
           if (!isMobileDevice) {
             setTimeout(() => {
@@ -1271,9 +1296,10 @@ export default function App() {
           }
         }
       }
+
       previousStatusesRef.current.set(item.task_id, item.status);
     }
-  }, [downloads, isMobileDevice]);
+  }, [downloads, isMobileDevice, downloadNotification]);
 
   const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
 
@@ -1285,6 +1311,10 @@ export default function App() {
       const res = await api.post('/download', { url, quality, format });
       const tid = res?.data?.task_id;
       if (tid) setCurrentTaskId(tid);
+      if (tid) {
+        setDownloadNotification({ taskId: tid, filename: null, progress: 0, status: 'starting' });
+        notifiedDownloadedRef.current.delete(tid);
+      }
       pushToast('Download started', 'success');
       await refreshDownloads();
     } catch (error) {
@@ -1445,6 +1475,27 @@ export default function App() {
         </Routes>
       </main>
 
+      {downloadNotification ? (
+        <div className="download-notification" style={{ position: 'fixed', right: 20, top: 20, zIndex: 9999, width: 320 }}>
+          <div className="panel panel--tiny">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontWeight: 600 }}>{downloadNotification.filename || 'Preparing…'}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>{downloadNotification.status}</div>
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <ProgressBar value={downloadNotification.progress || 0} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+              <button className="ghost-button" type="button" onClick={() => { setDownloadNotification(null); }}>
+                Close
+              </button>
+              <button className="ghost-button" type="button" onClick={() => { if (downloadNotification?.taskId) cancelDownload(downloadNotification.taskId); }} style={{ marginLeft: 8 }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <ToastStack toasts={toasts} />
     </div>
   );
