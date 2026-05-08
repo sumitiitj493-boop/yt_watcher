@@ -112,64 +112,46 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
     quality_map = {
         "2160": (
-            "bestvideo[height>=2160][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=2160]+bestaudio/"
-            "315+140/"
-            "272+251/"
-            "bestvideo[height>=1080]+bestaudio/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=2160]+bestaudio"
+            "/best[height<=2160]"
+            "/best"
         ),
         "1440": (
-            "bestvideo[height>=1440][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=1440]+bestaudio/"
-            "308+140/"
-            "271+251/"
-            "bestvideo[height>=1080]+bestaudio/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1440]+bestaudio"
+            "/best[height<=1440]"
+            "/best"
         ),
         "1080": (
-            "bestvideo[height>=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=1080]+bestaudio/"
-            "137+140/"
-            "248+251/"
-            "399+140/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080]+bestaudio"
+            "/best[height<=1080]"
+            "/best"
         ),
         "720": (
-            "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=720]+bestaudio/"
-            "136+140/"
-            "247+251/"
-            "398+140/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=720]+bestaudio"
+            "/best[height<=720]"
+            "/best"
         ),
         "480": (
-            "bestvideo[height>=480][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=480]+bestaudio/"
-            "135+140/"
-            "244+251/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=480]+bestaudio"
+            "/best[height<=480]"
+            "/best"
         ),
         "360": (
-            "bestvideo[height>=360][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=360]+bestaudio/"
-            "134+140/"
-            "243+251/"
-            "bestvideo+bestaudio"
-        ),
-        "240": (
-            "bestvideo[height<=240][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=240]+bestaudio/"
-            "133+140/"
-            "242+251/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=360]+bestaudio"
+            "/best[height<=360]"
+            "/best"
         ),
         "144": (
-            "bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=144]+bestaudio/"
-            "160+140/"
-            "278+251/"
-            "bestvideo+bestaudio"
+            "bestvideo[height<=144][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=144]+bestaudio"
+            "/best[height<=144]"
+            "/best"
         ),
     }
 
@@ -178,13 +160,16 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     elif quality in ("best", ""):
         format_string = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
     else:
-        format_string = quality_map.get(quality, "bestvideo+bestaudio")
+        format_string = quality_map.get(
+            quality,
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        )
 
     ydl_opts = {
         "format": format_string,
         "outtmpl": (DOWNLOAD_DIR / "%(title)s (%(id)s).%(ext)s").as_posix(),
         "progress_hooks": [hook],
-        "quiet": False,
+        "quiet": True,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
