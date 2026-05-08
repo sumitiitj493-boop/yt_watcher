@@ -1166,6 +1166,7 @@ export default function App() {
   const toastTimers = useRef([]);
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
+  const autoDownloadedRef = useRef(new Set());
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
   const pushToast = useCallback((message, type = 'info', duration = 3600) => {
@@ -1232,11 +1233,14 @@ export default function App() {
     for (const item of downloads) {
       const previousStatus = previousStatusesRef.current.get(item.task_id);
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
-        const filename = item.filename;
-        const a = document.createElement('a');
-        a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
-        a.download = filename;
-        a.click();
+        if (!autoDownloadedRef.current.has(item.task_id)) {
+          const filename = item.filename;
+          const a = document.createElement('a');
+          a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
+          a.download = filename;
+          a.click();
+          autoDownloadedRef.current.add(item.task_id);
+        }
       }
       previousStatusesRef.current.set(item.task_id, item.status);
     }
