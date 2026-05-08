@@ -836,6 +836,29 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const [query, setQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
+  const videoRef = useRef(null);
+
+  const releasePreviewPlayers = useCallback(async () => {
+    try {
+      const video = videoRef.current;
+      if (video) {
+        video.pause();
+        video.removeAttribute('src');
+        try { video.load(); } catch (e) { /* ignore */ }
+      }
+
+      document.querySelectorAll('audio').forEach((audio) => {
+        audio.pause();
+        audio.removeAttribute('src');
+        try { audio.load(); } catch (e) { /* ignore */ }
+      });
+
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+    } catch (error) {
+      // ignore UI cleanup errors
+    }
+  }, []);
 
   useEffect(() => {
     if (mediaFiles.length === 0) {
@@ -870,7 +893,6 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const previewThumbUrl = previewFile?.video_id ? `https://img.youtube.com/vi/${previewFile.video_id}/hqdefault.jpg` : '';
 
   // generate a thumbnail from the video's first frame when no external thumbnail is available
-  const videoRef = useRef(null);
   const [generatedThumb, setGeneratedThumb] = useState('');
 
   useEffect(() => {
@@ -934,11 +956,11 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
     const deletingPreview = previewFile?.filename === filename;
     if (deletingPreview) {
       setSelectedFile(null);
-      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await releasePreviewPlayers();
     }
 
     await onDeleteFile(filename);
-  }, [filtered, mediaFiles, onDeleteFile, previewFile?.filename]);
+  }, [onDeleteFile, previewFile?.filename, releasePreviewPlayers]);
 
   return (
     <div className="page-shell">
@@ -958,25 +980,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                 onClick={async () => {
                   const ok = window.confirm('Are you sure you want to delete ALL files? This cannot be undone.');
                   if (!ok) return;
-                  // Pause and release any active preview players to allow file deletion on Windows
-                  try {
-                    const video = videoRef?.current;
-                    if (video) {
-                      video.pause();
-                      video.removeAttribute('src');
-                      try { video.load(); } catch (e) { /* ignore */ }
-                    }
-                    // stop any audio players as well
-                    document.querySelectorAll('audio').forEach((a) => {
-                      a.pause();
-                      a.removeAttribute('src');
-                      try { a.load(); } catch (e) { /* ignore */ }
-                    });
-                    // Give the browser a moment to release file handles
-                    await new Promise((r) => setTimeout(r, 200));
-                  } catch (e) {
-                    // ignore UI errors
-                  }
+                  await releasePreviewPlayers();
                   await onClearFiles();
                 }}
               >
