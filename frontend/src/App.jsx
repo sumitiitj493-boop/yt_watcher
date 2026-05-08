@@ -835,6 +835,8 @@ function HistoryPage({ downloads, onDeleteDownload, onRetryDownload, onCancelDow
 function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist }) {
   const [query, setQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
+  const [suppressedPreviewFilename, setSuppressedPreviewFilename] = useState('');
+  const [isClearingAll, setIsClearingAll] = useState(false);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
   const videoRef = useRef(null);
 
@@ -885,7 +887,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
 
   const previewFile = selectedFile && filtered.some((file) => file.filename === selectedFile.filename)
     ? selectedFile
-    : filtered[0] || null;
+    : (isClearingAll ? null : filtered.find((file) => file.filename !== suppressedPreviewFilename) || null);
 
   const previewUrl = previewFile ? `${API_BASE}/stream/${encodeURIComponent(previewFile.filename)}` : '';
   const previewExt = previewFile ? mediaExt(previewFile.filename) : '';
@@ -955,11 +957,16 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const handleDeleteFile = useCallback(async (filename) => {
     const deletingPreview = previewFile?.filename === filename;
     if (deletingPreview) {
+      setSuppressedPreviewFilename(filename);
       setSelectedFile(null);
       await releasePreviewPlayers();
     }
 
-    await onDeleteFile(filename);
+    try {
+      await onDeleteFile(filename);
+    } finally {
+      setSuppressedPreviewFilename('');
+    }
   }, [onDeleteFile, previewFile?.filename, releasePreviewPlayers]);
 
   return (
@@ -980,8 +987,16 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                 onClick={async () => {
                   const ok = window.confirm('Are you sure you want to delete ALL files? This cannot be undone.');
                   if (!ok) return;
+                  setIsClearingAll(true);
+                  setSuppressedPreviewFilename(previewFile?.filename || '');
+                  setSelectedFile(null);
                   await releasePreviewPlayers();
-                  await onClearFiles();
+                  try {
+                    await onClearFiles();
+                  } finally {
+                    setSuppressedPreviewFilename('');
+                    setIsClearingAll(false);
+                  }
                 }}
               >
                 <Trash2 size={16} />
