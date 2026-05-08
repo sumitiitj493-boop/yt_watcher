@@ -1145,6 +1145,8 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [toasts, setToasts] = useState([]);
   const toastTimers = useRef([]);
+  const previousStatusesRef = useRef(new Map());
+  const statusTrackerReadyRef = useRef(false);
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
   const pushToast = useCallback((message, type = 'info', duration = 3600) => {
@@ -1200,6 +1202,26 @@ export default function App() {
       window.clearInterval(downloadTimer);
     };
   }, [activeDownloadCount, refreshDownloads, refreshFiles]);
+
+  useEffect(() => {
+    if (!statusTrackerReadyRef.current) {
+      previousStatusesRef.current = new Map(downloads.map((item) => [item.task_id, item.status]));
+      statusTrackerReadyRef.current = true;
+      return;
+    }
+
+    for (const item of downloads) {
+      const previousStatus = previousStatusesRef.current.get(item.task_id);
+      if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
+        const filename = item.filename;
+        const a = document.createElement('a');
+        a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
+        a.download = filename;
+        a.click();
+      }
+      previousStatusesRef.current.set(item.task_id, item.status);
+    }
+  }, [downloads]);
 
   const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
 
