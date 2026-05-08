@@ -1,23 +1,9 @@
 @echo off
-echo Starting YT Suite...
-timeout /t 15 /nobreak >nul
+echo Starting local backend only (Cloudflare disabled)...
 
-:: Vercel token is read from the permanent Windows environment variable
-if not defined VERCEL_TOKEN (
-	echo VERCEL_TOKEN is not set. Open a new terminal after setting it permanently.
-	pause
-	exit /b 1
-)
-
-:: Start Backend
 cd /d D:\semesters\sem4\projects\yt_watcher\backend
-start "YT Backend" cmd /k "C:\Users\HP\anaconda3\Scripts\activate.bat base && uvicorn main:app --host 0.0.0.0 --port 8000"
+call C:\Users\HP\anaconda3\Scripts\activate.bat base
 
-timeout /t 8 /nobreak >nul
-
-:: Start Auto Tunnel
-cd /d D:\semesters\sem4\projects\yt_watcher
-start "YT Tunnel" cmd /k "if defined VERCEL_TOKEN set VERCEL_TOKEN=%VERCEL_TOKEN% && C:\Users\HP\anaconda3\Scripts\activate.bat base && python auto_tunnel.py"
-
-echo Done! App ready in ~2 minutes.
-pause
+echo Running FastAPI on http://127.0.0.1:8000
+echo Press Ctrl+C to stop.
+uvicorn main:app --host 127.0.0.1 --port 8000

@@ -47,3 +47,16 @@ That keeps the app private on your machine while still giving you a public URL.
 ## Important note
 
 Do not scale the backend to multiple replicas unless you move download state out of memory and into a shared store. The current code keeps job status in process memory.
+
+## Local backend only mode (no Cloudflare)
+
+If you want to run without Cloudflare tunnels:
+
+1. Run `start_everything.bat`.
+2. This starts only the local backend at `http://127.0.0.1:8000`.
+3. No scheduler, no auto tunnel process, no extra tunnel terminal.
+
+Note:
+
+- A hosted HTTPS frontend (for example Vercel) cannot reliably call a local HTTP backend because of browser security and network visibility limits.
+- For local backend testing, use a local frontend/dev server on your machine, or deploy backend to a public HTTPS host.
