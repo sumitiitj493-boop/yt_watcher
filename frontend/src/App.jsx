@@ -25,6 +25,7 @@ import {
 import './App.css';
 import { api, API_BASE } from './lib/api';
 import StudyMode from './pages/StudyMode';
+import PlaylistPage from './pages/Playlist';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
@@ -307,7 +308,7 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
   );
 }
 
-function FileCard({ file, active, onSelect, onDelete }) {
+function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist }) {
   const title = file.title || cleanTitle(file.filename || 'Unknown file');
   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
@@ -327,7 +328,10 @@ function FileCard({ file, active, onSelect, onDelete }) {
           <a className="icon-button" href={downloadUrl} download title="Download file" onClick={(event) => event.stopPropagation()}>
             <Download size={15} />
           </a>
-          <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => { event.stopPropagation(); window.fetch(`${API_BASE}/playlist/add/${encodeURIComponent(file.filename)}`, { method: 'POST' }).then(() => { window.alert('Added to playlist'); }).catch(() => { window.alert('Failed to add to playlist'); }); }}>
+          <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => {
+            event.stopPropagation();
+            onAddToPlaylist?.(file.filename);
+          }}>
             <Plus size={15} />
           </button>
           <button className="icon-button icon-button--danger" type="button" title="Delete file" onClick={(event) => {
@@ -828,7 +832,7 @@ function HistoryPage({ downloads, onDeleteDownload, onRetryDownload, onCancelDow
   );
 }
 
-function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
+function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist }) {
   const [query, setQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
@@ -1071,6 +1075,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
                 active={selectedFile?.filename === file.filename}
                 onSelect={setSelectedFile}
                 onDelete={handleDeleteFile}
+                onAddToPlaylist={onAddToPlaylist}
                 compact
               />
             ))}
@@ -1118,6 +1123,11 @@ function Sidebar({ downloads, files, storageBytes }) {
           <span>Library</span>
           {files.length > 0 ? <span className="nav-link__badge">{files.length}</span> : null}
         </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/playlist" end>
+          <Music2 size={18} />
+          <span>Playlist</span>
+        </NavLink>
       </nav>
 
       <div className="sidebar__footer">
@@ -1137,12 +1147,12 @@ export default function App() {
   const toastTimers = useRef([]);
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
-  const pushToast = useCallback((message, type = 'info') => {
+  const pushToast = useCallback((message, type = 'info', duration = 3600) => {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     setToasts((current) => [...current, { id, message, type }].slice(-4));
     const timer = window.setTimeout(() => {
       setToasts((current) => current.filter((toast) => toast.id !== id));
-    }, 3600);
+    }, duration);
     toastTimers.current.push(timer);
   }, []);
 
@@ -1282,6 +1292,16 @@ export default function App() {
     }
   }, [pushToast, refreshFiles]);
 
+  const addToPlaylist = useCallback(async (filename) => {
+    if (!filename) return;
+    try {
+      await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
+      pushToast('Added to playlist', 'success', 2000);
+    } catch (error) {
+      pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
+    }
+  }, [pushToast]);
+
   const navigate = useNavigate();
 
   const openDownloadFromHistory = useCallback(({ url, quality = 'best', format = 'mp4' }) => {
@@ -1344,7 +1364,8 @@ export default function App() {
           <Route path="/about" element={<AboutPage />} />
           <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
-          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} />} />
+          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
           <Route path="/watch/:filename" element={<StudyMode />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
         </Routes>
