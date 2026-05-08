@@ -10,6 +10,8 @@ VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN", "")
 PROJECT_ID = "prj_E55zGt0GxM2iLtBNuGcMnPishXXP"
 ENV_VAR_ID = "JPyRcS55y3qwpaGW"
 CLOUDFLARED_PATH = "C:\\Users\\HP\\cloudflared.exe"
+CLOUDFLARED_TUNNEL_NAME = os.environ.get("CLOUDFLARED_TUNNEL_NAME", "")
+CLOUDFLARED_PUBLIC_URL = os.environ.get("CLOUDFLARED_PUBLIC_URL", "")
 
 
 def update_vercel(url):
@@ -53,7 +55,30 @@ def update_vercel(url):
     return True
 
 
+def start_named_tunnel():
+    if not CLOUDFLARED_TUNNEL_NAME or not CLOUDFLARED_PUBLIC_URL:
+        return False
+
+    print(f"Starting Cloudflare named tunnel: {CLOUDFLARED_TUNNEL_NAME}...")
+    process = subprocess.Popen(
+        [CLOUDFLARED_PATH, "tunnel", "run", CLOUDFLARED_TUNNEL_NAME],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    print(f"\nGot URL: {CLOUDFLARED_PUBLIC_URL}")
+    update_vercel(CLOUDFLARED_PUBLIC_URL)
+    print("\nTunnel running. Keeping alive...")
+    process.wait()
+    return True
+
+
 def start_tunnel():
+    if start_named_tunnel():
+        return
+
     print("Starting Cloudflare tunnel...")
     process = subprocess.Popen(
         [CLOUDFLARED_PATH, "tunnel", "--url", "http://localhost:8000"],
