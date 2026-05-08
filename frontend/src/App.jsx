@@ -1264,11 +1264,35 @@ export default function App() {
           const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
           if (isRecentlyCompleted) {
             const filename = item.filename;
-            const a = document.createElement('a');
-            a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
-            a.download = filename;
-            a.click();
+            const ext = mediaExt(filename || '');
+
+            // Mark as handled immediately to avoid double triggers
             autoDownloadedRef.current.add(item.task_id);
+
+            try {
+              // If it's an audio file, open the stream URL in a new tab so the browser will play it
+              if (isAudioExt(ext)) {
+                const streamUrl = `${API_BASE}/stream/${encodeURIComponent(filename)}`;
+                window.open(streamUrl, '_blank', 'noopener');
+              } else {
+                // For other media, trigger a download via a temporary hidden anchor element
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.setAttribute('data-auto-download', '1');
+                a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
+                a.download = filename;
+                document.body.appendChild(a);
+                // clicking programmatically
+                a.click();
+                // cleanup
+                setTimeout(() => {
+                  try { document.body.removeChild(a); } catch (e) { /* ignore */ }
+                }, 1000);
+              }
+            } catch (err) {
+              // if something goes wrong, ensure we don't repeatedly attempt
+              console.warn('auto-download failed', err);
+            }
           }
         }
       }
