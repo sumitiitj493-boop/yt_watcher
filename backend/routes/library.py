@@ -25,18 +25,37 @@ def _get_cached_files() -> list[dict]:
     if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
         return _files_cache["data"]
 
+    # Patterns to exclude from library
+    EXCLUDE_SUFFIXES = {".part", ".temp", ".ytdl", ".json"}
+    EXCLUDE_PATTERNS = [".f399.", ".f137.", ".f248.", ".f251.", ".temp."]
+
     file_list = []
     for file_path in DOWNLOAD_DIR.iterdir():
-        if file_path.is_file() and file_path.suffix.lower().lstrip(".") in MEDIA_EXTENSIONS:
-            stat = file_path.stat()
-            file_list.append({
-                "filename": file_path.name,
-                "title": clean_title(file_path.name),
-                "video_id": extract_video_id(file_path.name),
-                "size": stat.st_size,
-                "created_at": stat.st_mtime,
-                "ext": file_path.suffix.lower().lstrip("."),
-            })
+        # Skip non-files
+        if not file_path.is_file():
+            continue
+        # Skip partial/temp/json files
+        if file_path.suffix.lower() in EXCLUDE_SUFFIXES:
+            continue
+        # Skip intermediate stream files like .f399.mp4
+        if any(p in file_path.name for p in EXCLUDE_PATTERNS):
+            continue
+        # Skip non-media files
+        if file_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
+            continue
+        # Skip very small files (likely corrupted/partial) under 100KB
+        if file_path.stat().st_size < 102400:
+            continue
+
+        stat_info = file_path.stat()
+        file_list.append({
+            "filename": file_path.name,
+            "title": clean_title(file_path.name),
+            "video_id": extract_video_id(file_path.name),
+            "size": stat_info.st_size,
+            "created_at": stat_info.st_mtime,
+            "ext": file_path.suffix.lower().lstrip("."),
+        })
 
     file_list = sorted(
         file_list,
@@ -125,6 +144,16 @@ async def clear_files():
     deleted = 0
     for file_path in list(DOWNLOAD_DIR.iterdir()):
         if not file_path.is_file():
+            continue
+
+        EXCLUDE_SUFFIXES = {".part", ".temp", ".ytdl", ".json"}
+        EXCLUDE_PATTERNS = [".f399.", ".f137.", ".f248.", ".f251.", ".temp."]
+
+        # Skip partial/temp/json files
+        if file_path.suffix.lower() in EXCLUDE_SUFFIXES:
+            continue
+        # Skip intermediate stream files like .f399.mp4
+        if any(p in file_path.name for p in EXCLUDE_PATTERNS):
             continue
         if file_path.suffix.lower().lstrip('.') not in MEDIA_EXTENSIONS:
             continue
