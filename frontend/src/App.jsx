@@ -1167,6 +1167,10 @@ export default function App() {
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
   const autoDownloadedRef = useRef(new Set());
+  const isMobileDevice = useMemo(() => {
+    if (typeof navigator === 'undefined') return false;
+    return /Android|iPhone|iPad|iPod|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
+  }, []);
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
   const pushToast = useCallback((message, type = 'info', duration = 3600) => {
@@ -1224,6 +1228,18 @@ export default function App() {
   }, [activeDownloadCount, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
+    if (isMobileDevice) {
+      if (!statusTrackerReadyRef.current) {
+        previousStatusesRef.current = new Map(downloads.map((item) => [item.task_id, item.status]));
+        statusTrackerReadyRef.current = true;
+      } else {
+        for (const item of downloads) {
+          previousStatusesRef.current.set(item.task_id, item.status);
+        }
+      }
+      return;
+    }
+
     if (!statusTrackerReadyRef.current) {
       previousStatusesRef.current = new Map(downloads.map((item) => [item.task_id, item.status]));
       statusTrackerReadyRef.current = true;
@@ -1247,7 +1263,7 @@ export default function App() {
       }
       previousStatusesRef.current.set(item.task_id, item.status);
     }
-  }, [downloads]);
+  }, [downloads, isMobileDevice]);
 
   const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
 
