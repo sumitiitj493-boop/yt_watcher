@@ -662,7 +662,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
             <p className="field__help field__help--inline">
               {isMobileDevice
                 ? 'On phone, the file will appear in Library after processing. Use the Download button to save it to your device.'
-                : 'On desktop, the file auto-downloads once processing finishes, and also appears in Library.'}
+                : 'Video saved to your PC Library.'}
             </p>
           </form>
         </section>
@@ -732,7 +732,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               Live progress, ETA, and cancel controls.
               {isMobileDevice
                 ? ' On phones, downloads are manual to avoid browser save issues.'
-                : ' Desktop downloads save automatically when finished.'}
+                : ' Video saved to your PC Library.'}
             </p>
           </div>
           <span className="panel__badge">{activeDownloads.length}</span>
@@ -1180,7 +1180,6 @@ export default function App() {
   const toastTimers = useRef([]);
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
-  const autoDownloadedRef = useRef(new Set());
   // use module-level `isMobileDevice` defined above so components declared earlier can reference it
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
@@ -1260,39 +1259,15 @@ export default function App() {
     for (const item of downloads) {
       const previousStatus = previousStatusesRef.current.get(item.task_id);
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
-        if (!autoDownloadedRef.current.has(item.task_id)) {
-          const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
-          if (isRecentlyCompleted) {
-            const filename = item.filename;
-            const ext = mediaExt(filename || '');
-
-            // Mark as handled immediately to avoid double triggers
-            autoDownloadedRef.current.add(item.task_id);
-
-            try {
-              // If it's an audio file, open the stream URL in a new tab so the browser will play it
-              if (isAudioExt(ext)) {
-                const streamUrl = `${API_BASE}/stream/${encodeURIComponent(filename)}`;
-                window.open(streamUrl, '_blank', 'noopener');
-              } else {
-                // For other media, trigger a download via a temporary hidden anchor element
-                const a = document.createElement('a');
-                a.style.display = 'none';
-                a.setAttribute('data-auto-download', '1');
-                a.href = `${API_BASE}/files/download/${encodeURIComponent(filename)}`;
-                a.download = filename;
-                document.body.appendChild(a);
-                // clicking programmatically
-                a.click();
-                // cleanup
-                setTimeout(() => {
-                  try { document.body.removeChild(a); } catch (e) { /* ignore */ }
-                }, 1000);
-              }
-            } catch (err) {
-              // if something goes wrong, ensure we don't repeatedly attempt
-              console.warn('auto-download failed', err);
-            }
+        const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
+        if (isRecentlyCompleted) {
+          // Do NOT trigger any browser download or programmatic click.
+          // Instead show a success toast and, on desktop, redirect to Library after 2s.
+          pushToast('Video saved to your PC Library', 'success', 4000);
+          if (!isMobileDevice) {
+            setTimeout(() => {
+              try { navigate('/library'); } catch (e) { /* ignore */ }
+            }, 2000);
           }
         }
       }
