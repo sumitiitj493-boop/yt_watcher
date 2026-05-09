@@ -15,6 +15,31 @@ from services.database import init_db
 
 app = FastAPI(title="YT Private Suite API")
 
+
+def _load_local_env_file() -> None:
+    env_candidates = [
+        Path(__file__).resolve().parent.parent / ".env",
+        Path(__file__).resolve().parent / ".env",
+    ]
+
+    for env_path in env_candidates:
+        if not env_path.exists():
+            continue
+
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env_file()
+
 APP_ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "").strip()
 PASSWORD_HEADER = "X-App-Password"
 

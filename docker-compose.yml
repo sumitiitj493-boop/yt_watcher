@@ -4,6 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     restart: unless-stopped
+    env_file:
+      - .env
     expose:
       - "8000"
     volumes:
