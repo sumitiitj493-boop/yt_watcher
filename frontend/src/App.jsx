@@ -1468,25 +1468,28 @@ export default function App() {
       </main>
 
       {downloadNotification ? (
-        <div className="download-notification" style={{ position: 'fixed', right: 20, top: 20, zIndex: 9999, width: 320 }}>
-          <div className="panel panel--tiny">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ fontWeight: 600 }}>{downloadNotification.filename || 'Preparing…'}</div>
-              <div style={{ fontSize: 12, opacity: 0.8 }}>{downloadNotification.status}</div>
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <ProgressBar value={downloadNotification.progress || 0} />
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
-              <button className="ghost-button" type="button" onClick={() => { setDownloadNotification(null); }}>
-                Close
-              </button>
-              <button className="ghost-button" type="button" onClick={() => { if (downloadNotification?.taskId) cancelDownload(downloadNotification.taskId); }} style={{ marginLeft: 8 }}>
-                Cancel
-              </button>
+        <>
+          <div className="download-notification-overlay" />
+          <div className="download-notification">
+            <div className="download-notification__content">
+              <div className="download-notification__header">
+                <div className="download-notification__filename">{downloadNotification.filename || 'Preparing…'}</div>
+                <div className="download-notification__status">{downloadNotification.status}</div>
+              </div>
+              <div className="download-notification__progress">
+                <ProgressBar value={downloadNotification.progress || 0} />
+              </div>
+              <div className="download-notification__actions">
+                <button className="download-notification__button download-notification__button--close" type="button" onClick={() => { setDownloadNotification(null); }}>
+                  Close
+                </button>
+                <button className="download-notification__button download-notification__button--cancel" type="button" onClick={() => { if (downloadNotification?.taskId) cancelDownload(downloadNotification.taskId); }}>
+                  Cancel
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </>
       ) : null}
       <ToastStack toasts={toasts} />
     </div>

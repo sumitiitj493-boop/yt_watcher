@@ -2029,3 +2029,132 @@
 		font-size: 13px;
 	}
 }
+
+/* Download Notification */
+.download-notification-overlay {
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	pointer-events: none;
+	z-index: 900;
+}
+
+.download-notification {
+	position: fixed;
+	top: 20px;
+	right: 20px;
+	width: 360px;
+	max-width: calc(100vw - 40px);
+	background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+	border-radius: 16px;
+	box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3), 0 4px 16px rgba(0, 0, 0, 0.15);
+	pointer-events: auto;
+	z-index: 910;
+	overflow: hidden;
+}
+
+.download-notification__content {
+	padding: 20px;
+	color: white;
+}
+
+.download-notification__header {
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-start;
+	margin-bottom: 12px;
+}
+
+.download-notification__filename {
+	font-weight: 700;
+	font-size: 15px;
+	line-height: 1.3;
+	word-break: break-word;
+	flex: 1;
+	margin-right: 8px;
+	max-height: 2.6em;
+	overflow: hidden;
+}
+
+.download-notification__status {
+	font-size: 12px;
+	opacity: 0.9;
+	white-space: nowrap;
+	background: rgba(255, 255, 255, 0.2);
+	padding: 4px 10px;
+	border-radius: 999px;
+}
+
+.download-notification__progress {
+	margin: 12px 0;
+}
+
+.download-notification__actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+	margin-top: 12px;
+}
+
+.download-notification__button {
+	padding: 8px 14px;
+	border: none;
+	border-radius: 10px;
+	font-size: 13px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: all 0.2s ease;
+	font-family: inherit;
+}
+
+.download-notification__button--close {
+	background: rgba(255, 255, 255, 0.25);
+	color: white;
+}
+
+.download-notification__button--close:hover {
+	background: rgba(255, 255, 255, 0.35);
+}
+
+.download-notification__button--cancel {
+	background: rgba(255, 255, 255, 0.25);
+	color: white;
+}
+
+.download-notification__button--cancel:hover {
+	background: rgba(255, 255, 255, 0.35);
+}
+
+@keyframes slideIn {
+	from {
+		transform: translateX(400px);
+		opacity: 0;
+	}
+	to {
+		transform: translateX(0);
+		opacity: 1;
+	}
+}
+
+.download-notification {
+	animation: slideIn 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);
+}
+
+@media (max-width: 640px) {
+	.download-notification {
+		top: 12px;
+		right: 12px;
+		left: 12px;
+		width: auto;
+	}
+
+	.download-notification__content {
+		padding: 16px;
+	}
+
+	.download-notification__filename {
+		font-size: 14px;
+	}
+}
