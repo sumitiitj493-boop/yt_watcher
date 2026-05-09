@@ -1,4 +1,5 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import time
@@ -13,6 +14,9 @@ from routes import about, download, library, stream
 from services.database import init_db
 
 app = FastAPI(title="YT Private Suite API")
+
+APP_ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "").strip()
+PASSWORD_HEADER = "X-App-Password"
 
 logger = logging.getLogger("yt_suite")
 logs_dir = Path(__file__).resolve().parent / "logs"
@@ -84,6 +88,25 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         )
         return response
 
+
+class PasswordProtectionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not APP_ACCESS_PASSWORD:
+            return await call_next(request)
+
+        path = request.url.path
+        if request.method == "OPTIONS" or path in {"/", "/api/health", "/api/auth/login"}:
+            return await call_next(request)
+
+        supplied_password = request.headers.get(PASSWORD_HEADER, "").strip()
+        if supplied_password != APP_ACCESS_PASSWORD:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Password required"},
+            )
+
+        return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -94,6 +117,7 @@ app.add_middleware(
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(PasswordProtectionMiddleware)
 
 app.include_router(download.router, prefix="/api")
 app.include_router(about.router, prefix="/api")
@@ -143,4 +167,18 @@ def read_root():
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "passwordRequired": bool(APP_ACCESS_PASSWORD)}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    if not APP_ACCESS_PASSWORD:
+        return {"authenticated": True, "passwordRequired": False}
+
+    payload = await request.json()
+    supplied_password = str(payload.get("password", "")).strip()
+
+    if supplied_password != APP_ACCESS_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    return {"authenticated": True, "passwordRequired": True}
