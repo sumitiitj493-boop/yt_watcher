@@ -573,18 +573,11 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
     event.preventDefault();
     const trimmed = socialUrl.trim();
     if (!trimmed) return;
-    if (!trimmed.includes('instagram.com') && !trimmed.includes('facebook.com') && !trimmed.includes('fb.com') && !trimmed.includes('fb.watch')) {
-      pushToast('Only Instagram or Facebook links are supported', 'error');
-      return;
-    }
 
     setSocialSubmitting(true);
     try {
       await onStartSocialDownload({ url: trimmed, quality: socialQuality, format: socialFormat });
       setSocialUrl('');
-    } catch (err) {
-      // onStartSocialDownload surfaces errors as toasts; show a fallback
-      pushToast('Failed to start social download', 'error');
     } finally {
       setSocialSubmitting(false);
     }
@@ -674,10 +667,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           <div className="panel__header panel__header--stacked">
             <div>
           <div className="section-eyebrow section-eyebrow--soft">Public social video download</div>
-              <h2 className="panel__title">Instagram & Facebook</h2>
+              <h2 className="panel__title">Any Public Video Link</h2>
                   <p className="panel__subtitle">
-                Paste a public Instagram or Facebook link. This uses the same downloader engine, but keeps the feature
-                separate from YouTube.
+                Paste any public video link that opens in incognito mode without login. Private or paywalled links are not supported.
                   </p>
             </div>
             <span className="panel__badge panel__badge--soft">Social</span>
@@ -691,7 +683,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                 className="input"
                 value={socialUrl}
                 onChange={(event) => setSocialUrl(event.target.value)}
-                placeholder="https://instagram.com/... or https://facebook.com/..."
+                placeholder="https://example.com/public-video"
                 autoComplete="off"
                 spellCheck="false"
               />
@@ -718,7 +710,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
 
             <button className="primary-button" type="submit" disabled={socialSubmitting || !socialUrl.trim()}>
               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
-              {socialSubmitting ? 'Processing…' : 'Download Public Video'}
+              {socialSubmitting ? 'Processing…' : 'Process Public Link'}
             </button>
           </form>
         </section>
