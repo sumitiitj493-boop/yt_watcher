@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 
 import './App.css';
-import { api, API_BASE } from './lib/api';
+import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
 import StudyMode from './pages/StudyMode';
 import PlaylistPage from './pages/Playlist';
 
@@ -72,7 +72,7 @@ const ABOUT_HIGHLIGHTS = [
   },
   {
     label: 'Access',
-    value: 'No login required',
+    value: 'Password protected',
     Icon: ShieldCheck,
   },
 ];
@@ -116,6 +116,43 @@ function formatBytes(bytes = 0) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function AccessGate({ password, error, isSubmitting, onChangePassword, onSubmit }) {
+  return (
+    <div className="access-gate" role="dialog" aria-modal="true" aria-labelledby="access-gate-title">
+      <div className="access-gate__orb access-gate__orb--one" />
+      <div className="access-gate__orb access-gate__orb--two" />
+      <form className="access-gate__card" onSubmit={onSubmit}>
+        <div className="access-gate__badge">
+          <ShieldCheck size={18} />
+          Private access
+        </div>
+        <h1 id="access-gate-title">Enter the shared password</h1>
+        <p>
+          This app is locked. Only people with the password can open the downloader, history, and library.
+        </p>
+        <label className="access-gate__label" htmlFor="access-password">
+          Password
+        </label>
+        <input
+          id="access-password"
+          className="access-gate__input"
+          type="password"
+          value={password}
+          onChange={(event) => onChangePassword(event.target.value)}
+          placeholder="Enter password"
+          autoComplete="current-password"
+          autoFocus
+        />
+        {error ? <div className="access-gate__error">{error}</div> : null}
+        <button className="access-gate__button" type="submit" disabled={isSubmitting}>
+          {isSubmitting ? <Loader2 size={16} className="spin" /> : null}
+          {isSubmitting ? 'Checking…' : 'Unlock app'}
+        </button>
+      </form>
+    </div>
+  );
 }
 
 function timeAgo(timestamp) {
@@ -1170,6 +1207,11 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [toasts, setToasts] = useState([]);
   const [downloadNotification, setDownloadNotification] = useState(null);
+  const [accessPassword, setAccessPassword] = useState('');
+  const [accessError, setAccessError] = useState('');
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [isUnlocked, setIsUnlocked] = useState(false);
   const toastTimers = useRef([]);
   const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
@@ -1191,23 +1233,74 @@ export default function App() {
     toastTimers.current = [];
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const bootstrapAccess = async () => {
+      try {
+        const response = await api.get('/health');
+        const passwordRequired = Boolean(response.data?.passwordRequired);
+        if (!passwordRequired) {
+          if (!cancelled) {
+            setIsUnlocked(true);
+            setAuthReady(true);
+          }
+          return;
+        }
+
+        const storedPassword = getStoredAppPassword();
+        if (!storedPassword) {
+          if (!cancelled) {
+            setIsUnlocked(false);
+            setAuthReady(true);
+            setAccessError('Enter the shared password to continue.');
+          }
+          return;
+        }
+
+        await api.post('/auth/login', { password: storedPassword });
+        if (!cancelled) {
+          setIsUnlocked(true);
+          setAuthReady(true);
+          setAccessError('');
+          setAccessPassword('');
+        }
+      } catch (error) {
+        clearStoredAppPassword();
+        if (!cancelled) {
+          setIsUnlocked(false);
+          setAuthReady(true);
+          setAccessError(safeFetchError(error, 'Unable to verify password.'));
+        }
+      }
+    };
+
+    bootstrapAccess();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refreshDownloads = useCallback(async () => {
+    if (!authReady || !isUnlocked) return;
     try {
       const response = await api.get('/downloads');
       setDownloads(Array.isArray(response.data?.downloads) ? response.data.downloads : []);
     } catch {
       // polling should stay quiet on transient failures
     }
-  }, []);
+  }, [authReady, isUnlocked]);
 
   const refreshFiles = useCallback(async () => {
+    if (!authReady || !isUnlocked) return;
     try {
       const response = await api.get('/files');
       setFiles(Array.isArray(response.data?.files) ? response.data.files : []);
     } catch {
       // polling should stay quiet on transient failures
     }
-  }, []);
+  }, [authReady, isUnlocked]);
 
   const activeDownloadCount = useMemo(
     () => downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length,
@@ -1215,12 +1308,13 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!authReady || !isUnlocked) return undefined;
     refreshDownloads();
     refreshFiles();
-  }, [refreshDownloads, refreshFiles]);
+  }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
-    if (!activeDownloadCount) return undefined;
+    if (!authReady || !isUnlocked || !activeDownloadCount) return undefined;
 
     const downloadTimer = window.setInterval(() => {
       refreshDownloads();
@@ -1229,7 +1323,7 @@ export default function App() {
     return () => {
       window.clearInterval(downloadTimer);
     };
-  }, [activeDownloadCount, refreshDownloads, refreshFiles]);
+  }, [authReady, isUnlocked, activeDownloadCount, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
     if (isMobileDevice) {
@@ -1295,7 +1389,42 @@ export default function App() {
 
   const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
 
+  const handleUnlockSubmit = useCallback(async (event) => {
+    event.preventDefault();
+    const trimmedPassword = accessPassword.trim();
+
+    if (!trimmedPassword) {
+      setAccessError('Enter the shared password to continue.');
+      return;
+    }
+
+    setIsAuthSubmitting(true);
+    setAccessError('');
+
+    try {
+      await api.post('/auth/login', { password: trimmedPassword });
+      setStoredAppPassword(trimmedPassword);
+      setIsUnlocked(true);
+      setAuthReady(true);
+      setAccessPassword('');
+      pushToast('App unlocked', 'success');
+      await refreshDownloads();
+      await refreshFiles();
+    } catch (error) {
+      clearStoredAppPassword();
+      setIsUnlocked(false);
+      setAccessError(safeFetchError(error, 'Incorrect password.'));
+    } finally {
+      setIsAuthSubmitting(false);
+      setAuthReady(true);
+    }
+  }, [accessPassword, pushToast, refreshDownloads, refreshFiles]);
+
   const startDownload = useCallback(async ({ url, quality, format }) => {
+    if (!isUnlocked) {
+      pushToast('Enter the password first', 'warning');
+      return;
+    }
     if (!startDownload._inProgress) startDownload._inProgress = false;
     if (startDownload._inProgress) return;
     startDownload._inProgress = true;
@@ -1314,9 +1443,13 @@ export default function App() {
     } finally {
       startDownload._inProgress = false;
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const startSocialDownload = useCallback(async ({ url, quality, format }) => {
+    if (!isUnlocked) {
+      pushToast('Enter the password first', 'warning');
+      return;
+    }
     if (!startSocialDownload._inProgress) startSocialDownload._inProgress = false;
     if (startSocialDownload._inProgress) return;
     startSocialDownload._inProgress = true;
@@ -1331,9 +1464,10 @@ export default function App() {
     } finally {
       startSocialDownload._inProgress = false;
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const cancelDownload = useCallback(async (taskId) => {
+    if (!isUnlocked) return;
     try {
       await api.post(`/cancel/${encodeURIComponent(taskId)}`);
       pushToast('Cancel requested', 'info');
@@ -1341,9 +1475,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to cancel download'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const deleteDownload = useCallback(async (taskId) => {
+    if (!isUnlocked) return;
     try {
       await api.delete(`/downloads/${encodeURIComponent(taskId)}`);
       pushToast('Download removed', 'info');
@@ -1353,9 +1488,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to delete download'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [currentTaskId, isUnlocked, pushToast, refreshDownloads]);
 
   const clearDownloads = useCallback(async () => {
+    if (!isUnlocked) return;
     try {
       await api.post('/downloads/clear');
       pushToast('History cleared', 'info');
@@ -1363,7 +1499,7 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to clear history'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const retryDownload = useCallback(async (item) => {
     if (!item?.url) {
@@ -1379,6 +1515,7 @@ export default function App() {
   }, [pushToast, startDownload]);
 
   const deleteFile = useCallback(async (filename) => {
+    if (!isUnlocked) return;
     try {
       await api.delete(`/delete/${encodeURIComponent(filename)}`);
       pushToast('File deleted', 'info');
@@ -1386,9 +1523,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to delete file'), 'error');
     }
-  }, [pushToast, refreshFiles]);
+  }, [isUnlocked, pushToast, refreshFiles]);
 
   const addToPlaylist = useCallback(async (filename) => {
+    if (!isUnlocked) return;
     if (!filename) return;
     try {
       await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
@@ -1396,7 +1534,7 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
     }
-  }, [pushToast]);
+  }, [isUnlocked, pushToast]);
 
   const navigate = useNavigate();
 
@@ -1408,6 +1546,7 @@ export default function App() {
 
   const reprocessInProgress = useRef(new Set());
   const reprocessFromHistory = useCallback(async (item) => {
+    if (!isUnlocked) return;
     const taskId = item?.task_id;
     if (!taskId) return;
     if (reprocessInProgress.current.has(taskId)) return;
@@ -1431,9 +1570,10 @@ export default function App() {
     } finally {
       reprocessInProgress.current.delete(taskId);
     }
-  }, [pushToast, refreshDownloads, refreshFiles, navigate]);
+  }, [isUnlocked, pushToast, refreshDownloads, refreshFiles, navigate]);
 
   const clearFiles = useCallback(async () => {
+    if (!isUnlocked) return;
     try {
       const resp = await api.post('/files/clear');
       const data = resp?.data || {};
@@ -1448,10 +1588,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to clear files'), 'error');
     }
-  }, [pushToast, refreshFiles]);
+  }, [isUnlocked, pushToast, refreshFiles]);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
       <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} />
 
       <main className="main-stage">
@@ -1492,6 +1632,16 @@ export default function App() {
         </>
       ) : null}
       <ToastStack toasts={toasts} />
+
+      {!authReady || !isUnlocked ? (
+        <AccessGate
+          password={accessPassword}
+          error={accessError}
+          isSubmitting={isAuthSubmitting}
+          onChangePassword={setAccessPassword}
+          onSubmit={handleUnlockSubmit}
+        />
+      ) : null}
     </div>
   );
 }
