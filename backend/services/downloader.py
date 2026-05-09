@@ -31,16 +31,31 @@ def _normalize_quality(value: str) -> str:
 
 
 def _resolve_downloaded_file(ydl, info: dict, format_ext: str) -> str:
+    """Resolve the downloaded file path with retry logic to handle Windows file locking."""
     raw_filename = ydl.prepare_filename(info)
     final_path = Path(raw_filename)
 
-    if final_path.exists():
-        return raw_filename
+    # Retry with exponential backoff to handle Windows file locks
+    # (antivirus scanning, file explorer preview, etc.)
+    max_retries = 5
+    retry_delay = 0.1  # Start with 100ms
+    
+    for attempt in range(max_retries):
+        if final_path.exists():
+            return raw_filename
 
-    for ext in [format_ext, "mp4", "mkv", "webm", "mp3", "m4a"]:
-        candidate = final_path.with_suffix(f".{ext}")
-        if candidate.exists():
-            return str(candidate)
+        for ext in [format_ext, "mp4", "mkv", "webm", "mp3", "m4a"]:
+            candidate = final_path.with_suffix(f".{ext}")
+            if candidate.exists():
+                return str(candidate)
+        
+        # If not found on last attempt, return the raw filename anyway
+        if attempt == max_retries - 1:
+            return raw_filename
+        
+        # Wait before retrying (exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s)
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 2.0)  # Cap at 2 seconds
 
     return raw_filename
 
@@ -229,6 +244,8 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             download_tasks[task_id]["video_id"] = info.get("id")
             if download_tasks[task_id].get("status") == "cancelled":
                 return
+            # Small delay to allow Windows to release file locks from antivirus/indexing
+            time.sleep(0.5)
             _mark_completed(task_id, ydl, info, format_ext)
     except Exception as e:
         if download_tasks[task_id].get("status") == "cancelled":
