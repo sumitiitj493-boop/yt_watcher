@@ -54,6 +54,19 @@ def _persist_if_terminal(task_id: str) -> None:
     if download_tasks.get(task_id, {}).get("status") in TERMINAL_STATUSES:
         save_jobs(download_tasks)
 
+
+def _mark_completed(task_id: str, ydl, info: dict, format_ext: str) -> None:
+    filename = _resolve_downloaded_file(ydl, info, format_ext)
+    download_tasks[task_id].update({
+        "filename": filename,
+        "title": clean_title(filename),
+        "video_id": extract_video_id(filename) or info.get("id"),
+        "status": "completed",
+        "progress": 100.0,
+        "last_progress": 100.0,
+    })
+    _touch_task(task_id)
+
 def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     quality = _normalize_quality(quality)
     # Ensure we don't crash if the task wasn't pre-seeded; prefer any existing created_at
@@ -214,25 +227,34 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             info = ydl.extract_info(url, download=True)
             download_tasks[task_id]["title"] = info.get("title", "Unknown")
             download_tasks[task_id]["video_id"] = info.get("id")
-
-        if download_tasks[task_id].get("status") == "cancelled":
-            return
-
-        filename = _resolve_downloaded_file(ydl, info, format_ext)
-        download_tasks[task_id].update({
-            "filename": filename,
-            "title": clean_title(filename),
-            "video_id": extract_video_id(filename) or info.get("id"),
-            "status": "completed",
-            "progress": 100.0,
-            "last_progress": 100.0,
-        })
-        _touch_task(task_id)
+            if download_tasks[task_id].get("status") == "cancelled":
+                return
+            _mark_completed(task_id, ydl, info, format_ext)
     except Exception as e:
         if download_tasks[task_id].get("status") == "cancelled":
             return
+
+        clean_error = _clean(str(e))
+
+        # Some public sites are not recognized by platform extractors.
+        # Retry with yt-dlp generic extractor before failing.
+        if "Unsupported URL" in clean_error:
+            try:
+                generic_opts = dict(ydl_opts)
+                generic_opts["force_generic_extractor"] = True
+                with yt_dlp.YoutubeDL(generic_opts) as ydl_generic:
+                    info = ydl_generic.extract_info(url, download=True)
+                    download_tasks[task_id]["title"] = info.get("title", "Unknown")
+                    download_tasks[task_id]["video_id"] = info.get("id")
+                    if download_tasks[task_id].get("status") == "cancelled":
+                        return
+                    _mark_completed(task_id, ydl_generic, info, format_ext)
+                    return
+            except Exception as generic_error:
+                clean_error = _clean(str(generic_error))
+
         download_tasks[task_id]["status"] = "error"
-        download_tasks[task_id]["error"] = str(e)
+        download_tasks[task_id]["error"] = clean_error
         _touch_task(task_id)
     finally:
         if download_tasks.get(task_id, {}).get("status") == "cancelled":
