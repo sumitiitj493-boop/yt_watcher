@@ -952,6 +952,12 @@
 	color: #2563eb;
 }
 
+.status-pill--pending,
+.status-pill--queued {
+	background: rgba(124, 58, 237, 0.12);
+	color: #7c3aed;
+}
+
 .status-pill--processing {
 	background: rgba(245, 158, 11, 0.14);
 	color: #d97706;

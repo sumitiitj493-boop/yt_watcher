@@ -29,7 +29,7 @@ import PlaylistPage from './pages/Playlist';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
-const ACTIVE_STATUSES = new Set(['starting', 'downloading', 'processing']);
+const ACTIVE_STATUSES = new Set(['pending', 'queued', 'starting', 'downloading', 'processing']);
 const ABOUT_SOCIAL_LINKS = [
   {
     label: 'GitHub',
@@ -252,6 +252,8 @@ function StatusPill({ status }) {
   const labelMap = {
     completed: 'Complete',
     downloading: 'Downloading',
+    pending: 'Queued',
+    queued: 'Queued',
     processing: 'Processing',
     starting: 'Starting',
     error: 'Error',
@@ -295,6 +297,9 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
           <span>{item.quality ? qualityLabel(item.quality) : 'Best available'}</span>
           <span>{item.format ? item.format.toUpperCase() : 'MP4'}</span>
           {showExt ? <span>{ext.toUpperCase()}</span> : null}
+          {item.queue_position ? <span>Queue #{item.queue_position}</span> : null}
+          {item.retry_count ? <span>Retry {item.retry_count}/{item.max_auto_retries ?? item.retry_count}</span> : null}
+          {item.error_category ? <span>{String(item.error_category).toUpperCase()}</span> : null}
           <span>{timeAgo(item.created_at)}</span>
         </div>
 
@@ -562,6 +567,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [url, setUrl] = useState('');
   const [quality, setQuality] = useState('1080');
   const [format, setFormat] = useState('mp4');
+  const [metadata, setMetadata] = useState(null);
+  const [metadataError, setMetadataError] = useState('');
+  const [metadataLoading, setMetadataLoading] = useState(false);
   const [socialUrl, setSocialUrl] = useState('');
   const [socialQuality, setSocialQuality] = useState('best');
   const [socialFormat, setSocialFormat] = useState('mp4');
@@ -570,6 +578,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
+  const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
+  const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
 
   const location = useLocation();
   useEffect(() => {
@@ -591,6 +601,30 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       })();
     }
   }, [location, onStartDownload]);
+
+  const handleFetchMetadata = async () => {
+    const trimmed = url.trim();
+    if (!trimmed || metadataLoading) return;
+
+    setMetadataLoading(true);
+    setMetadataError('');
+    try {
+      const response = await api.post('/metadata', { url: trimmed });
+      const data = response.data || null;
+      setMetadata(data);
+      if (data?.qualities?.length && !data.qualities.includes(quality)) {
+        setQuality(data.qualities.includes('1080') ? '1080' : data.qualities[0]);
+      }
+      if (data?.formats?.length && !data.formats.includes(format)) {
+        setFormat(data.formats.includes('mp4') ? 'mp4' : data.formats[0]);
+      }
+    } catch (error) {
+      setMetadata(null);
+      setMetadataError(safeFetchError(error, 'Unable to fetch video preview.'));
+    } finally {
+      setMetadataLoading(false);
+    }
+  };
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -658,7 +692,11 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                 id="video-url"
                 className="input"
                 value={url}
-                onChange={(event) => setUrl(event.target.value)}
+                onChange={(event) => {
+                  setUrl(event.target.value);
+                  setMetadata(null);
+                  setMetadataError('');
+                }}
                 placeholder="https://youtube.com/watch?v=..."
                 autoComplete="off"
                 spellCheck="false"
@@ -669,7 +707,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <div className="field">
                 <label className="field__label" htmlFor="quality">QUALITY</label>
                 <select id="quality" className="select" value={quality} onChange={(event) => setQuality(event.target.value)}>
-                  {QUALITY_OPTIONS.map((option) => (
+                  {dynamicQualityOptions.map((option) => (
                     <option key={option} value={option}>{qualityLabel(option)}</option>
                   ))}
                 </select>
@@ -677,17 +715,59 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <div className="field">
                 <label className="field__label" htmlFor="format">FORMAT</label>
                 <select id="format" className="select" value={format} onChange={(event) => setFormat(event.target.value)}>
-                  {FORMAT_OPTIONS.map((option) => (
+                  {dynamicFormatOptions.map((option) => (
                     <option key={option} value={option}>{option.toUpperCase()}</option>
                   ))}
                 </select>
               </div>
             </div>
 
-            <button className="primary-button" type="submit" disabled={submitting || !url.trim()}>
-              {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
-              {submitting ? 'Processing…' : 'Process Link'}
-            </button>
+            {metadataError ? <p className="download-card__error">{metadataError}</p> : null}
+
+            {metadata ? (
+              <div className="download-card" style={{ alignItems: 'stretch' }}>
+                {metadata.thumbnail ? (
+                  <img className="media-thumb" src={metadata.thumbnail} alt={metadata.title} loading="lazy" />
+                ) : (
+                  <div className="media-thumb media-thumb--fallback" aria-hidden="true">
+                    <div className="media-thumb__title">Preview</div>
+                  </div>
+                )}
+                <div className="download-card__body">
+                  <div className="download-card__title-row">
+                    <h3 className="download-card__title">{metadata.title}</h3>
+                    {metadata.already_downloaded ? <StatusPill status="completed" /> : <span className="status-pill status-pill--processing">Ready</span>}
+                  </div>
+                  <div className="download-card__meta">
+                    {metadata.uploader ? <span>{metadata.uploader}</span> : null}
+                    {metadata.duration_label ? <span>{metadata.duration_label}</span> : null}
+                    {metadata.estimated_size_label ? <span>Up to {metadata.estimated_size_label}</span> : null}
+                    {metadata.is_playlist ? <span>{metadata.playlist_count} playlist items</span> : null}
+                  </div>
+                  {metadata.already_downloaded && metadata.existing_file ? (
+                    <p className="field__help field__help--inline">
+                      Already in Library as {metadata.existing_file.filename}. You can still download another quality if needed.
+                    </p>
+                  ) : null}
+                  {metadata.preview_items?.length > 1 ? (
+                    <p className="field__help field__help--inline">
+                      Previewing playlist: {metadata.preview_items.slice(0, 3).map((item) => item.title).join(', ')}{metadata.preview_items.length > 3 ? '…' : ''}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <button className="ghost-button" type="button" onClick={handleFetchMetadata} disabled={metadataLoading || !url.trim()}>
+                {metadataLoading ? <Loader2 className="spinner" size={16} /> : <Search size={16} />}
+                {metadataLoading ? 'Previewing…' : 'Preview Link'}
+              </button>
+              <button className="primary-button" type="submit" disabled={submitting || !url.trim()}>
+                {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
+                {submitting ? 'Processing…' : 'Process Link'}
+              </button>
+            </div>
 
             <p className="field__help field__help--inline">
               {isMobileDevice
@@ -880,6 +960,8 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const [selectedFile, setSelectedFile] = useState(null);
   const [suppressedPreviewFilename, setSuppressedPreviewFilename] = useState('');
   const [isClearingAll, setIsClearingAll] = useState(false);
+  const [useCompatiblePreview, setUseCompatiblePreview] = useState(false);
+  const [previewPlaybackRate, setPreviewPlaybackRate] = useState(1);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
   const videoRef = useRef(null);
 
@@ -932,8 +1014,10 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
     ? selectedFile
     : (isClearingAll ? null : filtered.find((file) => file.filename !== suppressedPreviewFilename) || null);
 
-  const previewUrl = previewFile ? `${API_BASE}/stream/${encodeURIComponent(previewFile.filename)}` : '';
   const previewExt = previewFile ? mediaExt(previewFile.filename) : '';
+  const previewUrl = previewFile
+    ? `${API_BASE}/${isVideoExt(previewExt) && useCompatiblePreview ? 'stream-compatible' : 'stream'}/${encodeURIComponent(previewFile.filename)}`
+    : '';
   const previewTitle = previewFile ? previewFile.title || cleanTitle(previewFile.filename) : '';
   const previewThumbUrl = previewFile?.video_id ? `https://img.youtube.com/vi/${previewFile.video_id}/hqdefault.jpg` : '';
 
@@ -996,6 +1080,19 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const previewPlatform = detectPlatformFromString((previewFile?.filename || '') + ' ' + (previewFile?.title || ''));
   const platformPlaceholder = previewPlatform ? platformPlaceholderDataUrl(previewPlatform, previewTitle) : '';
   const effectiveThumb = previewFile?.video_id ? previewThumbUrl : (generatedThumb || platformPlaceholder || '');
+
+  useEffect(() => {
+    setUseCompatiblePreview(false);
+  }, [previewFile?.filename]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.playbackRate = previewPlaybackRate;
+    }
+    document.querySelectorAll('.preview-audio__player').forEach((player) => {
+      player.playbackRate = previewPlaybackRate;
+    });
+  }, [previewPlaybackRate, previewFile?.filename]);
 
   const handleDeleteFile = useCallback(async (filename) => {
     const deletingPreview = previewFile?.filename === filename;
@@ -1073,6 +1170,12 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                 controls
                 preload="metadata"
                 poster={effectiveThumb || undefined}
+                onLoadedMetadata={() => {
+                  if (videoRef.current) videoRef.current.playbackRate = previewPlaybackRate;
+                }}
+                onError={() => {
+                  if (!useCompatiblePreview) setUseCompatiblePreview(true);
+                }}
               />
             ) : isAudioExt(previewExt) ? (
               <div className="preview-audio">
@@ -1083,7 +1186,15 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                     <Music2 size={28} />
                   )}
                 </div>
-                <audio className="preview-audio__player" src={previewUrl} controls preload="metadata" />
+                <audio
+                  className="preview-audio__player"
+                  src={previewUrl}
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={(event) => {
+                    event.currentTarget.playbackRate = previewPlaybackRate;
+                  }}
+                />
               </div>
             ) : (
               <div className="empty-state empty-state--compact">
@@ -1109,6 +1220,18 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
               <p className="panel__subtitle">{previewExt.toUpperCase()} · {formatBytes(previewFile.size)} · {timeAgo(previewFile.created_at)}</p>
             </div>
             <div className="preview-actions">
+              <label className="field__label" style={{ display: 'flex', alignItems: 'center', gap: 8, margin: 0 }}>
+                Speed
+                <select className="select" value={previewPlaybackRate} onChange={(event) => setPreviewPlaybackRate(Number(event.target.value))} style={{ width: 110 }}>
+                  {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                    <option key={rate} value={rate}>{rate}x</option>
+                  ))}
+                </select>
+              </label>
+              <Link className="ghost-button" to={`/watch/${encodeURIComponent(previewFile.filename)}`}>
+                <PlaySquare size={16} />
+                Study
+              </Link>
               <a className="ghost-button" href={`${API_BASE}/files/download/${encodeURIComponent(previewFile.filename)}`} download>
                 <Download size={16} />
                 Download
@@ -1210,8 +1333,8 @@ export default function App() {
   const [accessPassword, setAccessPassword] = useState('');
   const [accessError, setAccessError] = useState('');
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
-  const [authReady, setAuthReady] = useState(false);
-  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [authReady, setAuthReady] = useState(true);
+  const [isUnlocked, setIsUnlocked] = useState(true);
   const toastTimers = useRef([]);
   const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
@@ -1234,52 +1357,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const bootstrapAccess = async () => {
-      try {
-        const response = await api.get('/health');
-        const passwordRequired = Boolean(response.data?.passwordRequired);
-        if (!passwordRequired) {
-          if (!cancelled) {
-            setIsUnlocked(true);
-            setAuthReady(true);
-          }
-          return;
-        }
-
-        const storedPassword = getStoredAppPassword();
-        if (!storedPassword) {
-          if (!cancelled) {
-            setIsUnlocked(false);
-            setAuthReady(true);
-            setAccessError('Enter the shared password to continue.');
-          }
-          return;
-        }
-
-        await api.post('/auth/login', { password: storedPassword });
-        if (!cancelled) {
-          setIsUnlocked(true);
-          setAuthReady(true);
-          setAccessError('');
-          setAccessPassword('');
-        }
-      } catch (error) {
-        clearStoredAppPassword();
-        if (!cancelled) {
-          setIsUnlocked(false);
-          setAuthReady(true);
-          setAccessError(safeFetchError(error, 'Unable to verify password.'));
-        }
-      }
-    };
-
-    bootstrapAccess();
-
-    return () => {
-      cancelled = true;
-    };
+    // Auth is disabled for private/local use. Keep the app unlocked without
+    // extra health/login checks to reduce startup work and avoid auth overlays.
+    clearStoredAppPassword();
+    setIsUnlocked(true);
+    setAuthReady(true);
+    setAccessError('');
   }, []);
 
   const refreshDownloads = useCallback(async () => {
@@ -1319,7 +1402,7 @@ export default function App() {
     const downloadTimer = window.setInterval(() => {
       refreshDownloads();
       refreshFiles();
-    }, 2000);
+    }, 3500);
     return () => {
       window.clearInterval(downloadTimer);
     };
@@ -1356,30 +1439,17 @@ export default function App() {
 
         if (item.status === 'completed' && item.filename && !notifiedDownloadedRef.current.has(item.task_id)) {
           notifiedDownloadedRef.current.add(item.task_id);
-          try {
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = `${API_BASE}/files/download/${encodeURIComponent(item.filename)}`;
-            a.download = item.filename;
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => { try { document.body.removeChild(a); } catch (e) {} }, 1000);
-          } catch (e) {
-            console.warn('download notification failed to trigger browser save', e);
-          }
-          setTimeout(() => setDownloadNotification(null), 1500);
+          // Do not auto-click browser download or auto-open files. That was a
+          // noticeable source of UI lag on slower systems. User can manually
+          // download/open from Library.
+          setTimeout(() => setDownloadNotification(null), 900);
         }
       }
 
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
         const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
         if (isRecentlyCompleted) {
-          pushToast('Video saved to your PC Library', 'success', 4000);
-          if (!isMobileDevice) {
-            setTimeout(() => {
-              try { navigate('/library'); } catch (e) { /* ignore */ }
-            }, 2000);
-          }
+          pushToast('Video saved to your Library', 'success', 3000);
         }
       }
 
@@ -1507,12 +1577,26 @@ export default function App() {
       return;
     }
 
+    if (item.task_id) {
+      try {
+        const response = await api.post(`/retry/${encodeURIComponent(item.task_id)}`);
+        const tid = response?.data?.task_id;
+        if (tid) setCurrentTaskId(tid);
+        pushToast('Retry queued', 'success');
+        await refreshDownloads();
+        return;
+      } catch (error) {
+        pushToast(safeFetchError(error, 'Failed to queue retry'), 'error');
+        return;
+      }
+    }
+
     await startDownload({
       url: item.url,
       quality: item.quality || 'best',
       format: item.format || 'mp4',
     });
-  }, [pushToast, startDownload]);
+  }, [pushToast, refreshDownloads, startDownload]);
 
   const deleteFile = useCallback(async (filename) => {
     if (!isUnlocked) return;

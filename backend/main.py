@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse
 
 from routes import about, download, library, stream
 from services.database import init_db
+from services.downloader import resume_pending_downloads
 
 app = FastAPI(title="YT Private Suite API")
 
@@ -116,20 +117,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 class PasswordProtectionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if not APP_ACCESS_PASSWORD:
-            return await call_next(request)
-
-        path = request.url.path
-        if request.method == "OPTIONS" or path in {"/", "/api/health", "/api/auth/login"}:
-            return await call_next(request)
-
-        supplied_password = request.headers.get(PASSWORD_HEADER, "").strip()
-        if supplied_password != APP_ACCESS_PASSWORD:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Password required"},
-            )
-
+        # Auth disabled intentionally: this app is intended for private/local use.
+        # Keeping this middleware as a no-op avoids breaking imports/setup while
+        # removing 401s and media playback header problems.
         return await call_next(request)
 
 app.add_middleware(
@@ -153,6 +143,7 @@ app.include_router(stream.router, prefix="/api")
 @app.on_event("startup")
 async def startup_event():
     await init_db()
+    await resume_pending_downloads()
 
 
 @app.exception_handler(HTTPException)
@@ -192,7 +183,7 @@ def read_root():
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "passwordRequired": bool(APP_ACCESS_PASSWORD)}
+    return {"status": "ok", "passwordRequired": False}
 
 
 @app.post("/api/auth/login")

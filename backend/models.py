@@ -24,6 +24,10 @@ class DownloadRequest(BaseModel):
         return normalized
 
 
+class MetadataRequest(BaseModel):
+    url: HttpUrl
+
+
 class SocialDownloadRequest(BaseModel):
     url: HttpUrl
     quality: str = Field(default="best")

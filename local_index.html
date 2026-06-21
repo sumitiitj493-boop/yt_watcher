@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YT Suite - Download</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        color: #e2e8f0;
+        min-height: 100vh;
+        padding: 20px;
+      }
+      .container {
+        max-width: 800px;
+        margin: 0 auto;
+        background: rgba(30, 41, 59, 0.8);
+        border-radius: 16px;
+        padding: 30px;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+      }
+      h1 {
+        margin-bottom: 30px;
+        font-size: 2em;
+        text-align: center;
+        background: linear-gradient(135deg, #818cf8, #22c55e);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .tabs {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 30px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      }
+      button.tab {
+        padding: 12px 20px;
+        background: none;
+        border: none;
+        color: #94a3b8;
+        cursor: pointer;
+        font-size: 1em;
+        border-bottom: 3px solid transparent;
+        transition: all 0.3s;
+      }
+      button.tab.active {
+        color: #22c55e;
+        border-bottom-color: #22c55e;
+      }
+      .section {
+        display: none;
+      }
+      .section.active {
+        display: block;
+      }
+      .form-group {
+        margin-bottom: 20px;
+      }
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: #cbd5e1;
+      }
+      input[type="text"],
+      input[type="url"] {
+        width: 100%;
+        padding: 12px;
+        background: rgba(15, 23, 42, 0.8);
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 8px;
+        color: #f8fafc;
+        font-size: 1em;
+      }
+      input[type="text"]:focus,
+      input[type="url"]:focus {
+        outline: none;
+        border-color: #818cf8;
+        box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.1);
+      }
+      button {
+        padding: 12px 24px;
+        background: linear-gradient(135deg, #818cf8, #22c55e);
+        border: none;
+        border-radius: 8px;
+        color: #fff;
+        font-weight: 700;
+        cursor: pointer;
+        font-size: 1em;
+        transition: transform 0.2s;
+      }
+      button:hover:not(:disabled) {
+        transform: translateY(-2px);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .status {
+        margin-top: 20px;
+        padding: 15px;
+        background: rgba(129, 140, 248, 0.1);
+        border-left: 4px solid #818cf8;
+        border-radius: 4px;
+        display: none;
+      }
+      .status.show {
+        display: block;
+      }
+      .status.success {
+        background: rgba(34, 197, 94, 0.1);
+        border-left-color: #22c55e;
+      }
+      .status.error {
+        background: rgba(239, 68, 68, 0.1);
+        border-left-color: #ef4444;
+      }
+      .files-list {
+        display: grid;
+        gap: 10px;
+        margin-top: 20px;
+      }
+      .file-item {
+        padding: 15px;
+        background: rgba(15, 23, 42, 0.8);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 8px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .file-name {
+        flex: 1;
+        word-break: break-all;
+        color: #e2e8f0;
+      }
+      .file-size {
+        color: #94a3b8;
+        font-size: 0.9em;
+        margin-left: 20px;
+        min-width: 100px;
+        text-align: right;
+      }
+      .spinner {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border: 3px solid rgba(129, 140, 248, 0.3);
+        border-top-color: #818cf8;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>📥 YT Suite</h1>
+
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab('download')">
+          Download
+        </button>
+        <button class="tab" onclick="switchTab('library')">Library</button>
+      </div>
+
+      <!-- Download Section -->
+      <div id="download" class="section active">
+        <div class="form-group">
+          <label for="url">Video URL</label>
+          <input
+            type="url"
+            id="url"
+            placeholder="https://www.youtube.com/watch?v=..."
+          />
+        </div>
+        <div class="form-group">
+          <label for="quality">Quality</label>
+          <input
+            type="text"
+            id="quality"
+            value="best"
+            placeholder="best, 720p, 480p, etc."
+          />
+        </div>
+        <button onclick="startDownload()">
+          <span id="dlBtn">Start Download</span>
+        </button>
+        <div id="status" class="status"></div>
+      </div>
+
+      <!-- Library Section -->
+      <div id="library" class="section">
+        <button onclick="loadLibrary()" style="margin-bottom: 20px">
+          Refresh Library
+        </button>
+        <div id="files" class="files-list"></div>
+      </div>
+    </div>
+
+    <script>
+      const API_BASE = `http://172.24.224.1:8000/api`;
+
+      function switchTab(tab) {
+        document
+          .querySelectorAll(".section")
+          .forEach((s) => s.classList.remove("active"));
+        document
+          .querySelectorAll(".tab")
+          .forEach((t) => t.classList.remove("active"));
+        document.getElementById(tab).classList.add("active");
+        event.target.classList.add("active");
+
+        if (tab === "library") loadLibrary();
+      }
+
+      async function startDownload() {
+        const url = document.getElementById("url").value.trim();
+        const quality = document.getElementById("quality").value || "best";
+        const status = document.getElementById("status");
+        const btn = document.getElementById("dlBtn");
+
+        if (!url) {
+          showStatus("Please enter a URL", "error");
+          return;
+        }
+
+        btn.innerHTML = '<span class="spinner"></span> Downloading...';
+        btn.disabled = true;
+
+        try {
+          const res = await fetch(`${API_BASE}/download`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, quality }),
+          });
+
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || "Download failed");
+          }
+
+          const data = await res.json();
+          showStatus(`✓ Download started! Job ID: ${data.job_id}`, "success");
+          document.getElementById("url").value = "";
+        } catch (e) {
+          showStatus(`✗ Error: ${e.message}`, "error");
+        } finally {
+          btn.innerHTML = "Start Download";
+          btn.disabled = false;
+        }
+      }
+
+      async function loadLibrary() {
+        const files = document.getElementById("files");
+        files.innerHTML = '<div class="spinner"></div> Loading...';
+
+        try {
+          const res = await fetch(`${API_BASE}/files`);
+          if (!res.ok) throw new Error("Failed to load files");
+
+          const data = await res.json();
+          files.innerHTML = "";
+
+          if (!data.files || data.files.length === 0) {
+            files.innerHTML =
+              '<p style="color: #94a3b8; text-align: center;">No files yet</p>';
+            return;
+          }
+
+          data.files.forEach((file) => {
+            const item = document.createElement("div");
+            item.className = "file-item";
+            const size = (file.size / (1024 * 1024)).toFixed(2);
+            item.innerHTML = `
+                        <span class="file-name">${file.name}</span>
+                        <span class="file-size">${size} MB</span>
+                    `;
+            files.appendChild(item);
+          });
+        } catch (e) {
+          files.innerHTML = `<p style="color: #ef4444;">Error: ${e.message}</p>`;
+        }
+      }
+
+      function showStatus(msg, type = "info") {
+        const status = document.getElementById("status");
+        status.textContent = msg;
+        status.className = `status show ${type}`;
+        setTimeout(() => status.classList.remove("show"), 5000);
+      }
+    </script>
+  </body>
+</html>
