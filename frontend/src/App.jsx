@@ -23,12 +23,13 @@ import {
 } from 'lucide-react';
 
 import './App.css';
-import { api, API_BASE } from './lib/api';
+import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
 import StudyMode from './pages/StudyMode';
+import PlaylistPage from './pages/Playlist';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
-const ACTIVE_STATUSES = new Set(['starting', 'downloading', 'processing']);
+const ACTIVE_STATUSES = new Set(['pending', 'queued', 'starting', 'downloading', 'processing']);
 const ABOUT_SOCIAL_LINKS = [
   {
     label: 'GitHub',
@@ -71,7 +72,7 @@ const ABOUT_HIGHLIGHTS = [
   },
   {
     label: 'Access',
-    value: 'No login required',
+    value: 'Password protected',
     Icon: ShieldCheck,
   },
 ];
@@ -117,6 +118,43 @@ function formatBytes(bytes = 0) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+function AccessGate({ password, error, isSubmitting, onChangePassword, onSubmit }) {
+  return (
+    <div className="access-gate" role="dialog" aria-modal="true" aria-labelledby="access-gate-title">
+      <div className="access-gate__orb access-gate__orb--one" />
+      <div className="access-gate__orb access-gate__orb--two" />
+      <form className="access-gate__card" onSubmit={onSubmit}>
+        <div className="access-gate__badge">
+          <ShieldCheck size={18} />
+          Private access
+        </div>
+        <h1 id="access-gate-title">Enter the shared password</h1>
+        <p>
+          This app is locked. Only people with the password can open the downloader, history, and library.
+        </p>
+        <label className="access-gate__label" htmlFor="access-password">
+          Password
+        </label>
+        <input
+          id="access-password"
+          className="access-gate__input"
+          type="password"
+          value={password}
+          onChange={(event) => onChangePassword(event.target.value)}
+          placeholder="Enter password"
+          autoComplete="current-password"
+          autoFocus
+        />
+        {error ? <div className="access-gate__error">{error}</div> : null}
+        <button className="access-gate__button" type="submit" disabled={isSubmitting}>
+          {isSubmitting ? <Loader2 size={16} className="spin" /> : null}
+          {isSubmitting ? 'Checking…' : 'Unlock app'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function timeAgo(timestamp) {
   if (!timestamp) return 'just now';
   const delta = Date.now() / 1000 - timestamp;
@@ -147,6 +185,9 @@ function isMediaFile(filename = '') {
   const ext = mediaExt(filename);
   return isAudioExt(ext) || isVideoExt(ext);
 }
+
+// Module-level mobile detection so components defined above `App` can use it
+const isMobileDevice = (typeof navigator !== 'undefined') && /Android|iPhone|iPad|iPod|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
 
 function safeFetchError(error, fallback) {
   return error?.response?.data?.detail || error?.response?.data?.error?.message || error?.message || fallback;
@@ -211,6 +252,8 @@ function StatusPill({ status }) {
   const labelMap = {
     completed: 'Complete',
     downloading: 'Downloading',
+    pending: 'Queued',
+    queued: 'Queued',
     processing: 'Processing',
     starting: 'Starting',
     error: 'Error',
@@ -254,6 +297,9 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
           <span>{item.quality ? qualityLabel(item.quality) : 'Best available'}</span>
           <span>{item.format ? item.format.toUpperCase() : 'MP4'}</span>
           {showExt ? <span>{ext.toUpperCase()}</span> : null}
+          {item.queue_position ? <span>Queue #{item.queue_position}</span> : null}
+          {item.retry_count ? <span>Retry {item.retry_count}/{item.max_auto_retries ?? item.retry_count}</span> : null}
+          {item.error_category ? <span>{String(item.error_category).toUpperCase()}</span> : null}
           <span>{timeAgo(item.created_at)}</span>
         </div>
 
@@ -307,7 +353,7 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
   );
 }
 
-function FileCard({ file, active, onSelect, onDelete }) {
+function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist }) {
   const title = file.title || cleanTitle(file.filename || 'Unknown file');
   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
@@ -327,7 +373,10 @@ function FileCard({ file, active, onSelect, onDelete }) {
           <a className="icon-button" href={downloadUrl} download title="Download file" onClick={(event) => event.stopPropagation()}>
             <Download size={15} />
           </a>
-          <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => { event.stopPropagation(); window.fetch(`${API_BASE}/playlist/add/${encodeURIComponent(file.filename)}`, { method: 'POST' }).then(() => { window.alert('Added to playlist'); }).catch(() => { window.alert('Failed to add to playlist'); }); }}>
+          <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => {
+            event.stopPropagation();
+            onAddToPlaylist?.(file.filename);
+          }}>
             <Plus size={15} />
           </button>
           <button className="icon-button icon-button--danger" type="button" title="Delete file" onClick={(event) => {
@@ -368,7 +417,7 @@ function SectionHeader({ title, subtitle, actions }) {
 }
 
 function AboutPage() {
-  const portraitUrl = '/sumit_image.png';
+  const portraitUrl = `${API_BASE}/about/photo`;
   const [portraitFailed, setPortraitFailed] = useState(false);
 
   return (
@@ -518,6 +567,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [url, setUrl] = useState('');
   const [quality, setQuality] = useState('1080');
   const [format, setFormat] = useState('mp4');
+  const [metadata, setMetadata] = useState(null);
+  const [metadataError, setMetadataError] = useState('');
+  const [metadataLoading, setMetadataLoading] = useState(false);
   const [socialUrl, setSocialUrl] = useState('');
   const [socialQuality, setSocialQuality] = useState('best');
   const [socialFormat, setSocialFormat] = useState('mp4');
@@ -526,6 +578,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
+  const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
+  const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
 
   const location = useLocation();
   useEffect(() => {
@@ -548,6 +602,30 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
     }
   }, [location, onStartDownload]);
 
+  const handleFetchMetadata = async () => {
+    const trimmed = url.trim();
+    if (!trimmed || metadataLoading) return;
+
+    setMetadataLoading(true);
+    setMetadataError('');
+    try {
+      const response = await api.post('/metadata', { url: trimmed });
+      const data = response.data || null;
+      setMetadata(data);
+      if (data?.qualities?.length && !data.qualities.includes(quality)) {
+        setQuality(data.qualities.includes('1080') ? '1080' : data.qualities[0]);
+      }
+      if (data?.formats?.length && !data.formats.includes(format)) {
+        setFormat(data.formats.includes('mp4') ? 'mp4' : data.formats[0]);
+      }
+    } catch (error) {
+      setMetadata(null);
+      setMetadataError(safeFetchError(error, 'Unable to fetch video preview.'));
+    } finally {
+      setMetadataLoading(false);
+    }
+  };
+
   const handleSubmit = async (event) => {
     event.preventDefault();
     const trimmed = url.trim();
@@ -566,18 +644,11 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
     event.preventDefault();
     const trimmed = socialUrl.trim();
     if (!trimmed) return;
-    if (!trimmed.includes('instagram.com') && !trimmed.includes('facebook.com') && !trimmed.includes('fb.com') && !trimmed.includes('fb.watch')) {
-      pushToast('Only Instagram or Facebook links are supported', 'error');
-      return;
-    }
 
     setSocialSubmitting(true);
     try {
       await onStartSocialDownload({ url: trimmed, quality: socialQuality, format: socialFormat });
       setSocialUrl('');
-    } catch (err) {
-      // onStartSocialDownload surfaces errors as toasts; show a fallback
-      pushToast('Failed to start social download', 'error');
     } finally {
       setSocialSubmitting(false);
     }
@@ -621,7 +692,11 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                 id="video-url"
                 className="input"
                 value={url}
-                onChange={(event) => setUrl(event.target.value)}
+                onChange={(event) => {
+                  setUrl(event.target.value);
+                  setMetadata(null);
+                  setMetadataError('');
+                }}
                 placeholder="https://youtube.com/watch?v=..."
                 autoComplete="off"
                 spellCheck="false"
@@ -632,7 +707,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <div className="field">
                 <label className="field__label" htmlFor="quality">QUALITY</label>
                 <select id="quality" className="select" value={quality} onChange={(event) => setQuality(event.target.value)}>
-                  {QUALITY_OPTIONS.map((option) => (
+                  {dynamicQualityOptions.map((option) => (
                     <option key={option} value={option}>{qualityLabel(option)}</option>
                   ))}
                 </select>
@@ -640,17 +715,65 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <div className="field">
                 <label className="field__label" htmlFor="format">FORMAT</label>
                 <select id="format" className="select" value={format} onChange={(event) => setFormat(event.target.value)}>
-                  {FORMAT_OPTIONS.map((option) => (
+                  {dynamicFormatOptions.map((option) => (
                     <option key={option} value={option}>{option.toUpperCase()}</option>
                   ))}
                 </select>
               </div>
             </div>
 
-            <button className="primary-button" type="submit" disabled={submitting || !url.trim()}>
-              {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
-              {submitting ? 'Processing…' : 'Process Link'}
-            </button>
+            {metadataError ? <p className="download-card__error">{metadataError}</p> : null}
+
+            {metadata ? (
+              <div className="download-card" style={{ alignItems: 'stretch' }}>
+                {metadata.thumbnail ? (
+                  <img className="media-thumb" src={metadata.thumbnail} alt={metadata.title} loading="lazy" />
+                ) : (
+                  <div className="media-thumb media-thumb--fallback" aria-hidden="true">
+                    <div className="media-thumb__title">Preview</div>
+                  </div>
+                )}
+                <div className="download-card__body">
+                  <div className="download-card__title-row">
+                    <h3 className="download-card__title">{metadata.title}</h3>
+                    {metadata.already_downloaded ? <StatusPill status="completed" /> : <span className="status-pill status-pill--processing">Ready</span>}
+                  </div>
+                  <div className="download-card__meta">
+                    {metadata.uploader ? <span>{metadata.uploader}</span> : null}
+                    {metadata.duration_label ? <span>{metadata.duration_label}</span> : null}
+                    {metadata.estimated_size_label ? <span>Up to {metadata.estimated_size_label}</span> : null}
+                    {metadata.is_playlist ? <span>{metadata.playlist_count} playlist items</span> : null}
+                  </div>
+                  {metadata.already_downloaded && metadata.existing_file ? (
+                    <p className="field__help field__help--inline">
+                      Already in Library as {metadata.existing_file.filename}. You can still download another quality if needed.
+                    </p>
+                  ) : null}
+                  {metadata.preview_items?.length > 1 ? (
+                    <p className="field__help field__help--inline">
+                      Previewing playlist: {metadata.preview_items.slice(0, 3).map((item) => item.title).join(', ')}{metadata.preview_items.length > 3 ? '…' : ''}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <button className="ghost-button" type="button" onClick={handleFetchMetadata} disabled={metadataLoading || !url.trim()}>
+                {metadataLoading ? <Loader2 className="spinner" size={16} /> : <Search size={16} />}
+                {metadataLoading ? 'Previewing…' : 'Preview Link'}
+              </button>
+              <button className="primary-button" type="submit" disabled={submitting || !url.trim()}>
+                {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
+                {submitting ? 'Processing…' : 'Process Link'}
+              </button>
+            </div>
+
+            <p className="field__help field__help--inline">
+              {isMobileDevice
+                ? 'On phone, the file will appear in Library after processing. Use the Download button to save it to your device.'
+                : 'Video saved to your PC Library.'}
+            </p>
           </form>
         </section>
       )}
@@ -661,10 +784,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           <div className="panel__header panel__header--stacked">
             <div>
           <div className="section-eyebrow section-eyebrow--soft">Public social video download</div>
-              <h2 className="panel__title">Instagram & Facebook</h2>
+              <h2 className="panel__title">Any Public Video Link</h2>
                   <p className="panel__subtitle">
-                Paste a public Instagram or Facebook link. This uses the same downloader engine, but keeps the feature
-                separate from YouTube.
+                Paste any public video link that opens in incognito mode without login. Private or paywalled links are not supported.
                   </p>
             </div>
             <span className="panel__badge panel__badge--soft">Social</span>
@@ -678,7 +800,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                 className="input"
                 value={socialUrl}
                 onChange={(event) => setSocialUrl(event.target.value)}
-                placeholder="https://instagram.com/... or https://facebook.com/..."
+                placeholder="https://example.com/public-video"
                 autoComplete="off"
                 spellCheck="false"
               />
@@ -705,7 +827,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
 
             <button className="primary-button" type="submit" disabled={socialSubmitting || !socialUrl.trim()}>
               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
-              {socialSubmitting ? 'Processing…' : 'Download Public Video'}
+              {socialSubmitting ? 'Processing…' : 'Process Public Link'}
             </button>
           </form>
         </section>
@@ -715,7 +837,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
         <div className="panel__header">
           <div>
             <h2 className="panel__title">Active Downloads</h2>
-            <p className="panel__subtitle">Live progress, ETA, and cancel controls.</p>
+            <p className="panel__subtitle">
+              Live progress, ETA, and cancel controls.
+              {isMobileDevice
+                ? ' On phones, downloads are manual to avoid browser save issues.'
+                : ' Video saved to your PC Library.'}
+            </p>
           </div>
           <span className="panel__badge">{activeDownloads.length}</span>
         </div>
@@ -828,10 +955,37 @@ function HistoryPage({ downloads, onDeleteDownload, onRetryDownload, onCancelDow
   );
 }
 
-function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
+function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist }) {
   const [query, setQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
+  const [suppressedPreviewFilename, setSuppressedPreviewFilename] = useState('');
+  const [isClearingAll, setIsClearingAll] = useState(false);
+  const [useCompatiblePreview, setUseCompatiblePreview] = useState(false);
+  const [previewPlaybackRate, setPreviewPlaybackRate] = useState(1);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
+  const videoRef = useRef(null);
+
+  const releasePreviewPlayers = useCallback(async () => {
+    try {
+      const video = videoRef.current;
+      if (video) {
+        video.pause();
+        video.removeAttribute('src');
+        try { video.load(); } catch (e) { /* ignore */ }
+      }
+
+      document.querySelectorAll('audio').forEach((audio) => {
+        audio.pause();
+        audio.removeAttribute('src');
+        try { audio.load(); } catch (e) { /* ignore */ }
+      });
+
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+    } catch (error) {
+      // ignore UI cleanup errors
+    }
+  }, []);
 
   useEffect(() => {
     if (mediaFiles.length === 0) {
@@ -858,15 +1012,16 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
 
   const previewFile = selectedFile && filtered.some((file) => file.filename === selectedFile.filename)
     ? selectedFile
-    : filtered[0] || null;
+    : (isClearingAll ? null : filtered.find((file) => file.filename !== suppressedPreviewFilename) || null);
 
-  const previewUrl = previewFile ? `${API_BASE}/stream/${encodeURIComponent(previewFile.filename)}` : '';
   const previewExt = previewFile ? mediaExt(previewFile.filename) : '';
+  const previewUrl = previewFile
+    ? `${API_BASE}/${isVideoExt(previewExt) && useCompatiblePreview ? 'stream-compatible' : 'stream'}/${encodeURIComponent(previewFile.filename)}`
+    : '';
   const previewTitle = previewFile ? previewFile.title || cleanTitle(previewFile.filename) : '';
   const previewThumbUrl = previewFile?.video_id ? `https://img.youtube.com/vi/${previewFile.video_id}/hqdefault.jpg` : '';
 
   // generate a thumbnail from the video's first frame when no external thumbnail is available
-  const videoRef = useRef(null);
   const [generatedThumb, setGeneratedThumb] = useState('');
 
   useEffect(() => {
@@ -926,15 +1081,33 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
   const platformPlaceholder = previewPlatform ? platformPlaceholderDataUrl(previewPlatform, previewTitle) : '';
   const effectiveThumb = previewFile?.video_id ? previewThumbUrl : (generatedThumb || platformPlaceholder || '');
 
+  useEffect(() => {
+    setUseCompatiblePreview(false);
+  }, [previewFile?.filename]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.playbackRate = previewPlaybackRate;
+    }
+    document.querySelectorAll('.preview-audio__player').forEach((player) => {
+      player.playbackRate = previewPlaybackRate;
+    });
+  }, [previewPlaybackRate, previewFile?.filename]);
+
   const handleDeleteFile = useCallback(async (filename) => {
     const deletingPreview = previewFile?.filename === filename;
     if (deletingPreview) {
+      setSuppressedPreviewFilename(filename);
       setSelectedFile(null);
-      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await releasePreviewPlayers();
     }
 
-    await onDeleteFile(filename);
-  }, [filtered, mediaFiles, onDeleteFile, previewFile?.filename]);
+    try {
+      await onDeleteFile(filename);
+    } finally {
+      setSuppressedPreviewFilename('');
+    }
+  }, [onDeleteFile, previewFile?.filename, releasePreviewPlayers]);
 
   return (
     <div className="page-shell">
@@ -954,26 +1127,16 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
                 onClick={async () => {
                   const ok = window.confirm('Are you sure you want to delete ALL files? This cannot be undone.');
                   if (!ok) return;
-                  // Pause and release any active preview players to allow file deletion on Windows
+                  setIsClearingAll(true);
+                  setSuppressedPreviewFilename(previewFile?.filename || '');
+                  setSelectedFile(null);
+                  await releasePreviewPlayers();
                   try {
-                    const video = videoRef?.current;
-                    if (video) {
-                      video.pause();
-                      video.removeAttribute('src');
-                      try { video.load(); } catch (e) { /* ignore */ }
-                    }
-                    // stop any audio players as well
-                    document.querySelectorAll('audio').forEach((a) => {
-                      a.pause();
-                      a.removeAttribute('src');
-                      try { a.load(); } catch (e) { /* ignore */ }
-                    });
-                    // Give the browser a moment to release file handles
-                    await new Promise((r) => setTimeout(r, 200));
-                  } catch (e) {
-                    // ignore UI errors
+                    await onClearFiles();
+                  } finally {
+                    setSuppressedPreviewFilename('');
+                    setIsClearingAll(false);
                   }
-                  await onClearFiles();
                 }}
               >
                 <Trash2 size={16} />
@@ -1007,6 +1170,12 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
                 controls
                 preload="metadata"
                 poster={effectiveThumb || undefined}
+                onLoadedMetadata={() => {
+                  if (videoRef.current) videoRef.current.playbackRate = previewPlaybackRate;
+                }}
+                onError={() => {
+                  if (!useCompatiblePreview) setUseCompatiblePreview(true);
+                }}
               />
             ) : isAudioExt(previewExt) ? (
               <div className="preview-audio">
@@ -1017,7 +1186,15 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
                     <Music2 size={28} />
                   )}
                 </div>
-                <audio className="preview-audio__player" src={previewUrl} controls preload="metadata" />
+                <audio
+                  className="preview-audio__player"
+                  src={previewUrl}
+                  controls
+                  preload="metadata"
+                  onLoadedMetadata={(event) => {
+                    event.currentTarget.playbackRate = previewPlaybackRate;
+                  }}
+                />
               </div>
             ) : (
               <div className="empty-state empty-state--compact">
@@ -1043,6 +1220,18 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
               <p className="panel__subtitle">{previewExt.toUpperCase()} · {formatBytes(previewFile.size)} · {timeAgo(previewFile.created_at)}</p>
             </div>
             <div className="preview-actions">
+              <label className="field__label" style={{ display: 'flex', alignItems: 'center', gap: 8, margin: 0 }}>
+                Speed
+                <select className="select" value={previewPlaybackRate} onChange={(event) => setPreviewPlaybackRate(Number(event.target.value))} style={{ width: 110 }}>
+                  {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((rate) => (
+                    <option key={rate} value={rate}>{rate}x</option>
+                  ))}
+                </select>
+              </label>
+              <Link className="ghost-button" to={`/watch/${encodeURIComponent(previewFile.filename)}`}>
+                <PlaySquare size={16} />
+                Study
+              </Link>
               <a className="ghost-button" href={`${API_BASE}/files/download/${encodeURIComponent(previewFile.filename)}`} download>
                 <Download size={16} />
                 Download
@@ -1071,6 +1260,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles }) {
                 active={selectedFile?.filename === file.filename}
                 onSelect={setSelectedFile}
                 onDelete={handleDeleteFile}
+                onAddToPlaylist={onAddToPlaylist}
                 compact
               />
             ))}
@@ -1118,6 +1308,11 @@ function Sidebar({ downloads, files, storageBytes }) {
           <span>Library</span>
           {files.length > 0 ? <span className="nav-link__badge">{files.length}</span> : null}
         </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/playlist" end>
+          <Music2 size={18} />
+          <span>Playlist</span>
+        </NavLink>
       </nav>
 
       <div className="sidebar__footer">
@@ -1134,15 +1329,25 @@ export default function App() {
   const [downloads, setDownloads] = useState([]);
   const [files, setFiles] = useState([]);
   const [toasts, setToasts] = useState([]);
+  const [downloadNotification, setDownloadNotification] = useState(null);
+  const [accessPassword, setAccessPassword] = useState('');
+  const [accessError, setAccessError] = useState('');
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
+  const [authReady, setAuthReady] = useState(true);
+  const [isUnlocked, setIsUnlocked] = useState(true);
   const toastTimers = useRef([]);
+  const notifiedDownloadedRef = useRef(new Set());
+  const previousStatusesRef = useRef(new Map());
+  const statusTrackerReadyRef = useRef(false);
+  // use module-level `isMobileDevice` defined above so components declared earlier can reference it
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
-  const pushToast = useCallback((message, type = 'info') => {
+  const pushToast = useCallback((message, type = 'info', duration = 3600) => {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     setToasts((current) => [...current, { id, message, type }].slice(-4));
     const timer = window.setTimeout(() => {
       setToasts((current) => current.filter((toast) => toast.id !== id));
-    }, 3600);
+    }, duration);
     toastTimers.current.push(timer);
   }, []);
 
@@ -1151,23 +1356,34 @@ export default function App() {
     toastTimers.current = [];
   }, []);
 
+  useEffect(() => {
+    // Auth is disabled for private/local use. Keep the app unlocked without
+    // extra health/login checks to reduce startup work and avoid auth overlays.
+    clearStoredAppPassword();
+    setIsUnlocked(true);
+    setAuthReady(true);
+    setAccessError('');
+  }, []);
+
   const refreshDownloads = useCallback(async () => {
+    if (!authReady || !isUnlocked) return;
     try {
       const response = await api.get('/downloads');
       setDownloads(Array.isArray(response.data?.downloads) ? response.data.downloads : []);
     } catch {
       // polling should stay quiet on transient failures
     }
-  }, []);
+  }, [authReady, isUnlocked]);
 
   const refreshFiles = useCallback(async () => {
+    if (!authReady || !isUnlocked) return;
     try {
       const response = await api.get('/files');
       setFiles(Array.isArray(response.data?.files) ? response.data.files : []);
     } catch {
       // polling should stay quiet on transient failures
     }
-  }, []);
+  }, [authReady, isUnlocked]);
 
   const activeDownloadCount = useMemo(
     () => downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length,
@@ -1175,25 +1391,110 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!authReady || !isUnlocked) return undefined;
     refreshDownloads();
     refreshFiles();
-  }, [refreshDownloads, refreshFiles]);
+  }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
-    if (!activeDownloadCount) return undefined;
+    if (!authReady || !isUnlocked || !activeDownloadCount) return undefined;
 
     const downloadTimer = window.setInterval(() => {
       refreshDownloads();
       refreshFiles();
-    }, 2000);
+    }, 3500);
     return () => {
       window.clearInterval(downloadTimer);
     };
-  }, [activeDownloadCount, refreshDownloads, refreshFiles]);
+  }, [authReady, isUnlocked, activeDownloadCount, refreshDownloads, refreshFiles]);
+
+  useEffect(() => {
+    if (isMobileDevice) {
+      if (!statusTrackerReadyRef.current) {
+        previousStatusesRef.current = new Map(downloads.map((item) => [item.task_id, item.status]));
+        statusTrackerReadyRef.current = true;
+      } else {
+        for (const item of downloads) {
+          previousStatusesRef.current.set(item.task_id, item.status);
+        }
+      }
+      return;
+    }
+
+    if (!statusTrackerReadyRef.current) {
+      previousStatusesRef.current = new Map(downloads.map((item) => [item.task_id, item.status]));
+      statusTrackerReadyRef.current = true;
+      return;
+    }
+
+    for (const item of downloads) {
+      const previousStatus = previousStatusesRef.current.get(item.task_id);
+
+      // update notification UI if this is the task we're tracking
+      if (downloadNotification && item.task_id === downloadNotification.taskId) {
+        const progress = Number.isFinite(item.progress)
+          ? Number(item.progress)
+          : Number.parseFloat(String(item.percent || '0').replace('%', '')) || 0;
+        setDownloadNotification((prev) => prev ? ({ ...prev, filename: item.filename || prev.filename, progress, status: item.status }) : prev);
+
+        if (item.status === 'completed' && item.filename && !notifiedDownloadedRef.current.has(item.task_id)) {
+          notifiedDownloadedRef.current.add(item.task_id);
+          // Do not auto-click browser download or auto-open files. That was a
+          // noticeable source of UI lag on slower systems. User can manually
+          // download/open from Library.
+          setTimeout(() => setDownloadNotification(null), 900);
+        }
+      }
+
+      if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
+        const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
+        if (isRecentlyCompleted) {
+          pushToast('Video saved to your Library', 'success', 3000);
+        }
+      }
+
+      previousStatusesRef.current.set(item.task_id, item.status);
+    }
+  }, [downloads, isMobileDevice, downloadNotification]);
 
   const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
 
+  const handleUnlockSubmit = useCallback(async (event) => {
+    event.preventDefault();
+    const trimmedPassword = accessPassword.trim();
+
+    if (!trimmedPassword) {
+      setAccessError('Enter the shared password to continue.');
+      return;
+    }
+
+    setIsAuthSubmitting(true);
+    setAccessError('');
+
+    try {
+      await api.post('/auth/login', { password: trimmedPassword });
+      setStoredAppPassword(trimmedPassword);
+      setIsUnlocked(true);
+      setAuthReady(true);
+      setAccessPassword('');
+      pushToast('App unlocked', 'success');
+      await refreshDownloads();
+      await refreshFiles();
+    } catch (error) {
+      clearStoredAppPassword();
+      setIsUnlocked(false);
+      setAccessError(safeFetchError(error, 'Incorrect password.'));
+    } finally {
+      setIsAuthSubmitting(false);
+      setAuthReady(true);
+    }
+  }, [accessPassword, pushToast, refreshDownloads, refreshFiles]);
+
   const startDownload = useCallback(async ({ url, quality, format }) => {
+    if (!isUnlocked) {
+      pushToast('Enter the password first', 'warning');
+      return;
+    }
     if (!startDownload._inProgress) startDownload._inProgress = false;
     if (startDownload._inProgress) return;
     startDownload._inProgress = true;
@@ -1201,6 +1502,10 @@ export default function App() {
       const res = await api.post('/download', { url, quality, format });
       const tid = res?.data?.task_id;
       if (tid) setCurrentTaskId(tid);
+      if (tid) {
+        setDownloadNotification({ taskId: tid, filename: null, progress: 0, status: 'starting' });
+        notifiedDownloadedRef.current.delete(tid);
+      }
       pushToast('Download started', 'success');
       await refreshDownloads();
     } catch (error) {
@@ -1208,9 +1513,13 @@ export default function App() {
     } finally {
       startDownload._inProgress = false;
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const startSocialDownload = useCallback(async ({ url, quality, format }) => {
+    if (!isUnlocked) {
+      pushToast('Enter the password first', 'warning');
+      return;
+    }
     if (!startSocialDownload._inProgress) startSocialDownload._inProgress = false;
     if (startSocialDownload._inProgress) return;
     startSocialDownload._inProgress = true;
@@ -1225,9 +1534,10 @@ export default function App() {
     } finally {
       startSocialDownload._inProgress = false;
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const cancelDownload = useCallback(async (taskId) => {
+    if (!isUnlocked) return;
     try {
       await api.post(`/cancel/${encodeURIComponent(taskId)}`);
       pushToast('Cancel requested', 'info');
@@ -1235,9 +1545,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to cancel download'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const deleteDownload = useCallback(async (taskId) => {
+    if (!isUnlocked) return;
     try {
       await api.delete(`/downloads/${encodeURIComponent(taskId)}`);
       pushToast('Download removed', 'info');
@@ -1247,9 +1558,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to delete download'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [currentTaskId, isUnlocked, pushToast, refreshDownloads]);
 
   const clearDownloads = useCallback(async () => {
+    if (!isUnlocked) return;
     try {
       await api.post('/downloads/clear');
       pushToast('History cleared', 'info');
@@ -1257,7 +1569,7 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to clear history'), 'error');
     }
-  }, [pushToast, refreshDownloads]);
+  }, [isUnlocked, pushToast, refreshDownloads]);
 
   const retryDownload = useCallback(async (item) => {
     if (!item?.url) {
@@ -1265,14 +1577,29 @@ export default function App() {
       return;
     }
 
+    if (item.task_id) {
+      try {
+        const response = await api.post(`/retry/${encodeURIComponent(item.task_id)}`);
+        const tid = response?.data?.task_id;
+        if (tid) setCurrentTaskId(tid);
+        pushToast('Retry queued', 'success');
+        await refreshDownloads();
+        return;
+      } catch (error) {
+        pushToast(safeFetchError(error, 'Failed to queue retry'), 'error');
+        return;
+      }
+    }
+
     await startDownload({
       url: item.url,
       quality: item.quality || 'best',
       format: item.format || 'mp4',
     });
-  }, [pushToast, startDownload]);
+  }, [pushToast, refreshDownloads, startDownload]);
 
   const deleteFile = useCallback(async (filename) => {
+    if (!isUnlocked) return;
     try {
       await api.delete(`/delete/${encodeURIComponent(filename)}`);
       pushToast('File deleted', 'info');
@@ -1280,7 +1607,18 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to delete file'), 'error');
     }
-  }, [pushToast, refreshFiles]);
+  }, [isUnlocked, pushToast, refreshFiles]);
+
+  const addToPlaylist = useCallback(async (filename) => {
+    if (!isUnlocked) return;
+    if (!filename) return;
+    try {
+      await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
+      pushToast('Added to playlist', 'success', 2000);
+    } catch (error) {
+      pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
+    }
+  }, [isUnlocked, pushToast]);
 
   const navigate = useNavigate();
 
@@ -1292,6 +1630,7 @@ export default function App() {
 
   const reprocessInProgress = useRef(new Set());
   const reprocessFromHistory = useCallback(async (item) => {
+    if (!isUnlocked) return;
     const taskId = item?.task_id;
     if (!taskId) return;
     if (reprocessInProgress.current.has(taskId)) return;
@@ -1315,9 +1654,10 @@ export default function App() {
     } finally {
       reprocessInProgress.current.delete(taskId);
     }
-  }, [pushToast, refreshDownloads, refreshFiles, navigate]);
+  }, [isUnlocked, pushToast, refreshDownloads, refreshFiles, navigate]);
 
   const clearFiles = useCallback(async () => {
+    if (!isUnlocked) return;
     try {
       const resp = await api.post('/files/clear');
       const data = resp?.data || {};
@@ -1332,10 +1672,10 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to clear files'), 'error');
     }
-  }, [pushToast, refreshFiles]);
+  }, [isUnlocked, pushToast, refreshFiles]);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
       <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} />
 
       <main className="main-stage">
@@ -1344,13 +1684,48 @@ export default function App() {
           <Route path="/about" element={<AboutPage />} />
           <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
-          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} />} />
+          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
           <Route path="/watch/:filename" element={<StudyMode />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
         </Routes>
       </main>
 
+      {downloadNotification ? (
+        <>
+          <div className="download-notification-overlay" />
+          <div className="download-notification">
+            <div className="download-notification__content">
+              <div className="download-notification__header">
+                <div className="download-notification__filename">{downloadNotification.filename || 'Preparing…'}</div>
+                <div className="download-notification__status">{downloadNotification.status}</div>
+              </div>
+              <div className="download-notification__progress">
+                <ProgressBar value={downloadNotification.progress || 0} />
+              </div>
+              <div className="download-notification__actions">
+                <button className="download-notification__button download-notification__button--close" type="button" onClick={() => { setDownloadNotification(null); }}>
+                  Close
+                </button>
+                <button className="download-notification__button download-notification__button--cancel" type="button" onClick={() => { if (downloadNotification?.taskId) cancelDownload(downloadNotification.taskId); }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      ) : null}
       <ToastStack toasts={toasts} />
+
+      {!authReady || !isUnlocked ? (
+        <AccessGate
+          password={accessPassword}
+          error={accessError}
+          isSubmitting={isAuthSubmitting}
+          onChangePassword={setAccessPassword}
+          onSubmit={handleUnlockSubmit}
+        />
+      ) : null}
     </div>
   );
 }

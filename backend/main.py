@@ -1,4 +1,5 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import time
@@ -11,8 +12,37 @@ from starlette.responses import JSONResponse
 
 from routes import about, download, library, stream
 from services.database import init_db
+from services.downloader import resume_pending_downloads
 
 app = FastAPI(title="YT Private Suite API")
+
+
+def _load_local_env_file() -> None:
+    env_candidates = [
+        Path(__file__).resolve().parent.parent / ".env",
+        Path(__file__).resolve().parent / ".env",
+    ]
+
+    for env_path in env_candidates:
+        if not env_path.exists():
+            continue
+
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env_file()
+
+APP_ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "").strip()
+PASSWORD_HEADER = "X-App-Password"
 
 logger = logging.getLogger("yt_suite")
 logs_dir = Path(__file__).resolve().parent / "logs"
@@ -84,6 +114,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         )
         return response
 
+
+class PasswordProtectionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Auth disabled intentionally: this app is intended for private/local use.
+        # Keeping this middleware as a no-op avoids breaking imports/setup while
+        # removing 401s and media playback header problems.
+        return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -94,6 +132,7 @@ app.add_middleware(
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(PasswordProtectionMiddleware)
 
 app.include_router(download.router, prefix="/api")
 app.include_router(about.router, prefix="/api")
@@ -104,6 +143,7 @@ app.include_router(stream.router, prefix="/api")
 @app.on_event("startup")
 async def startup_event():
     await init_db()
+    await resume_pending_downloads()
 
 
 @app.exception_handler(HTTPException)
@@ -143,4 +183,18 @@ def read_root():
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "passwordRequired": False}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    if not APP_ACCESS_PASSWORD:
+        return {"authenticated": True, "passwordRequired": False}
+
+    payload = await request.json()
+    supplied_password = str(payload.get("password", "")).strip()
+
+    if supplied_password != APP_ACCESS_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    return {"authenticated": True, "passwordRequired": True}

@@ -1,14 +1,19 @@
 import json
-import os
-from pathlib import Path
 from typing import Dict
 
+from services.database import (
+    clear_jobs_from_db,
+    delete_job_from_db,
+    load_jobs_from_db,
+    save_jobs_to_db,
+)
 from services.files import DOWNLOAD_DIR
 
+# Legacy path kept for one-time migration from older builds.
 JOBS_PATH = DOWNLOAD_DIR / "jobs.json"
 
 
-def load_jobs() -> Dict[str, dict]:
+def _load_legacy_jobs() -> Dict[str, dict]:
     if not JOBS_PATH.exists():
         return {}
     try:
@@ -17,8 +22,24 @@ def load_jobs() -> Dict[str, dict]:
         return {}
 
 
+def load_jobs() -> Dict[str, dict]:
+    jobs = load_jobs_from_db()
+    if jobs:
+        return jobs
+
+    legacy_jobs = _load_legacy_jobs()
+    if legacy_jobs:
+        save_jobs_to_db(legacy_jobs)
+    return legacy_jobs
+
+
 def save_jobs(jobs: Dict[str, dict]) -> None:
-    JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = JOBS_PATH.with_suffix(JOBS_PATH.suffix + ".tmp")
-    temp_path.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(temp_path, JOBS_PATH)
+    save_jobs_to_db(jobs)
+
+
+def delete_job(task_id: str) -> bool:
+    return delete_job_from_db(task_id)
+
+
+def clear_jobs() -> None:
+    clear_jobs_from_db()

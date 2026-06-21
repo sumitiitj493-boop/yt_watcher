@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import mimetypes
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -11,6 +13,8 @@ from services.stream_state import active_streams
 router = APIRouter()
 
 CHUNK_SIZE = 1024 * 1024
+BROWSER_VIDEO_EXTENSIONS = {"mp4", "webm", "mov", "m4v"}
+BROWSER_AUDIO_EXTENSIONS = {"mp3", "m4a", "aac", "ogg", "wav", "flac"}
 
 
 def _etag_for_file(file_path: Path) -> str:
@@ -127,6 +131,95 @@ def build_stream_response(video_id: str, request: Request) -> Response:
 @router.get('/stream/{video_id}')
 async def stream_video(video_id: str, request: Request):
     return build_stream_response(video_id, request)
+
+
+async def _ffmpeg_transcode_generator(file_path: Path):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="FFmpeg is required for compatible playback")
+
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(file_path),
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-tune",
+        "zerolatency",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "main",
+        "-level",
+        "4.0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    active_streams.add(file_path.name)
+    try:
+        assert process.stdout is not None
+        while True:
+            chunk = await process.stdout.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        active_streams.discard(file_path.name)
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+
+
+@router.get('/stream-compatible/{video_id}')
+async def stream_compatible_video(video_id: str, request: Request):
+    """Browser-compatible playback endpoint.
+
+    Direct `/stream` is best for already-compatible files. This endpoint exists
+    for files/codecs that Chrome/Edge cannot decode, e.g. MKV, AV1-only MP4,
+    VP9-in-MP4, etc. It transcodes to fragmented H.264/AAC MP4 on the fly.
+    """
+    try:
+        file_path = resolve_download_path(video_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Invalid filename')
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail='Video not found')
+
+    ext = file_path.suffix.lower().lstrip('.')
+    if ext in BROWSER_AUDIO_EXTENSIONS:
+        return build_stream_response(video_id, request)
+
+    return StreamingResponse(
+        _ffmpeg_transcode_generator(file_path),
+        media_type='video/mp4',
+        headers={
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no',
+        },
+    )
 
 
 @router.head('/stream/{video_id}')
