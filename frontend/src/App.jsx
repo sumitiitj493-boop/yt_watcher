@@ -1318,7 +1318,7 @@ function Sidebar({ downloads, files, storageBytes }) {
       <div className="sidebar__footer">
         <div className="usage-card">
           <div className="usage-card__label">Storage</div>
-          <div className="usage-card__value">{formatBytes(storageBytes)}</div>
+          <div className="usage-card__value">{storageBytes === null ? 'Loading...' : formatBytes(storageBytes)}</div>
         </div>
       </div>
     </aside>
@@ -1457,7 +1457,23 @@ export default function App() {
     }
   }, [downloads, isMobileDevice, downloadNotification]);
 
-  const storageBytes = useMemo(() => files.reduce((sum, file) => sum + (file.size || 0), 0), [files]);
+  const [storageBytes, setStorageBytes] = useState(null);  // null = loading
+
+  // Fetch real storage from backend
+  useEffect(() => {
+    let cancelled = false;
+    const fetchStorage = async () => {
+      try {
+        const res = await api.get('/storage');
+        if (!cancelled) setStorageBytes(res.data?.total_bytes ?? 0);
+      } catch {
+        if (!cancelled) setStorageBytes(0);
+      }
+    };
+    fetchStorage();
+    const interval = setInterval(fetchStorage, 15000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [files]);  // re-fetch when files change
 
   const handleUnlockSubmit = useCallback(async (event) => {
     event.preventDefault();

@@ -53,7 +53,7 @@ Do not scale the backend to multiple replicas unless you move download state out
 If you want to run without Cloudflare tunnels:
 
 1. Run `start_everything.bat`.
-2. This starts only the local backend at `http://127.0.0.1:8000`.
+2. This starts only the local backend at `http://127.0.0.1:8005`.
 3. No scheduler, no auto tunnel process, no extra tunnel terminal.
 
 Note:

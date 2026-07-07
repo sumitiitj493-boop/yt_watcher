@@ -101,6 +101,20 @@ async def list_files():
     return {"files": _get_cached_files()}
 
 
+@router.get("/storage")
+async def get_storage():
+    """Return actual disk usage of the downloads folder in bytes."""
+    if not DOWNLOAD_DIR.exists():
+        return {"total_bytes": 0, "file_count": 0}
+    total = 0
+    count = 0
+    for file_path in DOWNLOAD_DIR.iterdir():
+        if file_path.is_file():
+            total += file_path.stat().st_size
+            count += 1
+    return {"total_bytes": total, "file_count": count}
+
+
 @router.delete("/delete/{filename}")
 async def delete_file(filename: str):
     try:

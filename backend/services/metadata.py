@@ -115,7 +115,7 @@ def _find_existing(video_id: str | None, title: str | None) -> dict | None:
 
 
 def _metadata_sync(url: str) -> Dict[str, Any]:
-    cookies_file = Path(__file__).resolve().parents[1] / "cookies.txt"
+    cookies_file = Path(__file__).resolve().parents[1] / "instagram_cookies.txt"
     ydl_opts = {
         "quiet": True,
         "skip_download": True,

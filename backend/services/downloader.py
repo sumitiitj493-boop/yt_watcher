@@ -449,9 +449,9 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         },
     }
 
-    cookies_file = Path("cookies.txt")
+    cookies_file = Path(__file__).resolve().parent.parent / "instagram_cookies.txt"
     if cookies_file.exists():
-        ydl_opts["cookiefile"] = "cookies.txt"
+        ydl_opts["cookiefile"] = str(cookies_file)
 
     if format_ext == "mp3":
         ydl_opts["postprocessors"] = [{
