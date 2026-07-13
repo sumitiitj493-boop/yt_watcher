@@ -422,6 +422,251 @@
 	background: var(--accent);
 }
 
+/* Dark theme */
+html[data-theme='dark'],
+body[data-theme='dark'] {
+	color-scheme: dark;
+	--bg: #050816;
+	--bg-strong: #090f1f;
+	--surface: rgba(11, 18, 34, 0.88);
+	--surface-muted: rgba(255, 255, 255, 0.04);
+	--text: #f8fbff;
+	--text-muted: rgba(226, 236, 255, 0.68);
+	--border: rgba(255, 255, 255, 0.12);
+	--accent: #8b5cf6;
+	--accent-strong: #6366f1;
+	--accent-cool: #22d3ee;
+	--shadow: 0 26px 70px rgba(0, 0, 0, 0.45);
+	background:
+		radial-gradient(circle at 12% 8%, rgba(139, 92, 246, 0.24), transparent 30%),
+		radial-gradient(circle at 88% 12%, rgba(34, 211, 238, 0.14), transparent 26%),
+		linear-gradient(135deg, #040613 0%, #070b1c 42%, #040817 100%);
+}
+
+html[data-theme='dark'] body,
+body[data-theme='dark'] body {
+	background:
+		radial-gradient(circle at 12% 8%, rgba(139, 92, 246, 0.24), transparent 30%),
+		radial-gradient(circle at 88% 12%, rgba(34, 211, 238, 0.14), transparent 26%),
+		linear-gradient(135deg, #040613 0%, #070b1c 42%, #040817 100%);
+	color: var(--text);
+}
+
+body[data-theme='dark'] .app-shell {
+	background:
+		radial-gradient(circle at 18% 18%, rgba(255,255,255,0.05), transparent 23%),
+		linear-gradient(115deg, rgba(255,255,255,0.035), transparent 45%);
+}
+
+body[data-theme='dark'] .sidebar {
+	background:
+		linear-gradient(160deg, rgba(255,255,255,0.14), rgba(255,255,255,0.035)),
+		rgba(4, 8, 22, 0.78);
+	border-right-color: rgba(255,255,255,0.12);
+	box-shadow: 24px 0 80px rgba(0,0,0,0.42), inset -1px 0 0 rgba(255,255,255,0.06);
+	backdrop-filter: blur(26px) saturate(145%);
+	-webkit-backdrop-filter: blur(26px) saturate(145%);
+}
+
+body[data-theme='dark'] .brand__mark {
+	background: linear-gradient(135deg, #8b5cf6, #22d3ee);
+	box-shadow: 0 0 28px rgba(34, 211, 238, 0.36), 0 18px 35px rgba(139, 92, 246, 0.34);
+}
+
+body[data-theme='dark'] .brand__title,
+body[data-theme='dark'] .page-title,
+body[data-theme='dark'] .panel__title,
+body[data-theme='dark'] .download-card__title,
+body[data-theme='dark'] .history-info h4,
+body[data-theme='dark'] .usage-card__value,
+body[data-theme='dark'] .access-gate__card h1 {
+	color: #fff;
+}
+
+body[data-theme='dark'] .brand__subtitle,
+body[data-theme='dark'] .page-subtitle,
+body[data-theme='dark'] .panel__subtitle,
+body[data-theme='dark'] .field__label,
+body[data-theme='dark'] .download-card__meta,
+body[data-theme='dark'] .history-info p,
+body[data-theme='dark'] .redo-icon,
+body[data-theme='dark'] .note-content,
+body[data-theme='dark'] .notes-section,
+body[data-theme='dark'] .download-location,
+body[data-theme='dark'] .progress-stats,
+body[data-theme='dark'] .usage-card__label {
+	color: rgba(226, 236, 255, 0.68);
+}
+
+body[data-theme='dark'] .nav-link {
+	color: rgba(226, 236, 255, 0.72);
+}
+
+body[data-theme='dark'] .nav-link:hover,
+body[data-theme='dark'] .nav-link--active {
+	background: linear-gradient(135deg, rgba(139,92,246,0.22), rgba(34,211,238,0.1));
+	border-color: rgba(255,255,255,0.14);
+	color: #fff;
+}
+
+body[data-theme='dark'] .nav-link__badge,
+body[data-theme='dark'] .panel__badge,
+body[data-theme='dark'] .status-pill--completed,
+body[data-theme='dark'] .status-pill--downloading,
+body[data-theme='dark'] .status-pill--starting,
+body[data-theme='dark'] .status-pill--pending,
+body[data-theme='dark'] .status-pill--queued,
+body[data-theme='dark'] .status-pill--processing,
+body[data-theme='dark'] .status-pill--error,
+body[data-theme='dark'] .status-pill--cancelled {
+	box-shadow: none;
+}
+
+body[data-theme='dark'] .usage-card,
+body[data-theme='dark'] .panel,
+body[data-theme='dark'] .download-card,
+body[data-theme='dark'] .file-card,
+body[data-theme='dark'] .history-card,
+body[data-theme='dark'] .about-card,
+body[data-theme='dark'] .about-hero,
+body[data-theme='dark'] .about-profile-card,
+body[data-theme='dark'] .access-gate__card,
+body[data-theme='dark'] .preview-thumb-card,
+body[data-theme='dark'] .download-form,
+body[data-theme='dark'] .status-container,
+body[data-theme='dark'] .notes-section {
+	background:
+		linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04) 38%, rgba(255,255,255,0.03)),
+		rgba(8, 13, 30, 0.72);
+	border-color: rgba(255,255,255,0.12);
+	box-shadow:
+		inset 0 1px 0 rgba(255,255,255,0.16),
+		inset 0 -1px 0 rgba(255,255,255,0.04),
+		0 28px 70px rgba(0,0,0,0.38);
+}
+
+body[data-theme='dark'] .panel::before,
+body[data-theme='dark'] .download-card::before,
+body[data-theme='dark'] .history-card::before,
+body[data-theme='dark'] .file-card::before {
+	background: linear-gradient(110deg, transparent, rgba(255,255,255,0.08), transparent);
+}
+
+body[data-theme='dark'] .ghost-button,
+body[data-theme='dark'] .icon-button,
+body[data-theme='dark'] .refresh-btn,
+body[data-theme='dark'] .cancel-btn,
+body[data-theme='dark'] .open-folder-btn,
+body[data-theme='dark'] .delete-btn,
+body[data-theme='dark'] .theme-toggle {
+	background: rgba(10, 16, 31, 0.88);
+	border-color: rgba(255,255,255,0.12);
+	color: #e2ecff;
+}
+
+body[data-theme='dark'] .ghost-button:hover,
+body[data-theme='dark'] .icon-button:hover,
+body[data-theme='dark'] .refresh-btn:hover,
+body[data-theme='dark'] .cancel-btn:hover,
+body[data-theme='dark'] .open-folder-btn:hover,
+body[data-theme='dark'] .delete-btn:hover,
+body[data-theme='dark'] .theme-toggle:hover {
+	border-color: rgba(139,92,246,0.45);
+	color: #fff;
+}
+
+body[data-theme='dark'] .primary-button {
+	box-shadow: 0 20px 32px rgba(99, 102, 241, 0.28);
+}
+
+body[data-theme='dark'] .input,
+body[data-theme='dark'] .select,
+body[data-theme='dark'] .download-form input,
+body[data-theme='dark'] .download-form select,
+body[data-theme='dark'] .note-form input,
+body[data-theme='dark'] .library-search input {
+	background: rgba(8, 13, 28, 0.9);
+	color: #f8fbff;
+	border-color: rgba(255,255,255,0.14);
+}
+
+body[data-theme='dark'] .input:focus,
+body[data-theme='dark'] .select:focus,
+body[data-theme='dark'] .download-form input:focus,
+body[data-theme='dark'] .download-form select:focus,
+body[data-theme='dark'] .note-form input:focus,
+body[data-theme='dark'] .library-search input:focus {
+	background: rgba(8, 13, 28, 0.98);
+	box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.2);
+}
+
+body[data-theme='dark'] .panel__badge--soft,
+body[data-theme='dark'] .section-eyebrow,
+body[data-theme='dark'] .status-label,
+body[data-theme='dark'] .note-timestamp {
+	color: #8b5cf6;
+}
+
+body[data-theme='dark'] .preview-media,
+body[data-theme='dark'] .preview-player,
+body[data-theme='dark'] .player-wrapper,
+body[data-theme='dark'] .history-thumb,
+body[data-theme='dark'] .audio-cover,
+body[data-theme='dark'] .preview-audio,
+body[data-theme='dark'] .preview-audio__art,
+body[data-theme='dark'] .preview-thumb-card,
+body[data-theme='dark'] .media-thumb {
+	background-color: #0a1020;
+}
+
+body[data-theme='dark'] .preview-thumb-card__fallback,
+body[data-theme='dark'] .audio-cover-fallback,
+body[data-theme='dark'] .history-thumb-fallback,
+body[data-theme='dark'] .media-thumb--fallback {
+	background: linear-gradient(135deg, rgba(99,102,241,0.18), rgba(124,58,237,0.22));
+}
+
+body[data-theme='dark'] .preview-thumb-card__title {
+	color: #f8fbff;
+}
+
+body[data-theme='dark'] .note-card {
+	background: rgba(11, 18, 34, 0.84);
+	border-color: rgba(255,255,255,0.08);
+}
+
+body[data-theme='dark'] .download-card--active {
+	box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+}
+
+body[data-theme='dark'] .download-card__error,
+body[data-theme='dark'] .error {
+	color: #f87171;
+}
+
+body[data-theme='dark'] .theme-toggle {
+	justify-content: flex-start;
+	width: 100%;
+	padding: 12px 14px;
+	border-radius: 16px;
+	font-weight: 700;
+}
+
+body[data-theme='dark'] .theme-toggle svg {
+	flex-shrink: 0;
+}
+
+body[data-theme='dark'] .sidebar__footer {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+body[data-theme='dark'] .main-stage {
+	background: transparent;
+}
+
+
 
 @media (max-width: 980px) {
 	.app-layout {
@@ -856,14 +1101,12 @@
 .download-card__title {
 	margin: 0;
 	font-size: 15px;
+	line-height: 1.25;
 	font-weight: 700;
 	color: #0f172a;
 	letter-spacing: -0.02em;
 	overflow: hidden;
-	text-overflow: ellipsis;
-	display: -webkit-box;
-	-webkit-line-clamp: 2;
-	-webkit-box-orient: vertical;
+	max-height: 2.5em;
 }
 
 .download-card__meta,
@@ -1111,10 +1354,8 @@
 	text-align: center;
 	font-size: 14px;
 	line-height: 1.2;
-	display: -webkit-box;
-	-webkit-line-clamp: 2;
-	-webkit-box-orient: vertical;
 	overflow: hidden;
+	max-height: 2.4em;
 }
 
 .media-thumb--fallback { 
@@ -1186,14 +1427,12 @@
 .file-card__title {
 	margin: 0;
 	font-size: 15px;
+	line-height: 1.25;
 	font-weight: 700;
 	letter-spacing: -0.02em;
 	color: #0f172a;
 	overflow: hidden;
-	text-overflow: ellipsis;
-	display: -webkit-box;
-	-webkit-line-clamp: 2;
-	-webkit-box-orient: vertical;
+	max-height: 2.5em;
 }
 
 .file-card__meta {
@@ -1949,7 +2188,7 @@
 	}
 
 	.download-card--compact .download-card__title {
-		-webkit-line-clamp: 2;
+		max-height: 2.5em;
 	}
 
 	.download-card--compact .download-card__actions {

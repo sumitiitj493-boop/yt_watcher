@@ -10,6 +10,7 @@ import {
   Loader2,
   GraduationCap,
   MapPin,
+  Moon,
   PlaySquare,
   RefreshCw,
   RotateCcw,
@@ -20,11 +21,11 @@ import {
   X,
   Music2,
   Plus,
+  SunMedium,
 } from 'lucide-react';
 
 import './App.css';
 import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
-import StudyMode from './pages/StudyMode';
 import PlaylistPage from './pages/Playlist';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
@@ -76,6 +77,8 @@ const ABOUT_HIGHLIGHTS = [
     Icon: ShieldCheck,
   },
 ];
+
+const THEME_STORAGE_KEY = 'yt-watcher-theme';
 
 function GitHubMark() {
   return (
@@ -162,6 +165,15 @@ function timeAgo(timestamp) {
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
   if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
   return new Date(timestamp * 1000).toLocaleDateString();
+}
+
+function formatTranscriptTime(seconds = 0) {
+  const safe = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const secs = Math.floor(safe % 60);
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  return `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
 function qualityLabel(value) {
@@ -962,6 +974,8 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const [isClearingAll, setIsClearingAll] = useState(false);
   const [useCompatiblePreview, setUseCompatiblePreview] = useState(false);
   const [previewPlaybackRate, setPreviewPlaybackRate] = useState(1);
+  const [transcriptButtonLabel, setTranscriptButtonLabel] = useState('Get Transcript');
+  const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
   const videoRef = useRef(null);
 
@@ -1086,6 +1100,11 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   }, [previewFile?.filename]);
 
   useEffect(() => {
+    setTranscriptButtonLabel('Get Transcript');
+    setIsTranscriptLoading(false);
+  }, [previewFile?.filename]);
+
+  useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = previewPlaybackRate;
     }
@@ -1108,6 +1127,42 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
       setSuppressedPreviewFilename('');
     }
   }, [onDeleteFile, previewFile?.filename, releasePreviewPlayers]);
+
+  const handleGetTranscript = useCallback(async () => {
+    if (!previewFile?.filename || isTranscriptLoading) return;
+
+    setIsTranscriptLoading(true);
+    setTranscriptButtonLabel('Getting...');
+
+    try {
+      const response = await api.get(`/transcript/${encodeURIComponent(previewFile.filename)}`);
+      const segments = Array.isArray(response.data?.segments) ? response.data.segments : [];
+      const transcriptText = segments
+        .map((segment) => {
+          const text = String(segment?.text || '').trim();
+          if (!text) return '';
+          return `[${formatTranscriptTime(segment.start)}] ${text}`;
+        })
+        .filter(Boolean)
+        .join('\n');
+
+      if (!transcriptText) {
+        setTranscriptButtonLabel('No Transcript');
+        window.setTimeout(() => setTranscriptButtonLabel('Get Transcript'), 1800);
+        return;
+      }
+
+      await navigator.clipboard.writeText(transcriptText);
+      setTranscriptButtonLabel('Copied');
+      window.setTimeout(() => setTranscriptButtonLabel('Get Transcript'), 1800);
+    } catch (error) {
+      console.error('Failed to copy transcript:', error);
+      setTranscriptButtonLabel('Failed');
+      window.setTimeout(() => setTranscriptButtonLabel('Get Transcript'), 1800);
+    } finally {
+      setIsTranscriptLoading(false);
+    }
+  }, [isTranscriptLoading, previewFile?.filename]);
 
   return (
     <div className="page-shell">
@@ -1228,10 +1283,10 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                   ))}
                 </select>
               </label>
-              <Link className="ghost-button" to={`/watch/${encodeURIComponent(previewFile.filename)}`}>
+              <button className="primary-button" type="button" onClick={handleGetTranscript} disabled={isTranscriptLoading}>
                 <PlaySquare size={16} />
-                Study
-              </Link>
+                {transcriptButtonLabel}
+              </button>
               <a className="ghost-button" href={`${API_BASE}/files/download/${encodeURIComponent(previewFile.filename)}`} download>
                 <Download size={16} />
                 Download
@@ -1271,8 +1326,9 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   );
 }
 
-function Sidebar({ downloads, files, storageBytes }) {
+function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length;
+  const themeIsDark = theme === 'dark';
 
   return (
     <aside className="sidebar">
@@ -1316,6 +1372,10 @@ function Sidebar({ downloads, files, storageBytes }) {
       </nav>
 
       <div className="sidebar__footer">
+        <button className="theme-toggle" type="button" onClick={onToggleTheme} aria-label={`Switch to ${themeIsDark ? 'light' : 'dark'} mode`}>
+          {themeIsDark ? <SunMedium size={16} /> : <Moon size={16} />}
+          <span>{themeIsDark ? 'Light mode' : 'Dark mode'}</span>
+        </button>
         <div className="usage-card">
           <div className="usage-card__label">Storage</div>
           <div className="usage-card__value">{storageBytes === null ? 'Loading...' : formatBytes(storageBytes)}</div>
@@ -1335,6 +1395,11 @@ export default function App() {
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
   const [authReady, setAuthReady] = useState(true);
   const [isUnlocked, setIsUnlocked] = useState(true);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === 'undefined') return 'dark';
+    const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return storedTheme === 'light' || storedTheme === 'dark' ? storedTheme : 'dark';
+  });
   const toastTimers = useRef([]);
   const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
@@ -1355,6 +1420,14 @@ export default function App() {
     toastTimers.current.forEach((timer) => window.clearTimeout(timer));
     toastTimers.current = [];
   }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    document.body.dataset.theme = theme;
+    root.style.colorScheme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
     // Auth is disabled for private/local use. Keep the app unlocked without
@@ -1690,9 +1763,13 @@ export default function App() {
     }
   }, [isUnlocked, pushToast, refreshFiles]);
 
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
+  }, []);
+
   return (
     <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
-      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} />
+      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} />
 
       <main className="main-stage">
         <Routes>
@@ -1702,7 +1779,6 @@ export default function App() {
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
-          <Route path="/watch/:filename" element={<StudyMode />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
         </Routes>
       </main>

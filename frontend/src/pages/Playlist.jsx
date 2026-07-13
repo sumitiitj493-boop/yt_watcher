@@ -15,6 +15,42 @@ const extractVideoId = (filename = '') => {
   const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
   return match ? match[1] : '';
 };
+const formatTime = (seconds = 0) => {
+  const safe = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const secs = Math.floor(safe % 60);
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  return `${minutes}:${String(secs).padStart(2, '0')}`;
+};
+
+const naturalCompare = (left, right) => {
+  const leftParts = String(left).match(/\d+|\D+/g) || [];
+  const rightParts = String(right).match(/\d+|\D+/g) || [];
+  const length = Math.max(leftParts.length, rightParts.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index];
+    const rightPart = rightParts[index];
+
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+
+    const leftNumber = Number(leftPart);
+    const rightNumber = Number(rightPart);
+    const leftIsNumber = Number.isFinite(leftNumber) && String(leftNumber) === leftPart;
+    const rightIsNumber = Number.isFinite(rightNumber) && String(rightNumber) === rightPart;
+
+    if (leftIsNumber && rightIsNumber && leftNumber !== rightNumber) {
+      return leftNumber - rightNumber;
+    }
+
+    const comparison = leftPart.localeCompare(rightPart, undefined, { sensitivity: 'base' });
+    if (comparison !== 0) return comparison;
+  }
+
+  return 0;
+};
 
 function PlaylistThumb({ file }) {
   const title = file.title || cleanTitle(file.filename || '');
@@ -49,6 +85,8 @@ export default function PlaylistPage({ files = [], onNotify }) {
   const [playbackRate, setPlaybackRate] = useState(1);
   const [useCompatiblePlayback, setUseCompatiblePlayback] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [transcriptStatus, setTranscriptStatus] = useState('Get Transcript');
+  const [transcriptLoading, setTranscriptLoading] = useState(false);
   const playerRef = useRef(null);
 
   const fileMap = useMemo(() => new Map(files.map((file) => [file.filename, file])), [files]);
@@ -90,6 +128,11 @@ export default function PlaylistPage({ files = [], onNotify }) {
   }, [currentFile?.filename]);
 
   useEffect(() => {
+    setTranscriptStatus('Get Transcript');
+    setTranscriptLoading(false);
+  }, [currentFile?.filename]);
+
+  useEffect(() => {
     if (playerRef.current) {
       playerRef.current.playbackRate = playbackRate;
     }
@@ -110,6 +153,22 @@ export default function PlaylistPage({ files = [], onNotify }) {
       notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
       refreshPlaylist();
     }
+  };
+
+  const sortPlaylist = (direction) => {
+    if (playlist.length < 2) return;
+    const next = [...playlist].sort((left, right) => {
+      const leftTitle = fileMap.get(left)?.title || cleanTitle(left);
+      const rightTitle = fileMap.get(right)?.title || cleanTitle(right);
+      return naturalCompare(leftTitle, rightTitle);
+    });
+
+    if (direction === 'desc') {
+      next.reverse();
+    }
+
+    setCurrentIndex(0);
+    saveOrder(next);
   };
 
   const addSelected = async () => {
@@ -175,6 +234,36 @@ export default function PlaylistPage({ files = [], onNotify }) {
     }
   };
 
+  const copyPlaylistTranscript = async () => {
+    if (!currentFile?.filename || transcriptLoading) return;
+    setTranscriptLoading(true);
+    setTranscriptStatus('Getting...');
+    try {
+      const response = await api.get(`/transcript/${encodeURIComponent(currentFile.filename)}`);
+      const segments = Array.isArray(response.data?.segments) ? response.data.segments : [];
+      const transcriptText = segments
+        .map((segment) => `[${formatTime(segment.start)}] ${String(segment.text || '').trim()}`)
+        .filter(Boolean)
+        .join('\n');
+
+      if (!transcriptText) {
+        notify('No transcript available for this item', 'error');
+        setTranscriptStatus('No Transcript');
+        return;
+      }
+
+      await navigator.clipboard.writeText(transcriptText);
+      setTranscriptStatus('Copied');
+      notify('Transcript copied to clipboard', 'success');
+      window.setTimeout(() => setTranscriptStatus('Get Transcript'), 1800);
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to get transcript', 'error');
+      setTranscriptStatus('Get Transcript');
+    } finally {
+      setTranscriptLoading(false);
+    }
+  };
+
   return (
     <div className="page-shell">
       <div className="page-header">
@@ -183,6 +272,12 @@ export default function PlaylistPage({ files = [], onNotify }) {
           <p className="page-subtitle">Build a private queue from your saved library, reorder it, and play continuously.</p>
         </div>
         <div className="page-header__actions">
+          <button className="ghost-button" type="button" onClick={() => sortPlaylist('asc')} disabled={playlist.length < 2}>
+            Sort 1-9
+          </button>
+          <button className="ghost-button" type="button" onClick={() => sortPlaylist('desc')} disabled={playlist.length < 2}>
+            Sort 9-1
+          </button>
           <button className="ghost-button" type="button" onClick={refreshPlaylist}>Refresh</button>
           <button className="ghost-button" type="button" onClick={shufflePlaylist} disabled={playlist.length < 2}>
             <Shuffle size={16} /> Shuffle
@@ -262,6 +357,9 @@ export default function PlaylistPage({ files = [], onNotify }) {
                   ))}
                 </select>
               </label>
+              <button className="primary-button" type="button" onClick={copyPlaylistTranscript} disabled={transcriptLoading}>
+                {transcriptStatus}
+              </button>
               <button className="ghost-button" type="button" onClick={togglePlay}>
                 {isPlaying ? <Pause size={16} /> : <Play size={16} />}
                 {isPlaying ? 'Pause' : 'Play'}
@@ -291,7 +389,19 @@ export default function PlaylistPage({ files = [], onNotify }) {
         ) : (
           <div className="stack-list">
             {playlistFiles.map((file, index) => (
-              <article key={`${file.filename}-${index}`} className={`download-card ${index === currentIndex ? 'download-card--active' : ''}`}>
+              <article
+                key={`${file.filename}-${index}`}
+                className={`download-card ${index === currentIndex ? 'download-card--active' : ''}`}
+                role="button"
+                tabIndex={0}
+                onClick={() => playIndex(index)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    playIndex(index);
+                  }
+                }}
+              >
                 <PlaylistThumb file={file} />
                 <div className="download-card__body">
                   <div className="download-card__title-row">
@@ -304,10 +414,10 @@ export default function PlaylistPage({ files = [], onNotify }) {
                   </div>
                 </div>
                 <div className="download-card__actions">
-                  <button className="icon-button" type="button" onClick={() => playIndex(index)} title="Play"><Play size={15} /></button>
-                  <button className="icon-button" type="button" onClick={() => moveItem(index, -1)} disabled={index === 0} title="Move up">↑</button>
-                  <button className="icon-button" type="button" onClick={() => moveItem(index, 1)} disabled={index === playlist.length - 1} title="Move down">↓</button>
-                  <button className="icon-button icon-button--danger" type="button" onClick={() => removeItem(file.filename)} title="Remove"><Trash2 size={15} /></button>
+                  <button className="icon-button" type="button" onClick={(event) => { event.stopPropagation(); playIndex(index); }} title="Play"><Play size={15} /></button>
+                  <button className="icon-button" type="button" onClick={(event) => { event.stopPropagation(); moveItem(index, -1); }} disabled={index === 0} title="Move up">↑</button>
+                  <button className="icon-button" type="button" onClick={(event) => { event.stopPropagation(); moveItem(index, 1); }} disabled={index === playlist.length - 1} title="Move down">↓</button>
+                  <button className="icon-button icon-button--danger" type="button" onClick={(event) => { event.stopPropagation(); removeItem(file.filename); }} title="Remove"><Trash2 size={15} /></button>
                 </div>
               </article>
             ))}

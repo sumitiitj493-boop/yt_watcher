@@ -3,6 +3,9 @@ import os
 import re
 import time
 import uuid
+import base64
+import urllib.request
+from urllib.parse import parse_qs
 from pathlib import Path
 from threading import RLock
 from typing import Dict, List
@@ -49,6 +52,36 @@ def _clean(value: str) -> str:
 
 def _normalize_quality(value: str) -> str:
     return str(value).strip().lower().replace("p", "")
+
+
+def _extract_custom_url(url: str) -> str | None:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+        match = re.search(r'player-x\.php\?q=([A-Za-z0-9+/=]+)', html)
+        if match:
+            q_b64 = match.group(1)
+            decoded = base64.b64decode(q_b64).decode('utf-8', errors='ignore')
+            parsed = parse_qs(decoded)
+            if 'tag' in parsed:
+                tag_html = parsed['tag'][0]
+                src_match = re.search(r'src=["\']([^"\']+)["\']', tag_html)
+                if src_match:
+                    return src_match.group(1)
+    except Exception as e:
+        pass
+    return None
 
 
 def _categorize_error(message: str) -> str:
@@ -481,6 +514,10 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         # Some public sites are not recognized by platform extractors.
         # Retry with yt-dlp generic extractor before failing.
         if "Unsupported URL" in clean_error:
+            custom_extracted = _extract_custom_url(url)
+            if custom_extracted:
+                url = custom_extracted
+
             try:
                 generic_opts = dict(ydl_opts)
                 generic_opts["force_generic_extractor"] = True

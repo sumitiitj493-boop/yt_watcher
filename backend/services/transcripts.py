@@ -53,6 +53,28 @@ def _clean_caption_text(text: str) -> str:
     return text
 
 
+def _dedupe_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for segment in segments:
+        text = _clean_caption_text(str(segment.get("text", "")))
+        if not text:
+            continue
+
+        start = round(float(segment.get("start", 0.0) or 0.0), 3)
+        end = round(float(segment.get("end", start) or start), 3)
+
+        if deduped:
+            previous = deduped[-1]
+            same_text = previous["text"] == text
+            same_window = abs(previous["start"] - start) <= 0.5 and abs(previous["end"] - end) <= 0.5
+            if same_text and same_window:
+                previous["end"] = max(previous["end"], end)
+                continue
+
+        deduped.append({"start": start, "end": end, "text": text})
+    return deduped
+
+
 def parse_vtt(vtt_text: str) -> list[dict[str, Any]]:
     lines = vtt_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     segments: list[dict[str, Any]] = []
@@ -71,14 +93,14 @@ def parse_vtt(vtt_text: str) -> list[dict[str, Any]]:
             text_lines.append(lines[index].strip())
             index += 1
         text = _clean_caption_text(" ".join(text_lines))
-        if text and (not segments or segments[-1].get("text") != text or abs(segments[-1].get("start", 0) - start) > 0.5):
+        if text:
             segments.append({
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "text": text,
             })
         index += 1
-    return segments
+    return _dedupe_segments(segments)
 
 
 def _write_vtt_from_segments(path: Path, segments: list[dict[str, Any]]) -> None:
@@ -98,12 +120,16 @@ def _cached_transcript(filename: str) -> dict | None:
     if json_path.exists():
         try:
             data = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(data.get("segments"), list):
+                data["segments"] = _dedupe_segments(data["segments"])
+                if data["segments"]:
+                    data["available"] = True
             data["cached"] = True
             return data
         except Exception:
             pass
     if vtt_path.exists():
-        segments = parse_vtt(vtt_path.read_text(encoding="utf-8", errors="ignore"))
+        segments = _dedupe_segments(parse_vtt(vtt_path.read_text(encoding="utf-8", errors="ignore")))
         return {
             "available": bool(segments),
             "source": "cache",
@@ -117,6 +143,7 @@ def _save_transcript(filename: str, source: str, segments: list[dict[str, Any]])
     key = _safe_key(filename)
     vtt_path = TRANSCRIPT_DIR / f"{key}.vtt"
     json_path = TRANSCRIPT_DIR / f"{key}.json"
+    segments = _dedupe_segments(segments)
     _write_vtt_from_segments(vtt_path, segments)
     data = {
         "available": bool(segments),
@@ -144,9 +171,42 @@ def _find_downloaded_subtitle_file(key: str) -> Path | None:
     return None
 
 
+def _find_cached_transcript_payload(key: str) -> dict | None:
+    json_candidates = sorted(TRANSCRIPT_DIR.glob(f"{key}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for candidate in json_candidates:
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data.get("segments"), list):
+            data["segments"] = _dedupe_segments(data["segments"])
+            if data["segments"]:
+                data["available"] = True
+            data["cached"] = True
+            return data
+
+    subtitle_path = _find_downloaded_subtitle_file(key)
+    if subtitle_path:
+        segments = _dedupe_segments(parse_vtt(subtitle_path.read_text(encoding="utf-8", errors="ignore")))
+        if segments:
+            return {
+                "available": True,
+                "source": "cache",
+                "segments": segments,
+                "cached": True,
+            }
+
+    return None
+
+
 def fetch_online_transcript_sync(filename: str, force: bool = False) -> dict:
     if not force:
         cached = _cached_transcript(filename)
+        if cached:
+            return cached
+
+        key = _safe_key(filename)
+        cached = _find_cached_transcript_payload(key)
         if cached:
             return cached
 
@@ -262,7 +322,7 @@ def _transcribe_with_faster_whisper(audio_path: Path) -> list[dict[str, Any]]:
         text = _clean_caption_text(segment.text)
         if text:
             segments.append({"start": round(float(segment.start), 3), "end": round(float(segment.end), 3), "text": text})
-    return segments
+    return _dedupe_segments(segments)
 
 
 def _transcribe_with_whisper_cli(audio_path: Path, key: str) -> list[dict[str, Any]]:
