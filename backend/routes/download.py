@@ -3,8 +3,9 @@ import asyncio
 from fastapi import APIRouter, HTTPException, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from models import DownloadRequest, MetadataRequest, SocialDownloadRequest
+from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
 from services.metadata import fetch_metadata
+from services.transcripts import fetch_url_transcript
 from services.url_guard import validate_public_url
 from services.downloader import (
     clear_downloads,
@@ -33,6 +34,17 @@ async def video_metadata(request: MetadataRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to fetch metadata: {exc}")
+
+
+@router.post("/transcript-from-url")
+async def transcript_from_url(request: TranscriptUrlRequest):
+    try:
+        safe_url = await validate_public_url(str(request.url))
+        return await fetch_url_transcript(safe_url, request.force)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to fetch transcript: {exc}")
 
 
 @router.post("/download")

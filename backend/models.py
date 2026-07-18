@@ -28,6 +28,11 @@ class MetadataRequest(BaseModel):
     url: HttpUrl
 
 
+class TranscriptUrlRequest(BaseModel):
+    url: HttpUrl
+    force: bool = Field(default=False)
+
+
 class SocialDownloadRequest(BaseModel):
     url: HttpUrl
     quality: str = Field(default="best")

@@ -3,7 +3,9 @@ import { Link, Navigate, NavLink, Route, Routes, useNavigate, useLocation } from
 import {
   BadgeCheck,
   ChevronRight,
+  Clipboard,
   Download,
+  FileText,
   HardDrive,
   History,
   LibraryBig,
@@ -587,11 +589,23 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [socialFormat, setSocialFormat] = useState('mp4');
   const [submitting, setSubmitting] = useState(false);
   const [socialSubmitting, setSocialSubmitting] = useState(false);
+  const [transcriptUrl, setTranscriptUrl] = useState('');
+  const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [transcriptResult, setTranscriptResult] = useState(null);
+  const [transcriptError, setTranscriptError] = useState('');
+  const [transcriptCopyStatus, setTranscriptCopyStatus] = useState('Copy Transcript');
   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
   const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
   const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
+  const transcriptText = transcriptResult?.text || (transcriptResult?.segments || [])
+    .map((segment) => {
+      const text = String(segment.text || '').trim();
+      return text ? `[${formatTranscriptTime(segment.start)}] ${text}` : '';
+    })
+    .filter(Boolean)
+    .join('\n');
 
   const location = useLocation();
   useEffect(() => {
@@ -666,12 +680,102 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
     }
   };
 
+  const handleFetchTranscript = async (event) => {
+    event.preventDefault();
+    const trimmed = transcriptUrl.trim();
+    if (!trimmed || transcriptLoading) return;
+
+    setTranscriptLoading(true);
+    setTranscriptError('');
+    setTranscriptResult(null);
+    setTranscriptCopyStatus('Copy Transcript');
+    try {
+      const response = await api.post('/transcript-from-url', { url: trimmed });
+      const data = response.data || null;
+      if (!data?.available) {
+        setTranscriptError(data?.reason || 'No transcript is available for this URL.');
+        return;
+      }
+      setTranscriptResult(data);
+    } catch (error) {
+      setTranscriptError(safeFetchError(error, 'Unable to fetch transcript.'));
+    } finally {
+      setTranscriptLoading(false);
+    }
+  };
+
+  const handleCopyUrlTranscript = async () => {
+    if (!transcriptText) return;
+    try {
+      await navigator.clipboard.writeText(transcriptText);
+      setTranscriptCopyStatus('Copied');
+      window.setTimeout(() => setTranscriptCopyStatus('Copy Transcript'), 1600);
+    } catch (error) {
+      setTranscriptCopyStatus('Copy Failed');
+      window.setTimeout(() => setTranscriptCopyStatus('Copy Transcript'), 1600);
+    }
+  };
+
   return (
     <div className="page-shell">
       <SectionHeader
         title="Download Video"
         subtitle="Paste a YouTube URL, process it, then choose to watch online or download the saved file."
       />
+
+      <section className="panel panel--form transcript-url-panel">
+        <div className="panel__header panel__header--stacked">
+          <div>
+            <div className="section-eyebrow section-eyebrow--soft">Transcript without download</div>
+            <h2 className="panel__title">Fast URL Transcript</h2>
+            <p className="panel__subtitle">
+              Paste a video URL and fetch available captions directly. No video file is downloaded.
+            </p>
+          </div>
+          <span className="panel__badge panel__badge--soft">Fast</span>
+        </div>
+
+        <form onSubmit={handleFetchTranscript} className="download-form">
+          <div className="field field--full">
+            <label className="field__label" htmlFor="transcript-url">TRANSCRIPT URL</label>
+            <input
+              id="transcript-url"
+              className="input"
+              value={transcriptUrl}
+              onChange={(event) => {
+                setTranscriptUrl(event.target.value);
+                setTranscriptError('');
+              }}
+              placeholder="https://youtube.com/watch?v=..."
+              autoComplete="off"
+              spellCheck="false"
+            />
+          </div>
+
+          {transcriptError ? <p className="download-card__error">{transcriptError}</p> : null}
+
+          <div className="transcript-actions">
+            <button className="primary-button" type="submit" disabled={transcriptLoading || !transcriptUrl.trim()}>
+              {transcriptLoading ? <Loader2 className="spinner" size={16} /> : <FileText size={16} />}
+              {transcriptLoading ? 'Fetching...' : 'Fetch Transcript'}
+            </button>
+            <button className="ghost-button" type="button" onClick={handleCopyUrlTranscript} disabled={!transcriptText}>
+              <Clipboard size={16} />
+              {transcriptCopyStatus}
+            </button>
+          </div>
+        </form>
+
+        {transcriptResult?.available ? (
+          <div className="transcript-result">
+            <div className="download-card__title-row">
+              <h3 className="download-card__title">{transcriptResult.title || 'Transcript ready'}</h3>
+              <span className="status-pill status-pill--completed">{transcriptResult.segments?.length || 0} lines</span>
+            </div>
+            <textarea className="transcript-textarea" readOnly value={transcriptText} />
+          </div>
+        ) : null}
+      </section>
 
       {/* Toggle Switch */}
       <section className="panel panel--toggle">

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,29 @@ def _safe_key(filename: str) -> str:
     if video_id:
         return video_id
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem)[:140]
+
+
+def _safe_url_key(url: str) -> str:
+    return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:24]
+
+
+def _transcript_text(segments: list[dict[str, Any]]) -> str:
+    lines = []
+    for segment in segments:
+        text = _clean_caption_text(str(segment.get("text", "")))
+        if text:
+            lines.append(f"[{_seconds_to_display_time(float(segment.get('start', 0.0) or 0.0))}] {text}")
+    return "\n".join(lines)
+
+
+def _seconds_to_display_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def _seconds_to_vtt_time(seconds: float) -> str:
@@ -156,6 +180,25 @@ def _save_transcript(filename: str, source: str, segments: list[dict[str, Any]])
     return data
 
 
+def _save_transcript_by_key(key: str, source: str, segments: list[dict[str, Any]], extra: dict | None = None) -> dict:
+    vtt_path = TRANSCRIPT_DIR / f"{key}.vtt"
+    json_path = TRANSCRIPT_DIR / f"{key}.json"
+    segments = _dedupe_segments(segments)
+    _write_vtt_from_segments(vtt_path, segments)
+    data = {
+        "available": bool(segments),
+        "source": source,
+        "segments": segments,
+        "text": _transcript_text(segments),
+        "cached": True,
+        "updated_at": time.time(),
+    }
+    if extra:
+        data.update(extra)
+    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return data
+
+
 def _youtube_url_for_filename(filename: str) -> str | None:
     video_id = extract_video_id(filename)
     if not video_id:
@@ -250,6 +293,71 @@ def fetch_online_transcript_sync(filename: str, force: bool = False) -> dict:
 
 async def fetch_online_transcript(filename: str, force: bool = False) -> dict:
     return await asyncio.to_thread(fetch_online_transcript_sync, filename, force)
+
+
+def fetch_url_transcript_sync(url: str, force: bool = False) -> dict:
+    url = str(url or "").strip()
+    if not url:
+        return {"available": False, "source": "url", "reason": "URL is required", "segments": [], "text": ""}
+
+    fallback_key = f"url_{_safe_url_key(url)}"
+    if not force:
+        cached = _find_cached_transcript_payload(fallback_key)
+        if cached and cached.get("available"):
+            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+            return cached
+
+    outtmpl = (TRANSCRIPT_DIR / f"{fallback_key}.%(ext)s").as_posix()
+    ydl_opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitlesformat": "vtt/best",
+        "subtitleslangs": ["en", "en.*"],
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "socket_timeout": 10,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            video_id = str(info.get("id") or "").strip()
+            key = video_id or fallback_key
+            if video_id and not force:
+                cached = _find_cached_transcript_payload(key)
+                if cached and cached.get("available"):
+                    cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+                    return cached
+
+            subtitles = info.get("subtitles") or {}
+            automatic = info.get("automatic_captions") or {}
+            if not subtitles and not automatic:
+                return {"available": False, "source": "url", "reason": "No transcript for this video", "segments": [], "text": ""}
+
+            ydl.download([url])
+    except Exception as exc:
+        return {"available": False, "source": "url", "reason": f"No transcript for this video: {exc}", "segments": [], "text": ""}
+
+    subtitle_path = _find_downloaded_subtitle_file(key)
+    if not subtitle_path:
+        subtitle_path = _find_downloaded_subtitle_file(fallback_key)
+    if not subtitle_path:
+        return {"available": False, "source": "url", "reason": "No transcript for this video", "segments": [], "text": ""}
+
+    segments = parse_vtt(subtitle_path.read_text(encoding="utf-8", errors="ignore"))
+    if not segments:
+        return {"available": False, "source": "url", "reason": "Transcript file was empty", "segments": [], "text": ""}
+
+    title = (info.get("title") or "").strip() if isinstance(info, dict) else ""
+    webpage_url = (info.get("webpage_url") or url) if isinstance(info, dict) else url
+    return _save_transcript_by_key(key, "url", segments, {"title": title, "url": webpage_url})
+
+
+async def fetch_url_transcript(url: str, force: bool = False) -> dict:
+    return await asyncio.to_thread(fetch_url_transcript_sync, url, force)
 
 
 def _download_tiny_audio_sync(filename: str) -> Path:

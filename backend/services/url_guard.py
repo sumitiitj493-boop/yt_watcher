@@ -12,6 +12,29 @@ UNSAFE_HOSTNAMES = {
     "ip6-loopback",
 }
 
+TRUSTED_PUBLIC_MEDIA_HOSTS = {
+    "youtube.com",
+    "youtu.be",
+    "googlevideo.com",
+    "ytimg.com",
+    "instagram.com",
+    "cdninstagram.com",
+    "facebook.com",
+    "fbcdn.net",
+    "tiktok.com",
+    "tiktokcdn.com",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "vimeo.com",
+    "vimeocdn.com",
+    "dailymotion.com",
+    "dmcdn.net",
+    "twitch.tv",
+    "soundcloud.com",
+    "reddit.com",
+}
+
 BLOCKED_PORTS = {
     0,
     22,      # SSH
@@ -35,6 +58,10 @@ def _private_urls_allowed() -> bool:
     return os.environ.get("APP_ALLOW_PRIVATE_URLS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _strict_dns_guard_enabled() -> bool:
+    return os.environ.get("APP_STRICT_URL_DNS_GUARD", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_unsafe_ip(ip: ipaddress._BaseAddress) -> bool:
     return any([
         ip.is_private,
@@ -48,6 +75,10 @@ def _is_unsafe_ip(ip: ipaddress._BaseAddress) -> bool:
 
 def _strip_trailing_dot(hostname: str) -> str:
     return hostname.strip().strip(".").lower()
+
+
+def _is_trusted_public_media_host(hostname: str) -> bool:
+    return any(hostname == domain or hostname.endswith(f".{domain}") for domain in TRUSTED_PUBLIC_MEDIA_HOSTS)
 
 
 @lru_cache(maxsize=2048)
@@ -67,6 +98,10 @@ def validate_public_url_sync(url: str) -> str:
     This is an SSRF guard for yt-dlp metadata/download calls. It intentionally
     rejects localhost, private networks, link-local/cloud metadata ranges,
     unsafe schemes, credentials-in-URL, and risky internal service ports.
+
+    DNS-level SSRF checks can false-positive on consumer/VPN/ad-blocking DNS.
+    They are skipped for known public media hosts by default. Set
+    APP_STRICT_URL_DNS_GUARD=1 to force DNS checks for every hostname.
 
     Set APP_ALLOW_PRIVATE_URLS=1 only for trusted local development if you need
     to fetch from private network addresses.
@@ -106,6 +141,9 @@ def validate_public_url_sync(url: str) -> str:
         if "Private or internal" in str(exc):
             raise
         # Host is not an IP literal; continue with DNS resolution.
+
+    if _is_trusted_public_media_host(hostname) and not _strict_dns_guard_enabled():
+        return raw_url
 
     try:
         addresses = _resolve_host(hostname)
