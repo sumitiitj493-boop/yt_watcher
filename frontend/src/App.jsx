@@ -798,10 +798,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       <section className="panel panel--form transcript-url-panel">
         <div className="panel__header panel__header--stacked">
           <div>
-            <div className="section-eyebrow section-eyebrow--soft">Whisper transcript</div>
+            <div className="section-eyebrow section-eyebrow--soft">YouTube transcript</div>
             <h2 className="panel__title">URL Transcript</h2>
             <p className="panel__subtitle">
-              Paste a video URL and generate a local Whisper transcript from downloaded audio.
+              Paste a video URL and fetch the available YouTube subtitles or auto-captions.
             </p>
           </div>
           <span className="panel__badge panel__badge--soft">AI</span>
@@ -829,7 +829,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           <div className="transcript-actions">
             <button className="primary-button" type="submit" disabled={transcriptLoading || !transcriptUrl.trim()}>
               {transcriptLoading ? <Loader2 className="spinner" size={16} /> : <FileText size={16} />}
-              {transcriptLoading ? 'Transcribing...' : 'Run Whisper'}
+              {transcriptLoading ? 'Fetching...' : 'Get Transcript'}
             </button>
             <button className="ghost-button" type="button" onClick={handleCopyUrlTranscript} disabled={!transcriptText}>
               <Clipboard size={16} />

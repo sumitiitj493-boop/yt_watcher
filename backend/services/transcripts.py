@@ -311,6 +311,10 @@ def _pick_caption(subtitles: dict[str, Any], automatic: dict[str, Any]) -> dict[
     candidates.extend(_caption_candidates(automatic, automatic=True))
     if not candidates:
         return None
+    return _sort_caption_candidates(candidates)[0]
+
+
+def _sort_caption_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         candidates,
         key=lambda item: (
@@ -318,10 +322,21 @@ def _pick_caption(subtitles: dict[str, Any], automatic: dict[str, Any]) -> dict[
             _caption_language_rank(item["language"]),
             _caption_extension_rank(item["ext"]),
         ),
-    )[0]
+    )
 
 
-def _fetch_caption_text(url: str) -> str:
+def _fetch_caption_text(url: str, ydl: yt_dlp.YoutubeDL | None = None) -> str:
+    if ydl is not None:
+        response = ydl.urlopen(url)
+        try:
+            headers = getattr(response, "headers", None)
+            charset = headers.get_content_charset() if headers and hasattr(headers, "get_content_charset") else None
+            return response.read().decode(charset or "utf-8", errors="ignore")
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
     request = urllib.request.Request(
         url,
         headers={
@@ -427,12 +442,14 @@ def _find_downloaded_subtitle_file(key: str) -> Path | None:
     return None
 
 
-def _find_cached_transcript_payload(key: str) -> dict | None:
+def _find_cached_transcript_payload(key: str, allowed_sources: set[str] | None = None) -> dict | None:
     json_candidates = sorted(TRANSCRIPT_DIR.glob(f"{key}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     for candidate in json_candidates:
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if allowed_sources is not None and data.get("source") not in allowed_sources:
             continue
         if isinstance(data.get("segments"), list):
             data["segments"] = _dedupe_segments(data["segments"])
@@ -444,6 +461,8 @@ def _find_cached_transcript_payload(key: str) -> dict | None:
 
     subtitle_path = _find_downloaded_subtitle_file(key)
     if subtitle_path:
+        if allowed_sources is not None and "cache" not in allowed_sources:
+            return None
         segments = _dedupe_segments(parse_vtt(subtitle_path.read_text(encoding="utf-8", errors="ignore")))
         if segments:
             return {
@@ -496,7 +515,107 @@ async def fetch_online_transcript(filename: str, force: bool = False) -> dict:
 
 
 def fetch_url_transcript_sync(url: str, force: bool = False) -> dict:
-    return transcribe_url_with_whisper_sync(url, force)
+    url = str(url or "").strip()
+    if not url:
+        return {"available": False, "source": "youtube", "reason": "URL is required", "segments": [], "text": ""}
+
+    fallback_key = f"url_{_safe_url_key(url)}"
+    youtube_sources = {"youtube", "youtube_captions", "cache"}
+    if not force:
+        cached = _find_cached_transcript_payload(fallback_key, youtube_sources)
+        if cached and cached.get("available"):
+            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+            return cached
+
+    cookies_file = Path(__file__).resolve().parents[1] / "instagram_cookies.txt"
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "no_warnings": True,
+        "geo_bypass": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    if cookies_file.exists():
+        ydl_opts["cookiefile"] = str(cookies_file)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+
+            video_id = str(info.get("id") or "").strip()
+            key = video_id or fallback_key
+            if video_id and not force:
+                cached = _find_cached_transcript_payload(key, youtube_sources)
+                if cached and cached.get("available"):
+                    cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+                    return cached
+
+            captions = _sort_caption_candidates(
+                _caption_candidates(info.get("subtitles") or {}, automatic=False)
+                + _caption_candidates(info.get("automatic_captions") or {}, automatic=True)
+            )
+            if not captions:
+                return {
+                    "available": False,
+                    "source": "youtube",
+                    "reason": "No YouTube transcript or captions are available for this video. Use the Whisper section for manual transcription.",
+                    "segments": [],
+                    "text": "",
+                }
+
+            last_error = ""
+            for caption in captions:
+                try:
+                    caption_text = _fetch_caption_text(caption["url"], ydl)
+                    segments = _parse_caption_payload(caption_text, caption.get("ext") or "vtt")
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+                if segments:
+                    break
+            else:
+                reason = "YouTube captions were found, but no readable transcript text was available."
+                if last_error:
+                    reason = f"YouTube captions were found, but could not be loaded: {last_error}"
+                return {
+                    "available": False,
+                    "source": "youtube",
+                    "reason": f"{reason} Use the Whisper section for manual transcription.",
+                    "segments": [],
+                    "text": "",
+                }
+    except Exception as exc:
+        return {"available": False, "source": "youtube", "reason": f"Unable to read YouTube captions: {exc}", "segments": [], "text": ""}
+
+    if not segments:
+        return {
+            "available": False,
+            "source": "youtube",
+            "reason": "YouTube captions were found, but no readable transcript text was available. Use the Whisper section for manual transcription.",
+            "segments": [],
+            "text": "",
+        }
+
+    extra = {
+        "title": (info.get("title") or "").strip(),
+        "url": info.get("webpage_url") or url,
+        "video_id": video_id,
+        "subtitle_name": _caption_display_name(caption),
+        "transcript_method": "youtube_captions",
+        "direct": True,
+    }
+    data = _save_transcript_by_key(key, "youtube", segments, extra)
+    if key != fallback_key:
+        _save_transcript_by_key(fallback_key, "youtube", segments, extra)
+    return data
 
 
 async def fetch_url_transcript(url: str, force: bool = False) -> dict:
