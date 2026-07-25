@@ -12,6 +12,7 @@ import {
   Loader2,
   GraduationCap,
   MapPin,
+  Mic2,
   Moon,
   PlaySquare,
   RefreshCw,
@@ -176,6 +177,83 @@ function formatTranscriptTime(seconds = 0) {
   const secs = Math.floor(safe % 60);
   if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   return `${minutes}:${String(secs).padStart(2, '0')}`;
+}
+
+function formatDurationLabel(seconds = 0) {
+  const safe = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function transcriptWords(text = '') {
+  return String(text)
+    .toLowerCase()
+    .match(/[a-z0-9']+/g) || [];
+}
+
+function trimRepeatedTranscriptPrefix(previousText = '', currentText = '') {
+  const previousWords = transcriptWords(previousText);
+  const currentWords = transcriptWords(currentText);
+  if (!previousWords.length || !currentWords.length) return currentText;
+
+  if (currentWords.length <= previousWords.length) {
+    for (let index = 0; index <= previousWords.length - currentWords.length; index += 1) {
+      if (currentWords.every((word, offset) => previousWords[index + offset] === word)) {
+        return '';
+      }
+    }
+  }
+
+  const maxOverlap = Math.min(previousWords.length, currentWords.length, 50);
+  let overlap = 0;
+  for (let size = maxOverlap; size >= 1; size -= 1) {
+    const matches = previousWords
+      .slice(previousWords.length - size)
+      .every((word, index) => word === currentWords[index]);
+    if (matches) {
+      overlap = size;
+      break;
+    }
+  }
+
+  if (overlap < 2) return currentText;
+  if (overlap >= currentWords.length) return '';
+
+  const wordMatches = [...String(currentText).matchAll(/[A-Za-z0-9']+/g)];
+  const trimAt = wordMatches[overlap]?.index ?? 0;
+  return String(currentText).slice(trimAt).trim();
+}
+
+function cleanedTranscriptSegments(segments = []) {
+  const cleaned = [];
+  for (const segment of segments || []) {
+    let text = String(segment?.text || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+
+    const start = Number(segment?.start) || 0;
+    const end = Number(segment?.end) || start;
+    const previous = cleaned[cleaned.length - 1];
+    if (previous && start <= previous.end + 12) {
+      text = trimRepeatedTranscriptPrefix(previous.text, text);
+      if (!text) {
+        previous.end = Math.max(previous.end, end);
+        continue;
+      }
+    }
+
+    cleaned.push({ start, end, text });
+  }
+  return cleaned;
+}
+
+function transcriptSegmentsToText(segments = []) {
+  return cleanedTranscriptSegments(segments)
+    .map((segment) => `[${formatTranscriptTime(segment.start)}] ${segment.text}`)
+    .join('\n');
 }
 
 function qualityLabel(value) {
@@ -599,13 +677,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
   const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
   const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
-  const transcriptText = transcriptResult?.text || (transcriptResult?.segments || [])
-    .map((segment) => {
-      const text = String(segment.text || '').trim();
-      return text ? `[${formatTranscriptTime(segment.start)}] ${text}` : '';
-    })
-    .filter(Boolean)
-    .join('\n');
+  const transcriptText = transcriptSegmentsToText(transcriptResult?.segments || []);
 
   const location = useLocation();
   useEffect(() => {
@@ -726,13 +798,13 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       <section className="panel panel--form transcript-url-panel">
         <div className="panel__header panel__header--stacked">
           <div>
-            <div className="section-eyebrow section-eyebrow--soft">Transcript without download</div>
-            <h2 className="panel__title">Fast URL Transcript</h2>
+            <div className="section-eyebrow section-eyebrow--soft">Whisper transcript</div>
+            <h2 className="panel__title">URL Transcript</h2>
             <p className="panel__subtitle">
-              Paste a video URL and fetch available captions directly. No video file is downloaded.
+              Paste a video URL and generate a local Whisper transcript from downloaded audio.
             </p>
           </div>
-          <span className="panel__badge panel__badge--soft">Fast</span>
+          <span className="panel__badge panel__badge--soft">AI</span>
         </div>
 
         <form onSubmit={handleFetchTranscript} className="download-form">
@@ -757,7 +829,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           <div className="transcript-actions">
             <button className="primary-button" type="submit" disabled={transcriptLoading || !transcriptUrl.trim()}>
               {transcriptLoading ? <Loader2 className="spinner" size={16} /> : <FileText size={16} />}
-              {transcriptLoading ? 'Fetching...' : 'Fetch Transcript'}
+              {transcriptLoading ? 'Transcribing...' : 'Run Whisper'}
             </button>
             <button className="ghost-button" type="button" onClick={handleCopyUrlTranscript} disabled={!transcriptText}>
               <Clipboard size={16} />
@@ -769,7 +841,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
         {transcriptResult?.available ? (
           <div className="transcript-result">
             <div className="download-card__title-row">
-              <h3 className="download-card__title">{transcriptResult.title || 'Transcript ready'}</h3>
+              <div>
+                <h3 className="download-card__title">{transcriptResult.title || 'Transcript ready'}</h3>
+                {transcriptResult.subtitle_name ? (
+                  <p className="download-card__meta">Subtitle: {transcriptResult.subtitle_name}</p>
+                ) : null}
+              </div>
               <span className="status-pill status-pill--completed">{transcriptResult.segments?.length || 0} lines</span>
             </div>
             <textarea className="transcript-textarea" readOnly value={transcriptText} />
@@ -991,6 +1068,211 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
             ) : null}
           </div>
         )}
+      </section>
+    </div>
+  );
+}
+
+function WhisperTranscriptionPage({ onNotify }) {
+  const [url, setUrl] = useState('');
+  const [force, setForce] = useState(false);
+  const [job, setJob] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [isStarting, setIsStarting] = useState(false);
+  const [copyStatus, setCopyStatus] = useState('Copy Transcript');
+  const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
+  const transcriptText = transcriptSegmentsToText(result?.segments || []);
+  const isActive = job && ['queued', 'downloading_audio', 'transcribing'].includes(job.status);
+  const jobElapsedSeconds = job
+    ? Math.max(0, Math.floor((job.elapsed_seconds ?? (nowSeconds - (job.started_at || job.created_at || nowSeconds)))))
+    : 0;
+  const transcribeElapsedSeconds = job?.transcribe_started_at
+    ? Math.max(0, Math.floor(nowSeconds - job.transcribe_started_at))
+    : 0;
+  const estimatedTotalSeconds = Number(job?.estimated_total_seconds) || 90;
+  const estimatedTranscribeProgress = job?.status === 'transcribing'
+    ? Math.min(94, 45 + (transcribeElapsedSeconds / estimatedTotalSeconds) * 45)
+    : Number(job?.progress) || 0;
+  const displayProgress = Math.min(100, Math.max(Number(job?.progress) || 0, estimatedTranscribeProgress));
+  const etaSeconds = job?.status === 'completed'
+    ? 0
+    : Number.isFinite(Number(job?.eta_seconds))
+      ? Number(job.eta_seconds)
+      : job?.status === 'transcribing'
+        ? Math.max(0, Math.ceil(estimatedTotalSeconds - transcribeElapsedSeconds))
+        : null;
+
+  const notify = useCallback((message, type = 'info') => {
+    if (onNotify) onNotify(message, type);
+  }, [onNotify]);
+
+  useEffect(() => {
+    if (!isActive) return undefined;
+    const timer = window.setInterval(() => setNowSeconds(Date.now() / 1000), 1000);
+    return () => window.clearInterval(timer);
+  }, [isActive]);
+
+  useEffect(() => {
+    if (!job?.job_id || !isActive) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await api.get(`/whisper-transcriptions/${encodeURIComponent(job.job_id)}`);
+        if (cancelled) return;
+        const nextJob = response.data || null;
+        setJob(nextJob);
+        if (nextJob?.status === 'completed') {
+          setResult(nextJob.result || null);
+          notify('Whisper transcript ready', 'success');
+        } else if (nextJob?.status === 'error') {
+          setError(nextJob.error || nextJob.message || 'Whisper transcription failed');
+          notify('Whisper transcription failed', 'error');
+        }
+      } catch (pollError) {
+        if (!cancelled) {
+          setError(safeFetchError(pollError, 'Unable to check transcription status.'));
+        }
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1800);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [job?.job_id, isActive, notify]);
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    const trimmed = url.trim();
+    if (!trimmed || isStarting || isActive) return;
+
+    setIsStarting(true);
+    setError('');
+    setResult(null);
+    setCopyStatus('Copy Transcript');
+    try {
+      const response = await api.post('/whisper-transcriptions', { url: trimmed, force });
+      const data = response.data || {};
+      if (data.already_done && data.result) {
+        setResult(data.result);
+        setJob(null);
+        notify('Loaded cached Whisper transcript', 'success');
+      } else {
+        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
+        notify('Whisper transcription started', 'success');
+      }
+    } catch (startError) {
+      setError(safeFetchError(startError, 'Unable to start Whisper transcription.'));
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!transcriptText) return;
+    try {
+      await navigator.clipboard.writeText(transcriptText);
+      setCopyStatus('Copied');
+      window.setTimeout(() => setCopyStatus('Copy Transcript'), 1600);
+    } catch {
+      setCopyStatus('Copy Failed');
+      window.setTimeout(() => setCopyStatus('Copy Transcript'), 1600);
+    }
+  };
+
+  return (
+    <div className="page-shell">
+      <SectionHeader
+        title="Whisper Transcription"
+        subtitle="Create transcripts by downloading the best available audio and running Whisper locally."
+      />
+
+      <section className="panel panel--form transcript-url-panel whisper-panel">
+        <div className="panel__header panel__header--stacked">
+          <div>
+            <div className="section-eyebrow section-eyebrow--soft">Always Whisper</div>
+            <h2 className="panel__title">Transcribe YouTube URL</h2>
+            <p className="panel__subtitle">
+              This path ignores YouTube captions and uses your local Whisper setup for consistent transcripts.
+            </p>
+          </div>
+          <span className="panel__badge panel__badge--soft">AI</span>
+        </div>
+
+        <form onSubmit={handleSubmit} className="download-form">
+          <div className="field field--full">
+            <label className="field__label" htmlFor="whisper-url">YOUTUBE URL</label>
+            <input
+              id="whisper-url"
+              className="input"
+              value={url}
+              onChange={(event) => {
+                setUrl(event.target.value);
+                setError('');
+              }}
+              placeholder="https://youtube.com/watch?v=..."
+              autoComplete="off"
+              spellCheck="false"
+            />
+          </div>
+
+          <label className="whisper-force-toggle">
+            <input type="checkbox" checked={force} onChange={(event) => setForce(event.target.checked)} />
+            <span>Regenerate even if a Whisper transcript is cached</span>
+          </label>
+
+          {error ? <p className="download-card__error">{error}</p> : null}
+
+          <div className="transcript-actions">
+            <button className="primary-button" type="submit" disabled={isStarting || isActive || !url.trim()}>
+              {isStarting || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
+              {isStarting ? 'Starting...' : isActive ? 'Transcribing...' : 'Start Whisper'}
+            </button>
+            <button className="ghost-button" type="button" onClick={handleCopy} disabled={!transcriptText}>
+              <Clipboard size={16} />
+              {copyStatus}
+            </button>
+          </div>
+        </form>
+
+        {job ? (
+          <div className="whisper-job-card">
+            <div className="download-card__title-row">
+              <div>
+                <h3 className="download-card__title">{job.status === 'completed' ? 'Transcript ready' : 'Whisper job running'}</h3>
+                <p className="download-card__meta">{job.message || 'Preparing transcription...'}</p>
+              </div>
+              <StatusPill status={job.status === 'completed' ? 'completed' : job.status === 'error' ? 'error' : 'processing'} />
+            </div>
+            <ProgressBar value={displayProgress} />
+            <div className="whisper-job-stats">
+              <span>{Math.min(100, Math.max(0, displayProgress)).toFixed(0)}%</span>
+              <span>Elapsed {formatDurationLabel(jobElapsedSeconds)}</span>
+              {etaSeconds !== null ? <span>ETA {formatDurationLabel(etaSeconds)}</span> : null}
+              {job.audio_size_mb ? <span>Audio {job.audio_size_mb} MB</span> : null}
+            </div>
+            {job.status === 'transcribing' ? (
+              <p className="whisper-job-note">
+                Whisper is still running. Progress is estimated between model updates.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {result?.available ? (
+          <div className="transcript-result">
+            <div className="download-card__title-row">
+              <div>
+                <h3 className="download-card__title">{result.title || 'Whisper transcript'}</h3>
+                <p className="download-card__meta">{result.subtitle_name || 'Whisper transcription'} - {result.segments?.length || 0} lines</p>
+              </div>
+              <span className="status-pill status-pill--completed">Whisper</span>
+            </div>
+            <textarea className="transcript-textarea" readOnly value={transcriptText} />
+          </div>
+        ) : null}
       </section>
     </div>
   );
@@ -1241,14 +1523,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
     try {
       const response = await api.get(`/transcript/${encodeURIComponent(previewFile.filename)}`);
       const segments = Array.isArray(response.data?.segments) ? response.data.segments : [];
-      const transcriptText = segments
-        .map((segment) => {
-          const text = String(segment?.text || '').trim();
-          if (!text) return '';
-          return `[${formatTranscriptTime(segment.start)}] ${text}`;
-        })
-        .filter(Boolean)
-        .join('\n');
+      const transcriptText = transcriptSegmentsToText(segments);
 
       if (!transcriptText) {
         setTranscriptButtonLabel('No Transcript');
@@ -1461,6 +1736,11 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
           <History size={18} />
           <span>History</span>
           {activeDownloads > 0 ? <span className="nav-link__badge">{activeDownloads}</span> : null}
+        </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/whisper" end>
+          <Mic2 size={18} />
+          <span>Whisper</span>
         </NavLink>
 
         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/library" end>
@@ -1881,6 +2161,7 @@ export default function App() {
           <Route path="/about" element={<AboutPage />} />
           <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} />} />
           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
           <Route path="*" element={<Navigate to="/download" replace />} />

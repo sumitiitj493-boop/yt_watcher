@@ -24,6 +24,55 @@ const formatTime = (seconds = 0) => {
   return `${minutes}:${String(secs).padStart(2, '0')}`;
 };
 
+const transcriptWords = (text = '') => String(text).toLowerCase().match(/[a-z0-9']+/g) || [];
+
+const trimRepeatedTranscriptPrefix = (previousText = '', currentText = '') => {
+  const previousWords = transcriptWords(previousText);
+  const currentWords = transcriptWords(currentText);
+  if (!previousWords.length || !currentWords.length) return currentText;
+
+  if (currentWords.length <= previousWords.length) {
+    for (let index = 0; index <= previousWords.length - currentWords.length; index += 1) {
+      if (currentWords.every((word, offset) => previousWords[index + offset] === word)) return '';
+    }
+  }
+
+  const maxOverlap = Math.min(previousWords.length, currentWords.length, 50);
+  let overlap = 0;
+  for (let size = maxOverlap; size >= 1; size -= 1) {
+    if (previousWords.slice(previousWords.length - size).every((word, index) => word === currentWords[index])) {
+      overlap = size;
+      break;
+    }
+  }
+
+  if (overlap < 2) return currentText;
+  if (overlap >= currentWords.length) return '';
+
+  const wordMatches = [...String(currentText).matchAll(/[A-Za-z0-9']+/g)];
+  return String(currentText).slice(wordMatches[overlap]?.index || 0).trim();
+};
+
+const transcriptSegmentsToText = (segments = []) => {
+  const cleaned = [];
+  for (const segment of segments || []) {
+    let text = String(segment?.text || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    const start = Number(segment?.start) || 0;
+    const end = Number(segment?.end) || start;
+    const previous = cleaned[cleaned.length - 1];
+    if (previous && start <= previous.end + 12) {
+      text = trimRepeatedTranscriptPrefix(previous.text, text);
+      if (!text) {
+        previous.end = Math.max(previous.end, end);
+        continue;
+      }
+    }
+    cleaned.push({ start, end, text });
+  }
+  return cleaned.map((segment) => `[${formatTime(segment.start)}] ${segment.text}`).join('\n');
+};
+
 const naturalCompare = (left, right) => {
   const leftParts = String(left).match(/\d+|\D+/g) || [];
   const rightParts = String(right).match(/\d+|\D+/g) || [];
@@ -241,10 +290,7 @@ export default function PlaylistPage({ files = [], onNotify }) {
     try {
       const response = await api.get(`/transcript/${encodeURIComponent(currentFile.filename)}`);
       const segments = Array.isArray(response.data?.segments) ? response.data.segments : [];
-      const transcriptText = segments
-        .map((segment) => `[${formatTime(segment.start)}] ${String(segment.text || '').trim()}`)
-        .filter(Boolean)
-        .join('\n');
+      const transcriptText = transcriptSegmentsToText(segments);
 
       if (!transcriptText) {
         notify('No transcript available for this item', 'error');

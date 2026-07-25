@@ -1002,6 +1002,59 @@ body[data-theme='dark'] .main-stage {
 	white-space: pre-wrap;
 }
 
+.whisper-panel {
+	max-width: 980px;
+}
+
+.whisper-force-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+	width: fit-content;
+	color: #64748b;
+	font-size: 14px;
+	font-weight: 600;
+}
+
+.whisper-force-toggle input {
+	width: 16px;
+	height: 16px;
+	accent-color: #6366f1;
+}
+
+.whisper-job-card {
+	display: grid;
+	gap: 12px;
+	padding: 16px;
+	border-radius: 18px;
+	background: rgba(99, 102, 241, 0.08);
+	border: 1px solid rgba(99, 102, 241, 0.18);
+}
+
+.whisper-job-stats {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex-wrap: wrap;
+	color: #64748b;
+	font-size: 13px;
+	font-weight: 700;
+}
+
+.whisper-job-stats span {
+	padding: 5px 9px;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.62);
+	border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.whisper-job-note {
+	margin: -2px 0 0;
+	color: #64748b;
+	font-size: 13px;
+	line-height: 1.5;
+}
+
 .field {
 	display: flex;
 	flex-direction: column;

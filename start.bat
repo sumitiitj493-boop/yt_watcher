@@ -92,11 +92,11 @@ if "%CHECK_ONLY%"=="1" (
 )
 
 echo [3/3] Starting services ...
-echo       Backend:  http://localhost:8005
+echo       Backend:  http://localhost:8000
 echo       Frontend: http://localhost:8080
 echo.
 
-start "YT Suite Backend" powershell.exe -NoExit -ExecutionPolicy Bypass -Command "Set-Location -LiteralPath '%BACKEND_DIR%'; & '%PYTHON%' -m uvicorn main:app --host 127.0.0.1 --port 8005"
+start "YT Suite Backend" powershell.exe -NoExit -ExecutionPolicy Bypass -Command "Set-Location -LiteralPath '%BACKEND_DIR%'; & '%PYTHON%' -m uvicorn main:app --host 127.0.0.1 --port 8000"
 if errorlevel 1 (
     echo ERROR: Could not open the backend PowerShell window.
     pause
@@ -111,7 +111,7 @@ if errorlevel 1 (
 )
 
 echo +------------------------------------------+
-echo ^|  Backend  - http://localhost:8005       ^|
+echo ^|  Backend  - http://localhost:8000       ^|
 echo ^|  Frontend - http://localhost:8080       ^|
 echo ^|                                          ^|
 echo ^|  Open http://localhost:8080 in browser  ^|

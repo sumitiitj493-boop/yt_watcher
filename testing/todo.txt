@@ -1,0 +1,1 @@
+please analyze my whole project and fix only one thing .for normal enter url in download section no need to use whisper because there is a separate section named whisper.only in whisper section whisper transcription should work,  other than whisper section normal transcript fetching should work .no matter transcript ood or bad.

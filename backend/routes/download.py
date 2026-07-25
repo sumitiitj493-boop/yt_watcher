@@ -5,7 +5,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
 from services.metadata import fetch_metadata
-from services.transcripts import fetch_url_transcript
+from services.transcripts import fetch_url_transcript, get_url_transcription_job, start_url_whisper_transcription
 from services.url_guard import validate_public_url
 from services.downloader import (
     clear_downloads,
@@ -45,6 +45,25 @@ async def transcript_from_url(request: TranscriptUrlRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to fetch transcript: {exc}")
+
+
+@router.post("/whisper-transcriptions")
+async def whisper_transcription_create(request: TranscriptUrlRequest):
+    try:
+        safe_url = await validate_public_url(str(request.url))
+        return await start_url_whisper_transcription(safe_url, request.force)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to start Whisper transcription: {exc}")
+
+
+@router.get("/whisper-transcriptions/{job_id}")
+async def whisper_transcription_status(job_id: str):
+    job = get_url_transcription_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Transcription job not found")
+    return job
 
 
 @router.post("/download")

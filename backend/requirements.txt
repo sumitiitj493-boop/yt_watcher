@@ -4,3 +4,4 @@ yt-dlp
 python-multipart
 websockets
 aiosqlite
+faster-whisper
