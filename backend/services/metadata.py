@@ -1,11 +1,11 @@
 import asyncio
 import re
-from pathlib import Path
 from typing import Any, Dict, List
 
 import yt_dlp
 
 from services.files import DOWNLOAD_DIR, clean_title, extract_video_id
+from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
 
 _VIDEO_FORMAT_RE = re.compile(r"^(\d{3,4})p?$")
 
@@ -115,7 +115,6 @@ def _find_existing(video_id: str | None, title: str | None) -> dict | None:
 
 
 def _metadata_sync(url: str) -> Dict[str, Any]:
-    cookies_file = Path(__file__).resolve().parents[1] / "instagram_cookies.txt"
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
@@ -125,17 +124,10 @@ def _metadata_sync(url: str) -> Dict[str, Any]:
         "ignoreerrors": False,
         "nocheckcertificate": False,
         "geo_bypass": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "http_headers": PUBLIC_HTTP_HEADERS,
     }
-    if cookies_file.exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
+    add_generic_impersonation(ydl_opts)
+    apply_cookiefile(ydl_opts, url)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)

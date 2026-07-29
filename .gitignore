@@ -14,6 +14,8 @@ backend/downloads/
 # Secrets
 cookies.txt
 backend/cookies.txt
+backend/instagram_cookies.txt
+backend/youtube_cookies.txt
 .env
 
 # Logs

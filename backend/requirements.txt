@@ -1,6 +1,7 @@
 fastapi==0.136.1
 uvicorn==0.46.0
 yt-dlp
+curl_cffi>=0.10,<0.15
 python-multipart
 websockets
 aiosqlite

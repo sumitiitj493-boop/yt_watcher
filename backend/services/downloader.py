@@ -7,7 +7,7 @@ import base64
 import urllib.request
 from urllib.parse import parse_qs
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Dict, List
 
 import yt_dlp
@@ -16,6 +16,7 @@ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id
 from services.job_store import delete_job as delete_job_record
 from services.job_store import load_jobs, save_jobs
 from services.url_guard import validate_public_url
+from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
 
 # Dictionary to hold the download progress of tasks
 # Structure: { video_id: {"status": "downloading", "percent": 0.0, "title": "", ...} }
@@ -24,6 +25,7 @@ download_tasks: Dict[str, dict] = load_jobs()
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2") or "2"))
 MAX_AUTO_RETRIES = max(0, int(os.environ.get("MAX_AUTO_RETRIES", "1") or "1"))
 AUTO_RETRY_BASE_DELAY_SECONDS = max(5, int(os.environ.get("AUTO_RETRY_BASE_DELAY_SECONDS", "20") or "20"))
+YTDLP_SOCKET_TIMEOUT_SECONDS = max(10, int(os.environ.get("YTDLP_SOCKET_TIMEOUT_SECONDS", "25") or "25"))
 
 TERMINAL_STATUSES = {"completed", "error", "cancelled"}
 QUEUED_STATUSES = {"pending", "queued"}
@@ -329,6 +331,31 @@ def _mark_error_or_retry(task_id: str, clean_error: str) -> None:
     _touch_task(task_id)
 
 
+def _set_task_message(task_id: str, message: str) -> None:
+    if task_id in download_tasks:
+        download_tasks[task_id]["message"] = message
+        _touch_task(task_id)
+
+
+def _start_download_watchdog(task_id: str, url: str) -> tuple[Event, Thread]:
+    stop_event = Event()
+
+    def watch() -> None:
+        started_at = time.time()
+        while not stop_event.wait(10):
+            task = download_tasks.get(task_id) or {}
+            status = task.get("status")
+            if status in TERMINAL_STATUSES or status in {"downloading", "processing"}:
+                return
+            elapsed = int(time.time() - started_at)
+            message = task.get("message") or "Preparing download"
+            print(f"[download] still preparing after {elapsed}s - {message} - {url}", flush=True)
+
+    thread = Thread(target=watch, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
 def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     quality = _normalize_quality(quality)
     # Ensure we don't crash if the task wasn't pre-seeded; preserve queue metadata.
@@ -358,6 +385,7 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         "error_category": existing_task.get("error_category"),
         "retryable": existing_task.get("retryable", False),
         "next_retry_at": None,
+        "message": "Preparing download...",
     }
     save_jobs(download_tasks)
 
@@ -367,11 +395,14 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             raise Exception("Download cancelled")
 
         if d["status"] == "downloading":
+            if download_tasks[task_id].get("status") != "downloading":
+                print(f"[download] transfer started - {url}", flush=True)
             download_tasks[task_id].update({
                 "status": "downloading",
                 "percent": _clean(d.get("_percent_str", "0%")),
                 "speed": _clean(d.get("_speed_str", "")),
                 "eta": _clean(d.get("_eta_str", "")),
+                "message": "Downloading media...",
             })
             total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded_bytes = d.get("downloaded_bytes")
@@ -393,6 +424,7 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
                 "percent": "100%",
                 "progress": 100.0,
                 "last_progress": 100.0,
+                "message": "Download finished, processing file...",
             })
             _touch_task(task_id)
 
@@ -459,6 +491,8 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
+        "extractor_retries": 1,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
         "continuedl": True,
         "concurrent_fragment_downloads": 4,
         "windowsfilenames": True,
@@ -472,19 +506,14 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         "age_limit": None,
         "ignoreerrors": False,
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
+            **PUBLIC_HTTP_HEADERS,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     }
+    add_generic_impersonation(ydl_opts)
 
-    cookies_file = Path(__file__).resolve().parent.parent / "instagram_cookies.txt"
-    if cookies_file.exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
+    apply_cookiefile(ydl_opts, url)
+    cookiefile = ydl_opts.get("cookiefile")
 
     if format_ext == "mp3":
         ydl_opts["postprocessors"] = [{
@@ -496,8 +525,17 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
+        print(
+            f"[download] preparing - quality={quality or 'best'} format={format_ext} "
+            f"cookies={'yes' if cookiefile else 'no'} timeout={YTDLP_SOCKET_TIMEOUT_SECONDS}s - {url}",
+            flush=True,
+        )
+        _set_task_message(task_id, "Contacting site and checking available formats...")
+        watchdog_stop, watchdog_thread = _start_download_watchdog(task_id, url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _set_task_message(task_id, "Authenticating/extracting media info...")
             info = ydl.extract_info(url, download=True)
+            watchdog_stop.set()
             download_tasks[task_id]["title"] = info.get("title", "Unknown")
             download_tasks[task_id]["video_id"] = info.get("id")
             if download_tasks[task_id].get("status") == "cancelled":
@@ -505,11 +543,17 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             # Small delay to allow Windows to release file locks from antivirus/indexing
             time.sleep(0.5)
             _mark_completed(task_id, ydl, info, format_ext)
+            print(f"[download] completed - {download_tasks[task_id].get('filename')}", flush=True)
     except Exception as e:
+        try:
+            watchdog_stop.set()
+        except UnboundLocalError:
+            pass
         if download_tasks[task_id].get("status") == "cancelled":
             return
 
         clean_error = _clean(str(e))
+        print(f"[download] error - {clean_error}", flush=True)
 
         # Some public sites are not recognized by platform extractors.
         # Retry with yt-dlp generic extractor before failing.
@@ -521,6 +565,9 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             try:
                 generic_opts = dict(ydl_opts)
                 generic_opts["force_generic_extractor"] = True
+                add_generic_impersonation(generic_opts)
+                print(f"[download] retrying with generic extractor - {url}", flush=True)
+                _set_task_message(task_id, "Retrying with generic extractor...")
                 with yt_dlp.YoutubeDL(generic_opts) as ydl_generic:
                     info = ydl_generic.extract_info(url, download=True)
                     download_tasks[task_id]["title"] = info.get("title", "Unknown")

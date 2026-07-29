@@ -8,12 +8,15 @@ import subprocess
 import time
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from threading import RLock
+from typing import Any, Iterator
 
 import yt_dlp
 
 from services.files import DOWNLOAD_DIR, extract_video_id, resolve_download_path
+from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
 
 TRANSCRIPT_DIR = DOWNLOAD_DIR / "transcripts"
 TRANSCRIPT_AUDIO_DIR = DOWNLOAD_DIR / "transcript_audio"
@@ -22,6 +25,9 @@ TRANSCRIPT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 MANUAL_TRANSCRIPT_JOBS: dict[str, dict] = {}
 URL_TRANSCRIPT_JOBS: dict[str, dict] = {}
+WHISPER_MODEL_CACHE: dict[tuple[str, str, str, int, int], Any] = {}
+WHISPER_MODEL_LOCK = RLock()
+WHISPER_TRANSCRIBE_LOCK = RLock()
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})"
@@ -46,6 +52,38 @@ LANGUAGE_NAMES = {
     "en-us": "English (US)",
     "en-gb": "English (UK)",
 }
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _default_whisper_threads() -> int:
+    # Leave a couple of threads free so the API and OS stay responsive.
+    return max(1, min((os.cpu_count() or 4) - 2, 10))
+
+
+def _whisper_compute_type(device: str) -> str:
+    configured = os.environ.get("WHISPER_COMPUTE_TYPE")
+    if configured:
+        return configured
+    if device.strip().lower().startswith("cuda"):
+        return "float16"
+    return "int8"
 
 
 def _safe_key(filename: str) -> str:
@@ -106,6 +144,104 @@ def _update_job_timing(job: dict, message: str | None = None, eta_seconds: int |
         if eta is not None:
             suffix += f", ETA {_duration_label(int(eta))}"
         job["message"] = f"{message}.{suffix}."
+
+
+def _terminal_transcription_label(job: dict | None, audio_path: Path) -> str:
+    if job is None:
+        return audio_path.name
+    return str(job.get("filename") or job.get("url") or audio_path.name)
+
+
+def _log_transcription_progress(job: dict | None, audio_path: Path, percent: float, *, force: bool = False) -> None:
+    if job is None:
+        return
+    bucket = max(0, min(100, int(percent // 5) * 5))
+    previous_bucket = int(job.get("_terminal_transcription_bucket") or 0)
+    if not force and (bucket < 5 or bucket <= previous_bucket):
+        return
+    if force and bucket <= previous_bucket:
+        return
+    if force and previous_bucket == 0:
+        milestones = [bucket]
+    else:
+        milestones = range(max(5, previous_bucket + 5), bucket + 1, 5)
+    for next_bucket in milestones:
+        print(
+            f"[transcription] {next_bucket}% done - {_terminal_transcription_label(job, audio_path)}",
+            flush=True,
+        )
+    job["_terminal_transcription_bucket"] = bucket
+
+
+class _TerminalWhisperProgress:
+    def __init__(self, total: float | int | None = None, *args: Any, job: dict | None = None, audio_path: Path | None = None, **kwargs: Any):
+        self.total = float(total or 0.0)
+        self.current = 0.0
+        self.job = job
+        self.audio_path = audio_path
+
+    def update(self, amount: float | int = 1) -> None:
+        self.current += float(amount or 0.0)
+        if self.job is not None and self.audio_path is not None and self.total > 0:
+            _log_transcription_progress(self.job, self.audio_path, (self.current / self.total) * 100)
+
+    def close(self) -> None:
+        pass
+
+
+@contextmanager
+def _capture_faster_whisper_progress(job: dict | None, audio_path: Path) -> Iterator[None]:
+    if job is None:
+        yield
+        return
+    import faster_whisper.transcribe as faster_whisper_transcribe  # type: ignore
+
+    original_tqdm = faster_whisper_transcribe.tqdm
+
+    def terminal_tqdm(*args: Any, **kwargs: Any) -> _TerminalWhisperProgress:
+        return _TerminalWhisperProgress(*args, job=job, audio_path=audio_path, **kwargs)
+
+    faster_whisper_transcribe.tqdm = terminal_tqdm
+    try:
+        yield
+    finally:
+        faster_whisper_transcribe.tqdm = original_tqdm
+
+
+def _get_faster_whisper_model() -> tuple[Any, dict[str, Any]]:
+    from faster_whisper import WhisperModel  # type: ignore
+
+    model_name = os.environ.get("WHISPER_MODEL", "base")
+    device = os.environ.get("WHISPER_DEVICE", "auto")
+    compute_type = _whisper_compute_type(device)
+    cpu_threads = _env_int("WHISPER_CPU_THREADS", _default_whisper_threads(), 1, os.cpu_count() or 16)
+    num_workers = _env_int("WHISPER_NUM_WORKERS", 1, 1, 4)
+    cache_key = (model_name, device, compute_type, cpu_threads, num_workers)
+
+    with WHISPER_MODEL_LOCK:
+        model = WHISPER_MODEL_CACHE.get(cache_key)
+        if model is None:
+            print(
+                "[transcription] loading faster-whisper model "
+                f"{model_name} ({device}, {compute_type}, cpu_threads={cpu_threads}, workers={num_workers})",
+                flush=True,
+            )
+            model = WhisperModel(
+                model_name,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+            )
+            WHISPER_MODEL_CACHE.clear()
+            WHISPER_MODEL_CACHE[cache_key] = model
+        return model, {
+            "model": model_name,
+            "device": device,
+            "compute_type": compute_type,
+            "cpu_threads": cpu_threads,
+            "num_workers": num_workers,
+        }
 
 
 def _seconds_to_vtt_time(seconds: float) -> str:
@@ -340,13 +476,8 @@ def _fetch_caption_text(url: str, ydl: yt_dlp.YoutubeDL | None = None) -> str:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            **PUBLIC_HTTP_HEADERS,
             "Accept": "text/vtt,application/json,text/xml,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
         },
     )
     with urllib.request.urlopen(request, timeout=15) as response:
@@ -527,24 +658,16 @@ def fetch_url_transcript_sync(url: str, force: bool = False) -> dict:
             cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
             return cached
 
-    cookies_file = Path(__file__).resolve().parents[1] / "instagram_cookies.txt"
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "noplaylist": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "http_headers": PUBLIC_HTTP_HEADERS,
     }
-    if cookies_file.exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
+    add_generic_impersonation(ydl_opts)
+    apply_cookiefile(ydl_opts, url)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -642,6 +765,7 @@ def _download_tiny_audio_sync(filename: str) -> Path:
                 "preferredquality": "192",
             }],
         }
+        apply_cookiefile(ydl_opts, url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         if audio_path.exists():
@@ -708,15 +832,10 @@ def _download_url_audio_sync(url: str, key: str, job: dict | None = None) -> tup
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "http_headers": PUBLIC_HTTP_HEADERS,
     }
+    add_generic_impersonation(ydl_opts)
+    apply_cookiefile(ydl_opts, url)
 
     def hook(data):
         if not job or data.get("status") != "downloading":
@@ -824,30 +943,60 @@ def transcribe_url_with_whisper_sync(url: str, force: bool = False, job_id: str 
 
 
 def _transcribe_with_faster_whisper(audio_path: Path, job: dict | None = None) -> list[dict[str, Any]]:
-    from faster_whisper import WhisperModel  # type: ignore
+    model, model_settings = _get_faster_whisper_model()
+    beam_size = _env_int("WHISPER_BEAM_SIZE", 1, 1, 10)
+    best_of = _env_int("WHISPER_BEST_OF", 1, 1, 10)
+    vad_filter = _env_bool("WHISPER_VAD_FILTER", True)
+    try:
+        temperature = float(os.environ.get("WHISPER_TEMPERATURE", "0.0") or "0.0")
+    except ValueError:
+        temperature = 0.0
 
-    model_name = os.environ.get("WHISPER_MODEL", "base")
-    device = os.environ.get("WHISPER_DEVICE", "auto")
-    compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "default")
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    segments_iter, info = model.transcribe(
-        str(audio_path),
-        beam_size=5,
-        vad_filter=True,
-    )
-    duration = float(getattr(info, "duration", 0.0) or 0.0)
     segments = []
-    for segment in segments_iter:
-        text = _clean_caption_text(segment.text)
-        if text:
-            segments.append({"start": round(float(segment.start), 3), "end": round(float(segment.end), 3), "text": text})
-        if job and duration > 0:
-            covered = min(1.0, max(0.0, float(segment.end or 0.0) / duration))
-            progress = min(95, max(float(job.get("progress") or 45), 45 + covered * 50))
-            elapsed = max(1, time.time() - float(job.get("transcribe_started_at") or time.time()))
-            eta_seconds = int((elapsed / max(covered, 0.01)) - elapsed) if covered > 0 else None
-            job.update({"progress": round(progress, 1)})
-            _update_job_timing(job, "Running Whisper", eta_seconds)
+    with WHISPER_TRANSCRIBE_LOCK:
+        with _capture_faster_whisper_progress(job, audio_path):
+            segments_iter, info = model.transcribe(
+                str(audio_path),
+                log_progress=bool(job),
+                beam_size=beam_size,
+                best_of=best_of,
+                temperature=temperature,
+                vad_filter=vad_filter,
+            )
+            duration = float(getattr(info, "duration", 0.0) or 0.0)
+            if job:
+                job["whisper_settings"] = {
+                    **model_settings,
+                    "beam_size": beam_size,
+                    "best_of": best_of,
+                    "temperature": temperature,
+                    "vad_filter": vad_filter,
+                }
+                job["_terminal_transcription_bucket"] = 0
+                print(
+                    f"[transcription] started - {_terminal_transcription_label(job, audio_path)}"
+                    f"{f' ({_duration_label(duration)})' if duration > 0 else ''}",
+                    flush=True,
+                )
+                print(
+                    "[transcription] settings - "
+                    f"model={model_settings['model']}, compute={model_settings['compute_type']}, "
+                    f"threads={model_settings['cpu_threads']}, beam={beam_size}, best_of={best_of}, vad={vad_filter}",
+                    flush=True,
+                )
+            for segment in segments_iter:
+                text = _clean_caption_text(segment.text)
+                if text:
+                    segments.append({"start": round(float(segment.start), 3), "end": round(float(segment.end), 3), "text": text})
+                if job and duration > 0:
+                    covered = min(1.0, max(0.0, float(segment.end or 0.0) / duration))
+                    progress = min(95, max(float(job.get("progress") or 45), 45 + covered * 50))
+                    elapsed = max(1, time.time() - float(job.get("transcribe_started_at") or time.time()))
+                    eta_seconds = int((elapsed / max(covered, 0.01)) - elapsed) if covered > 0 else None
+                    job.update({"progress": round(progress, 1)})
+                    _update_job_timing(job, "Running Whisper", eta_seconds)
+            if job:
+                _log_transcription_progress(job, audio_path, 100, force=True)
     return _dedupe_segments(segments)
 
 
@@ -886,10 +1035,11 @@ def manual_transcribe_sync(filename: str, job_id: str) -> dict:
         job.update({
             "status": "transcribing",
             "progress": 35,
+            "transcribe_started_at": time.time(),
             "message": f"Transcribing from audio ({round(audio_path.stat().st_size / 1024 / 1024, 2)} MB)...",
         })
         try:
-            segments = _transcribe_with_faster_whisper(audio_path)
+            segments = _transcribe_with_faster_whisper(audio_path, job=job)
         except Exception:
             segments = _transcribe_with_whisper_cli(audio_path, key)
         data = _save_transcript(filename, "manual", segments)
