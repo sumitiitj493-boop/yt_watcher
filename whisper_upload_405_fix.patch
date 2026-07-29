@@ -1,0 +1,25 @@
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index c915234..e3c611c 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -76,6 +76,7 @@ async def whisper_transcription_create(request: TranscriptUrlRequest):
+         raise HTTPException(status_code=400, detail=f"Unable to start Whisper transcription: {exc}")
+ 
+ 
++@router.post("/whisper-upload")
+ @router.post("/whisper-transcriptions/upload")
+ async def whisper_transcription_upload(
+     file: UploadFile = File(...),
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 00a7218..085863c 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1236,7 +1236,7 @@ function WhisperTranscriptionPage({ onNotify }) {
+       const formData = new FormData();
+       formData.append('file', selectedAudioFile);
+       formData.append('force', String(force));
+-      const response = await api.post('/whisper-transcriptions/upload', formData, {
++      const response = await api.post('/whisper-upload', formData, {
+         headers: { 'Content-Type': 'multipart/form-data' },
+       });
+       const data = response.data || {};

@@ -1,0 +1,385 @@
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index 9bb9e7b..c915234 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -1,11 +1,17 @@
+ import asyncio
+ 
+-from fastapi import APIRouter, HTTPException, WebSocket
++from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket
+ from starlette.websockets import WebSocketDisconnect
+ 
+ from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
+ from services.metadata import fetch_metadata
+-from services.transcripts import fetch_url_transcript, get_url_transcription_job, start_url_whisper_transcription
++from services.transcripts import (
++    fetch_url_transcript,
++    get_url_transcription_job,
++    save_uploaded_audio_file,
++    start_uploaded_whisper_transcription,
++    start_url_whisper_transcription,
++)
+ from services.youtube_access import check_youtube_access
+ from services.url_guard import validate_public_url
+ from services.downloader import (
+@@ -70,6 +76,28 @@ async def whisper_transcription_create(request: TranscriptUrlRequest):
+         raise HTTPException(status_code=400, detail=f"Unable to start Whisper transcription: {exc}")
+ 
+ 
++@router.post("/whisper-transcriptions/upload")
++async def whisper_transcription_upload(
++    file: UploadFile = File(...),
++    force: bool = Form(default=False),
++):
++    try:
++        audio_path, original_filename, key, size_bytes = await save_uploaded_audio_file(file)
++        response = await start_uploaded_whisper_transcription(audio_path, original_filename, key, force)
++        response["filename"] = original_filename
++        response["size_bytes"] = size_bytes
++        return response
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail=f"Unable to upload audio for Whisper transcription: {exc}")
++    finally:
++        try:
++            await file.close()
++        except Exception:
++            pass
++
++
+ @router.get("/whisper-transcriptions/{job_id}")
+ async def whisper_transcription_status(job_id: str):
+     job = get_url_transcription_job(job_id)
+diff --git a/backend/services/transcripts.py b/backend/services/transcripts.py
+index 8ff4d76..0e345e2 100644
+--- a/backend/services/transcripts.py
++++ b/backend/services/transcripts.py
+@@ -28,8 +28,10 @@ from services.yt_dlp_options import (
+ 
+ TRANSCRIPT_DIR = DOWNLOAD_DIR / "transcripts"
+ TRANSCRIPT_AUDIO_DIR = DOWNLOAD_DIR / "transcript_audio"
++TRANSCRIPT_UPLOAD_DIR = DOWNLOAD_DIR / "transcript_uploads"
+ TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+ TRANSCRIPT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
++TRANSCRIPT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ MANUAL_TRANSCRIPT_JOBS: dict[str, dict] = {}
+ URL_TRANSCRIPT_JOBS: dict[str, dict] = {}
+@@ -43,6 +45,11 @@ TIMESTAMP_RE = re.compile(
+ TAG_RE = re.compile(r"<[^>]+>")
+ WORD_RE = re.compile(r"[A-Za-z0-9']+")
+ 
++UPLOAD_AUDIO_EXTENSIONS = {
++    "mp3", "wav", "m4a", "aac", "ogg", "opus", "flac", "webm", "mp4", "mkv", "mov", "aiff", "aif",
++}
++MAX_UPLOAD_AUDIO_BYTES = max(1, int(os.environ.get("WHISPER_UPLOAD_MAX_MB", "500") or "500")) * 1024 * 1024
++
+ CAPTION_LANGUAGE_PRIORITY = (
+     "en",
+     "en-us",
+@@ -105,6 +112,60 @@ def _safe_url_key(url: str) -> str:
+     return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:24]
+ 
+ 
++def _safe_upload_name(filename: str) -> str:
++    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename or "audio").stem).strip("._") or "audio"
++    ext = re.sub(r"[^A-Za-z0-9]+", "", Path(filename or "").suffix.lower().lstrip(".")) or "audio"
++    return f"{stem[:120]}.{ext[:12]}"
++
++
++async def save_uploaded_audio_file(upload: Any) -> tuple[Path, str, str, int]:
++    """Save an uploaded audio/media file for Whisper and return path/name/key/size.
++
++    The key is based on SHA-256 so repeated uploads can reuse cached transcripts
++    unless the caller asks to force regeneration.
++    """
++    original_filename = Path(getattr(upload, "filename", "") or "uploaded_audio").name
++    safe_name = _safe_upload_name(original_filename)
++    extension = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
++    if extension not in UPLOAD_AUDIO_EXTENSIONS:
++        allowed = ", ".join(sorted(UPLOAD_AUDIO_EXTENSIONS))
++        raise ValueError(f"Unsupported upload type .{extension or 'unknown'}. Allowed: {allowed}")
++
++    temp_path = TRANSCRIPT_UPLOAD_DIR / f"tmp_{uuid.uuid4().hex}_{safe_name}"
++    hasher = hashlib.sha256()
++    total = 0
++    try:
++        with temp_path.open("wb") as output:
++            while True:
++                chunk = await upload.read(1024 * 1024)
++                if not chunk:
++                    break
++                total += len(chunk)
++                if total > MAX_UPLOAD_AUDIO_BYTES:
++                    raise ValueError(f"Upload is too large. Max size is {MAX_UPLOAD_AUDIO_BYTES // 1024 // 1024} MB")
++                hasher.update(chunk)
++                output.write(chunk)
++    except Exception:
++        try:
++            temp_path.unlink(missing_ok=True)
++        except Exception:
++            pass
++        raise
++
++    if total <= 0:
++        temp_path.unlink(missing_ok=True)
++        raise ValueError("Uploaded audio file is empty")
++
++    digest = hasher.hexdigest()
++    key = f"upload_{digest[:24]}"
++    final_path = TRANSCRIPT_UPLOAD_DIR / f"{key}_{safe_name}"
++    if final_path.exists():
++        temp_path.unlink(missing_ok=True)
++    else:
++        temp_path.replace(final_path)
++    return final_path, original_filename, key, total
++
++
+ def _transcript_text(segments: list[dict[str, Any]]) -> str:
+     lines = []
+     for segment in segments:
+@@ -1039,6 +1100,58 @@ def transcribe_url_with_whisper_sync(url: str, force: bool = False, job_id: str
+     return data
+ 
+ 
++def transcribe_uploaded_audio_sync(audio_path: Path, original_filename: str, key: str, force: bool = False, job_id: str | None = None) -> dict:
++    audio_path = Path(audio_path)
++    original_filename = original_filename or audio_path.name
++    key = key or f"upload_{_safe_url_key(str(audio_path))}"
++
++    if not force:
++        cached = _find_cached_transcript_payload(key)
++        if cached and cached.get("available") and cached.get("source") in {"whisper", "manual"}:
++            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
++            return cached
++
++    if not audio_path.exists() or audio_path.stat().st_size <= 0:
++        return {"available": False, "source": "whisper", "reason": "Uploaded audio file was not found or is empty", "segments": [], "text": ""}
++
++    job = URL_TRANSCRIPT_JOBS.get(job_id or "")
++    if job:
++        size_mb = round(audio_path.stat().st_size / 1024 / 1024, 2)
++        estimated_total = max(30, min(900, int(size_mb * 35)))
++        job.update({
++            "status": "transcribing",
++            "progress": 20,
++            "audio_size_mb": size_mb,
++            "transcribe_started_at": time.time(),
++            "estimated_total_seconds": estimated_total,
++            "eta_seconds": estimated_total,
++            "filename": original_filename,
++        })
++        _update_job_timing(job, f"Running Whisper on uploaded audio ({size_mb} MB)", estimated_total)
++
++    try:
++        try:
++            segments = _transcribe_with_faster_whisper(audio_path, job=job)
++        except Exception:
++            segments = _transcribe_with_whisper_cli(audio_path, key)
++    except Exception as exc:
++        return {"available": False, "source": "whisper", "reason": f"Whisper transcription failed: {exc}", "segments": [], "text": ""}
++
++    if not segments:
++        return {"available": False, "source": "whisper", "reason": "Whisper produced an empty transcript", "segments": [], "text": ""}
++
++    extra = {
++        "title": Path(original_filename).stem or "Uploaded audio",
++        "filename": original_filename,
++        "uploaded_audio": True,
++        "audio_path": str(audio_path),
++        "subtitle_name": "Whisper transcription from uploaded audio",
++        "transcript_method": "whisper_upload",
++        "direct": False,
++    }
++    return _save_transcript_by_key(key, "whisper", segments, extra)
++
++
+ def _transcribe_with_faster_whisper(audio_path: Path, job: dict | None = None) -> list[dict[str, Any]]:
+     model, model_settings = _get_faster_whisper_model()
+     beam_size = _env_int("WHISPER_BEAM_SIZE", 1, 1, 10)
+@@ -1193,6 +1306,7 @@ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict
+     URL_TRANSCRIPT_JOBS[job_id] = {
+         "job_id": job_id,
+         "url": url,
++        "source": "url",
+         "status": "queued",
+         "progress": 0,
+         "message": "Whisper transcription queued",
+@@ -1215,5 +1329,39 @@ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict
+     return {"already_done": False, "job_id": job_id, "status": "queued"}
+ 
+ 
++async def start_uploaded_whisper_transcription(audio_path: Path, original_filename: str, key: str, force: bool = False) -> dict:
++    if not force:
++        cached = _find_cached_transcript_payload(key)
++        if cached and cached.get("available") and cached.get("source") in {"whisper", "manual"}:
++            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
++            return {"already_done": True, "job_id": None, "result": cached}
++
++    job_id = str(uuid.uuid4())
++    URL_TRANSCRIPT_JOBS[job_id] = {
++        "job_id": job_id,
++        "source": "upload",
++        "filename": original_filename,
++        "status": "queued",
++        "progress": 0,
++        "message": "Uploaded audio queued for Whisper",
++        "created_at": time.time(),
++    }
++
++    async def runner():
++        job = URL_TRANSCRIPT_JOBS[job_id]
++        try:
++            result = await asyncio.to_thread(transcribe_uploaded_audio_sync, audio_path, original_filename, key, force, job_id)
++            if result.get("available"):
++                job.update({"status": "completed", "progress": 100, "message": "Whisper transcript ready", "result": result})
++            else:
++                reason = result.get("reason") or "Whisper transcription failed"
++                job.update({"status": "error", "progress": 100, "message": reason, "error": reason, "result": result})
++        except Exception as exc:
++            job.update({"status": "error", "progress": 100, "message": str(exc), "error": str(exc)})
++
++    asyncio.create_task(runner())
++    return {"already_done": False, "job_id": job_id, "status": "queued"}
++
++
+ def get_url_transcription_job(job_id: str) -> dict | None:
+     return URL_TRANSCRIPT_JOBS.get(job_id)
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 0120c23..00a7218 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1132,6 +1132,8 @@ function WhisperTranscriptionPage({ onNotify }) {
+   const [result, setResult] = useState(null);
+   const [error, setError] = useState('');
+   const [isStarting, setIsStarting] = useState(false);
++  const [isUploading, setIsUploading] = useState(false);
++  const [selectedAudioFile, setSelectedAudioFile] = useState(null);
+   const [copyStatus, setCopyStatus] = useState('Copy Transcript');
+   const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
+   const transcriptText = transcriptSegmentsToText(result?.segments || []);
+@@ -1222,6 +1224,37 @@ function WhisperTranscriptionPage({ onNotify }) {
+     }
+   };
+ 
++  const handleUploadSubmit = async (event) => {
++    event.preventDefault();
++    if (!selectedAudioFile || isUploading || isActive) return;
++
++    setIsUploading(true);
++    setError('');
++    setResult(null);
++    setCopyStatus('Copy Transcript');
++    try {
++      const formData = new FormData();
++      formData.append('file', selectedAudioFile);
++      formData.append('force', String(force));
++      const response = await api.post('/whisper-transcriptions/upload', formData, {
++        headers: { 'Content-Type': 'multipart/form-data' },
++      });
++      const data = response.data || {};
++      if (data.already_done && data.result) {
++        setResult(data.result);
++        setJob(null);
++        notify('Loaded cached upload transcript', 'success');
++      } else {
++        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
++        notify('Uploaded audio transcription started', 'success');
++      }
++    } catch (uploadError) {
++      setError(safeFetchError(uploadError, 'Unable to upload audio for Whisper transcription.'));
++    } finally {
++      setIsUploading(false);
++    }
++  };
++
+   const handleCopy = async () => {
+     if (!transcriptText) return;
+     try {
+@@ -1289,6 +1322,40 @@ function WhisperTranscriptionPage({ onNotify }) {
+           </div>
+         </form>
+ 
++        <div className="whisper-upload-divider"><span>or</span></div>
++
++        <form onSubmit={handleUploadSubmit} className="download-form whisper-upload-form">
++          <div className="field field--full">
++            <label className="field__label" htmlFor="whisper-audio-upload">UPLOAD AUDIO FROM PC</label>
++            <input
++              id="whisper-audio-upload"
++              className="input"
++              type="file"
++              accept="audio/*,video/mp4,video/webm,video/x-matroska,video/quicktime"
++              onChange={(event) => {
++                setSelectedAudioFile(event.target.files?.[0] || null);
++                setError('');
++              }}
++              disabled={isUploading || isActive}
++            />
++            <p className="field__help field__help--inline">
++              Supports MP3, WAV, M4A, AAC, OGG/OPUS, FLAC, WEBM, MP4/MOV/MKV audio/video containers.
++              {selectedAudioFile ? ` Selected: ${selectedAudioFile.name} (${formatBytes(selectedAudioFile.size)})` : ''}
++            </p>
++          </div>
++
++          <div className="transcript-actions">
++            <button className="primary-button" type="submit" disabled={isUploading || isActive || !selectedAudioFile}>
++              {isUploading || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
++              {isUploading ? 'Uploading...' : isActive ? 'Transcribing...' : 'Upload & Transcribe'}
++            </button>
++            <button className="ghost-button" type="button" onClick={() => setSelectedAudioFile(null)} disabled={!selectedAudioFile || isUploading || isActive}>
++              <X size={16} />
++              Clear File
++            </button>
++          </div>
++        </form>
++
+         {job ? (
+           <div className="whisper-job-card">
+             <div className="download-card__title-row">
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index d78cb92..a821ab7 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -1046,6 +1046,40 @@ body[data-theme='dark'] .main-stage {
+ 	accent-color: #6366f1;
+ }
+ 
++.whisper-upload-divider {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	color: #94a3b8;
++	font-size: 12px;
++	font-weight: 800;
++	letter-spacing: 0.08em;
++	text-transform: uppercase;
++}
++
++.whisper-upload-divider::before,
++.whisper-upload-divider::after {
++	content: "";
++	flex: 1;
++	height: 1px;
++	background: rgba(148, 163, 184, 0.24);
++}
++
++.whisper-upload-divider span {
++	padding: 0 4px;
++}
++
++.whisper-upload-form {
++	padding: 16px;
++	border-radius: 18px;
++	border: 1px dashed rgba(99, 102, 241, 0.34);
++	background: rgba(99, 102, 241, 0.05);
++}
++
++.whisper-upload-form input[type="file"] {
++	cursor: pointer;
++}
++
+ .whisper-job-card {
+ 	display: grid;
+ 	gap: 12px;

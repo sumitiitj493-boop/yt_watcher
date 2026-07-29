@@ -1,11 +1,18 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException, WebSocket
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
 from services.metadata import fetch_metadata
-from services.transcripts import fetch_url_transcript, get_url_transcription_job, start_url_whisper_transcription
+from services.transcripts import (
+    fetch_url_transcript,
+    get_url_transcription_job,
+    save_uploaded_audio_file,
+    start_uploaded_whisper_transcription,
+    start_url_whisper_transcription,
+)
+from services.youtube_access import check_youtube_access
 from services.url_guard import validate_public_url
 from services.downloader import (
     clear_downloads,
@@ -36,6 +43,17 @@ async def video_metadata(request: MetadataRequest):
         raise HTTPException(status_code=400, detail=f"Unable to fetch metadata: {exc}")
 
 
+@router.post("/youtube-access-check")
+async def youtube_access_check(request: MetadataRequest):
+    try:
+        safe_url = await validate_public_url(str(request.url))
+        return await check_youtube_access(safe_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to check YouTube access: {exc}")
+
+
 @router.post("/transcript-from-url")
 async def transcript_from_url(request: TranscriptUrlRequest):
     try:
@@ -56,6 +74,29 @@ async def whisper_transcription_create(request: TranscriptUrlRequest):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to start Whisper transcription: {exc}")
+
+
+@router.post("/whisper-upload")
+@router.post("/whisper-transcriptions/upload")
+async def whisper_transcription_upload(
+    file: UploadFile = File(...),
+    force: bool = Form(default=False),
+):
+    try:
+        audio_path, original_filename, key, size_bytes = await save_uploaded_audio_file(file)
+        response = await start_uploaded_whisper_transcription(audio_path, original_filename, key, force)
+        response["filename"] = original_filename
+        response["size_bytes"] = size_bytes
+        return response
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to upload audio for Whisper transcription: {exc}")
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 @router.get("/whisper-transcriptions/{job_id}")

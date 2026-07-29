@@ -10,18 +10,28 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import Any, Iterator
 
 import yt_dlp
 
 from services.files import DOWNLOAD_DIR, extract_video_id, resolve_download_path
-from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
+from services.yt_dlp_options import (
+    PUBLIC_HTTP_HEADERS,
+    YTDLP_SOCKET_TIMEOUT_SECONDS,
+    YTDLP_STARTUP_TIMEOUT_SECONDS,
+    apply_reliable_ytdlp_options,
+    cookiefile_report,
+    pretty_cookie_summary,
+    validate_cookiefile_for_ytdlp,
+)
 
 TRANSCRIPT_DIR = DOWNLOAD_DIR / "transcripts"
 TRANSCRIPT_AUDIO_DIR = DOWNLOAD_DIR / "transcript_audio"
+TRANSCRIPT_UPLOAD_DIR = DOWNLOAD_DIR / "transcript_uploads"
 TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+TRANSCRIPT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MANUAL_TRANSCRIPT_JOBS: dict[str, dict] = {}
 URL_TRANSCRIPT_JOBS: dict[str, dict] = {}
@@ -34,6 +44,11 @@ TIMESTAMP_RE = re.compile(
 )
 TAG_RE = re.compile(r"<[^>]+>")
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+UPLOAD_AUDIO_EXTENSIONS = {
+    "mp3", "wav", "m4a", "aac", "ogg", "opus", "flac", "webm", "mp4", "mkv", "mov", "aiff", "aif",
+}
+MAX_UPLOAD_AUDIO_BYTES = max(1, int(os.environ.get("WHISPER_UPLOAD_MAX_MB", "500") or "500")) * 1024 * 1024
 
 CAPTION_LANGUAGE_PRIORITY = (
     "en",
@@ -95,6 +110,60 @@ def _safe_key(filename: str) -> str:
 
 def _safe_url_key(url: str) -> str:
     return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:24]
+
+
+def _safe_upload_name(filename: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename or "audio").stem).strip("._") or "audio"
+    ext = re.sub(r"[^A-Za-z0-9]+", "", Path(filename or "").suffix.lower().lstrip(".")) or "audio"
+    return f"{stem[:120]}.{ext[:12]}"
+
+
+async def save_uploaded_audio_file(upload: Any) -> tuple[Path, str, str, int]:
+    """Save an uploaded audio/media file for Whisper and return path/name/key/size.
+
+    The key is based on SHA-256 so repeated uploads can reuse cached transcripts
+    unless the caller asks to force regeneration.
+    """
+    original_filename = Path(getattr(upload, "filename", "") or "uploaded_audio").name
+    safe_name = _safe_upload_name(original_filename)
+    extension = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+    if extension not in UPLOAD_AUDIO_EXTENSIONS:
+        allowed = ", ".join(sorted(UPLOAD_AUDIO_EXTENSIONS))
+        raise ValueError(f"Unsupported upload type .{extension or 'unknown'}. Allowed: {allowed}")
+
+    temp_path = TRANSCRIPT_UPLOAD_DIR / f"tmp_{uuid.uuid4().hex}_{safe_name}"
+    hasher = hashlib.sha256()
+    total = 0
+    try:
+        with temp_path.open("wb") as output:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_AUDIO_BYTES:
+                    raise ValueError(f"Upload is too large. Max size is {MAX_UPLOAD_AUDIO_BYTES // 1024 // 1024} MB")
+                hasher.update(chunk)
+                output.write(chunk)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    if total <= 0:
+        temp_path.unlink(missing_ok=True)
+        raise ValueError("Uploaded audio file is empty")
+
+    digest = hasher.hexdigest()
+    key = f"upload_{digest[:24]}"
+    final_path = TRANSCRIPT_UPLOAD_DIR / f"{key}_{safe_name}"
+    if final_path.exists():
+        temp_path.unlink(missing_ok=True)
+    else:
+        temp_path.replace(final_path)
+    return final_path, original_filename, key, total
 
 
 def _transcript_text(segments: list[dict[str, Any]]) -> str:
@@ -666,8 +735,7 @@ def fetch_url_transcript_sync(url: str, force: bool = False) -> dict:
         "geo_bypass": True,
         "http_headers": PUBLIC_HTTP_HEADERS,
     }
-    add_generic_impersonation(ydl_opts)
-    apply_cookiefile(ydl_opts, url)
+    apply_reliable_ytdlp_options(ydl_opts, url)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -765,7 +833,7 @@ def _download_tiny_audio_sync(filename: str) -> Path:
                 "preferredquality": "192",
             }],
         }
-        apply_cookiefile(ydl_opts, url)
+        apply_reliable_ytdlp_options(ydl_opts, url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         if audio_path.exists():
@@ -811,6 +879,73 @@ def _find_audio_output(key: str) -> Path | None:
     return None
 
 
+def _start_audio_download_watchdog(job: dict | None, url: str) -> Event:
+    stop_event = Event()
+    if job is None:
+        return stop_event
+
+    def watch() -> None:
+        started_at = time.time()
+        while not stop_event.wait(10):
+            if job.get("status") in {"completed", "error"} or job.get("_audio_transfer_started"):
+                return
+            elapsed = int(time.time() - started_at)
+            _update_job_timing(job, f"Authenticating/extracting audio stream Still preparing after {elapsed}s")
+            print(f"[transcription] audio still preparing after {elapsed}s - {url}", flush=True)
+            if YTDLP_STARTUP_TIMEOUT_SECONDS and elapsed >= YTDLP_STARTUP_TIMEOUT_SECONDS:
+                reason = (
+                    f"Audio startup timeout: yt-dlp did not start audio transfer within "
+                    f"{YTDLP_STARTUP_TIMEOUT_SECONDS}s. Refresh youtube_cookies.txt from the browser "
+                    "where the members-only video plays, then retry."
+                )
+                job.update({
+                    "status": "error",
+                    "progress": 100,
+                    "message": reason,
+                    "error": reason,
+                    "_abort_requested": True,
+                })
+                print(f"[transcription] audio startup timeout - {url}", flush=True)
+                return
+
+    Thread(target=watch, daemon=True).start()
+    return stop_event
+
+
+class _YtDlpJobLogger:
+    def __init__(self, job: dict | None, label: str = "transcription") -> None:
+        self.job = job
+        self.label = label
+        self.verbose = os.environ.get("YTDLP_VERBOSE_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def debug(self, message: str) -> None:
+        cleaned = str(message or "").strip()
+        if not cleaned:
+            return
+        if self.verbose:
+            print(f"[{self.label}][yt-dlp] {cleaned}", flush=True)
+        if self.job:
+            lower = cleaned.lower()
+            if "downloading webpage" in lower:
+                _update_job_timing(self.job, "Reading video page")
+            elif "player api json" in lower:
+                _update_job_timing(self.job, "Checking YouTube player/API access")
+
+    def warning(self, message: str) -> None:
+        cleaned = str(message or "").strip()
+        if cleaned:
+            print(f"[{self.label}][yt-dlp warning] {cleaned}", flush=True)
+            if self.job:
+                _update_job_timing(self.job, f"yt-dlp warning: {cleaned[:160]}")
+
+    def error(self, message: str) -> None:
+        cleaned = str(message or "").strip()
+        if cleaned:
+            print(f"[{self.label}][yt-dlp error] {cleaned}", flush=True)
+            if self.job:
+                _update_job_timing(self.job, f"yt-dlp error: {cleaned[:160]}")
+
+
 def _download_url_audio_sync(url: str, key: str, job: dict | None = None) -> tuple[Path, dict[str, Any]]:
     cached_audio = _find_audio_output(key)
     info: dict[str, Any] = {}
@@ -822,10 +957,9 @@ def _download_url_audio_sync(url: str, key: str, job: dict | None = None) -> tup
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "quiet": True,
-        "no_warnings": True,
+        "logger": _YtDlpJobLogger(job),
+        "no_warnings": False,
         "noplaylist": True,
-        "retries": 3,
-        "fragment_retries": 3,
         "windowsfilenames": True,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
@@ -834,12 +968,14 @@ def _download_url_audio_sync(url: str, key: str, job: dict | None = None) -> tup
         }],
         "http_headers": PUBLIC_HTTP_HEADERS,
     }
-    add_generic_impersonation(ydl_opts)
-    apply_cookiefile(ydl_opts, url)
+    apply_reliable_ytdlp_options(ydl_opts, url)
 
     def hook(data):
+        if job and job.get("_abort_requested"):
+            raise TimeoutError(job.get("error") or "Audio download timed out before transfer started")
         if not job or data.get("status") != "downloading":
             return
+        job["_audio_transfer_started"] = True
         percent = str(data.get("_percent_str") or "").strip()
         speed = str(data.get("_speed_str") or "").strip()
         job.update({
@@ -850,9 +986,31 @@ def _download_url_audio_sync(url: str, key: str, job: dict | None = None) -> tup
 
     if job is not None:
         ydl_opts["progress_hooks"] = [hook]
+        cookie_report = cookiefile_report(url)
+        job["cookie_report"] = {
+            "exists": cookie_report.get("exists"),
+            "is_netscape": cookie_report.get("is_netscape"),
+            "has_auth_cookies": cookie_report.get("has_auth_cookies"),
+            "warning": cookie_report.get("warning"),
+        }
+        if cookie_report.get("warning"):
+            _update_job_timing(job, str(cookie_report["warning"]))
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True) or {}
+    validate_cookiefile_for_ytdlp(url)
+    print(
+        f"[transcription] audio download preparing - {pretty_cookie_summary(url)} "
+        f"timeout={YTDLP_SOCKET_TIMEOUT_SECONDS}s startup_timeout={YTDLP_STARTUP_TIMEOUT_SECONDS}s - {url}",
+        flush=True,
+    )
+    watchdog_stop = _start_audio_download_watchdog(job, url)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True) or {}
+    finally:
+        watchdog_stop.set()
+
+    if job and (job.get("_abort_requested") or job.get("status") == "error"):
+        raise TimeoutError(job.get("error") or "Audio download timed out before transfer started")
 
     audio_path = TRANSCRIPT_AUDIO_DIR / f"{key}.mp3"
     if audio_path.exists() and audio_path.stat().st_size > 1024:
@@ -940,6 +1098,58 @@ def transcribe_url_with_whisper_sync(url: str, force: bool = False, job_id: str 
     if key != fallback_key:
         _save_transcript_by_key(fallback_key, "whisper", segments, extra)
     return data
+
+
+def transcribe_uploaded_audio_sync(audio_path: Path, original_filename: str, key: str, force: bool = False, job_id: str | None = None) -> dict:
+    audio_path = Path(audio_path)
+    original_filename = original_filename or audio_path.name
+    key = key or f"upload_{_safe_url_key(str(audio_path))}"
+
+    if not force:
+        cached = _find_cached_transcript_payload(key)
+        if cached and cached.get("available") and cached.get("source") in {"whisper", "manual"}:
+            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+            return cached
+
+    if not audio_path.exists() or audio_path.stat().st_size <= 0:
+        return {"available": False, "source": "whisper", "reason": "Uploaded audio file was not found or is empty", "segments": [], "text": ""}
+
+    job = URL_TRANSCRIPT_JOBS.get(job_id or "")
+    if job:
+        size_mb = round(audio_path.stat().st_size / 1024 / 1024, 2)
+        estimated_total = max(30, min(900, int(size_mb * 35)))
+        job.update({
+            "status": "transcribing",
+            "progress": 20,
+            "audio_size_mb": size_mb,
+            "transcribe_started_at": time.time(),
+            "estimated_total_seconds": estimated_total,
+            "eta_seconds": estimated_total,
+            "filename": original_filename,
+        })
+        _update_job_timing(job, f"Running Whisper on uploaded audio ({size_mb} MB)", estimated_total)
+
+    try:
+        try:
+            segments = _transcribe_with_faster_whisper(audio_path, job=job)
+        except Exception:
+            segments = _transcribe_with_whisper_cli(audio_path, key)
+    except Exception as exc:
+        return {"available": False, "source": "whisper", "reason": f"Whisper transcription failed: {exc}", "segments": [], "text": ""}
+
+    if not segments:
+        return {"available": False, "source": "whisper", "reason": "Whisper produced an empty transcript", "segments": [], "text": ""}
+
+    extra = {
+        "title": Path(original_filename).stem or "Uploaded audio",
+        "filename": original_filename,
+        "uploaded_audio": True,
+        "audio_path": str(audio_path),
+        "subtitle_name": "Whisper transcription from uploaded audio",
+        "transcript_method": "whisper_upload",
+        "direct": False,
+    }
+    return _save_transcript_by_key(key, "whisper", segments, extra)
 
 
 def _transcribe_with_faster_whisper(audio_path: Path, job: dict | None = None) -> list[dict[str, Any]]:
@@ -1096,6 +1306,7 @@ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict
     URL_TRANSCRIPT_JOBS[job_id] = {
         "job_id": job_id,
         "url": url,
+        "source": "url",
         "status": "queued",
         "progress": 0,
         "message": "Whisper transcription queued",
@@ -1106,6 +1317,40 @@ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict
         job = URL_TRANSCRIPT_JOBS[job_id]
         try:
             result = await asyncio.to_thread(transcribe_url_with_whisper_sync, url, force, job_id)
+            if result.get("available"):
+                job.update({"status": "completed", "progress": 100, "message": "Whisper transcript ready", "result": result})
+            else:
+                reason = result.get("reason") or "Whisper transcription failed"
+                job.update({"status": "error", "progress": 100, "message": reason, "error": reason, "result": result})
+        except Exception as exc:
+            job.update({"status": "error", "progress": 100, "message": str(exc), "error": str(exc)})
+
+    asyncio.create_task(runner())
+    return {"already_done": False, "job_id": job_id, "status": "queued"}
+
+
+async def start_uploaded_whisper_transcription(audio_path: Path, original_filename: str, key: str, force: bool = False) -> dict:
+    if not force:
+        cached = _find_cached_transcript_payload(key)
+        if cached and cached.get("available") and cached.get("source") in {"whisper", "manual"}:
+            cached["text"] = cached.get("text") or _transcript_text(cached.get("segments") or [])
+            return {"already_done": True, "job_id": None, "result": cached}
+
+    job_id = str(uuid.uuid4())
+    URL_TRANSCRIPT_JOBS[job_id] = {
+        "job_id": job_id,
+        "source": "upload",
+        "filename": original_filename,
+        "status": "queued",
+        "progress": 0,
+        "message": "Uploaded audio queued for Whisper",
+        "created_at": time.time(),
+    }
+
+    async def runner():
+        job = URL_TRANSCRIPT_JOBS[job_id]
+        try:
+            result = await asyncio.to_thread(transcribe_uploaded_audio_sync, audio_path, original_filename, key, force, job_id)
             if result.get("available"):
                 job.update({"status": "completed", "progress": 100, "message": "Whisper transcript ready", "result": result})
             else:

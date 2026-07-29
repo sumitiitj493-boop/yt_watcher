@@ -16,7 +16,16 @@ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id
 from services.job_store import delete_job as delete_job_record
 from services.job_store import load_jobs, save_jobs
 from services.url_guard import validate_public_url
-from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
+from services.yt_dlp_options import (
+    PUBLIC_HTTP_HEADERS,
+    YTDLP_SOCKET_TIMEOUT_SECONDS,
+    YTDLP_STARTUP_TIMEOUT_SECONDS,
+    add_generic_impersonation,
+    apply_reliable_ytdlp_options,
+    cookiefile_report,
+    pretty_cookie_summary,
+    validate_cookiefile_for_ytdlp,
+)
 
 # Dictionary to hold the download progress of tasks
 # Structure: { video_id: {"status": "downloading", "percent": 0.0, "title": "", ...} }
@@ -25,7 +34,6 @@ download_tasks: Dict[str, dict] = load_jobs()
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2") or "2"))
 MAX_AUTO_RETRIES = max(0, int(os.environ.get("MAX_AUTO_RETRIES", "1") or "1"))
 AUTO_RETRY_BASE_DELAY_SECONDS = max(5, int(os.environ.get("AUTO_RETRY_BASE_DELAY_SECONDS", "20") or "20"))
-YTDLP_SOCKET_TIMEOUT_SECONDS = max(10, int(os.environ.get("YTDLP_SOCKET_TIMEOUT_SECONDS", "25") or "25"))
 
 TERMINAL_STATUSES = {"completed", "error", "cancelled"}
 QUEUED_STATUSES = {"pending", "queued"}
@@ -88,15 +96,24 @@ def _extract_custom_url(url: str) -> str | None:
 
 def _categorize_error(message: str) -> str:
     text = (message or "").lower()
+    timeout_markers = ["startup timeout", "timed out before media transfer", "pre-download timed out"]
     transient_markers = [
         "timed out", "timeout", "temporarily unavailable", "connection reset",
         "connection aborted", "network is unreachable", "http error 5", "503", "502", "504",
         "fragment", "incomplete read",
     ]
-    auth_markers = ["sign in", "login", "cookies", "private video", "members-only", "permission"]
+    auth_markers = [
+        "sign in", "login", "cookies", "private video", "members-only", "members only",
+        "join this channel", "permission", "not authorized", "account", "subscriber-only",
+    ]
+    bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
     geo_markers = ["not available in your country", "geo", "region"]
     unsupported_markers = ["unsupported url", "no suitable extractor"]
     removed_markers = ["video unavailable", "removed", "deleted", "does not exist"]
+    if any(marker in text for marker in timeout_markers):
+        return "timeout"
+    if any(marker in text for marker in bot_markers):
+        return "bot_check"
     if any(marker in text for marker in transient_markers):
         return "network"
     if any(marker in text for marker in auth_markers):
@@ -111,7 +128,7 @@ def _categorize_error(message: str) -> str:
 
 
 def _is_retryable_error(category: str) -> bool:
-    return category in {"network", "unknown"}
+    return category in {"network", "timeout", "unknown"}
 
 
 def _queue_position(task_id: str) -> int | None:
@@ -281,6 +298,8 @@ def _mark_completed(task_id: str, ydl, info: dict, format_ext: str) -> None:
         "error_category": None,
         "retryable": False,
         "next_retry_at": None,
+        "abort_requested": False,
+        "message": "Download completed.",
     })
     _touch_task(task_id)
 
@@ -308,6 +327,7 @@ def _mark_error_or_retry(task_id: str, clean_error: str) -> None:
             "retry_count": retry_count + 1,
             "last_error": clean_error,
             "error": f"Auto retry scheduled: {clean_error}",
+            "message": f"Auto retry scheduled after error: {clean_error}",
             "error_category": category,
             "retryable": True,
             "next_retry_at": next_retry_at,
@@ -323,6 +343,7 @@ def _mark_error_or_retry(task_id: str, clean_error: str) -> None:
         "status": "error",
         "error": clean_error,
         "last_error": clean_error,
+        "message": clean_error,
         "error_category": category,
         "retryable": retryable,
         "next_retry_at": None,
@@ -337,19 +358,75 @@ def _set_task_message(task_id: str, message: str) -> None:
         _touch_task(task_id)
 
 
+class _YtDlpTaskLogger:
+    def __init__(self, task_id: str, label: str = "download") -> None:
+        self.task_id = task_id
+        self.label = label
+        self.verbose = os.environ.get("YTDLP_VERBOSE_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def debug(self, message: str) -> None:
+        cleaned = _clean(str(message))
+        if not cleaned:
+            return
+        if self.verbose:
+            print(f"[{self.label}][yt-dlp] {cleaned}", flush=True)
+        lower = cleaned.lower()
+        if "downloading webpage" in lower:
+            _set_task_message(self.task_id, "Reading video page...")
+        elif "player api json" in lower:
+            _set_task_message(self.task_id, "Checking YouTube player/API access...")
+        elif "extracting url" in lower:
+            _set_task_message(self.task_id, "Extracting URL...")
+
+    def warning(self, message: str) -> None:
+        cleaned = _clean(str(message))
+        if cleaned:
+            print(f"[{self.label}][yt-dlp warning] {cleaned}", flush=True)
+            _set_task_message(self.task_id, f"yt-dlp warning: {cleaned[:180]}")
+
+    def error(self, message: str) -> None:
+        cleaned = _clean(str(message))
+        if cleaned:
+            print(f"[{self.label}][yt-dlp error] {cleaned}", flush=True)
+            _set_task_message(self.task_id, f"yt-dlp error: {cleaned[:180]}")
+
+
 def _start_download_watchdog(task_id: str, url: str) -> tuple[Event, Thread]:
     stop_event = Event()
 
     def watch() -> None:
         started_at = time.time()
-        while not stop_event.wait(10):
+        interval = 10
+        while not stop_event.wait(interval):
             task = download_tasks.get(task_id) or {}
             status = task.get("status")
             if status in TERMINAL_STATUSES or status in {"downloading", "processing"}:
                 return
             elapsed = int(time.time() - started_at)
-            message = task.get("message") or "Preparing download"
+            message = str(task.get("message") or "Preparing download").split(" Still preparing after ")[0]
+            _set_task_message(task_id, f"{message} Still preparing after {elapsed}s...")
             print(f"[download] still preparing after {elapsed}s - {message} - {url}", flush=True)
+            if YTDLP_STARTUP_TIMEOUT_SECONDS and elapsed >= YTDLP_STARTUP_TIMEOUT_SECONDS:
+                clean_error = (
+                    f"Startup timeout: yt-dlp did not start media transfer within "
+                    f"{YTDLP_STARTUP_TIMEOUT_SECONDS}s. This usually means YouTube auth/cookies, "
+                    "bot check, network, or player extraction is stuck. Try refreshing youtube_cookies.txt "
+                    "from the same browser where the members-only video plays, then retry."
+                )
+                task = download_tasks.get(task_id)
+                if task and task.get("status") not in TERMINAL_STATUSES:
+                    task.update({
+                        "status": "error",
+                        "error": clean_error,
+                        "last_error": clean_error,
+                        "error_category": "timeout",
+                        "retryable": True,
+                        "abort_requested": True,
+                        "updated_at": time.time(),
+                    })
+                    save_jobs(download_tasks)
+                print(f"[download] startup timeout - {url}", flush=True)
+                return
 
     thread = Thread(target=watch, daemon=True)
     thread.start()
@@ -368,6 +445,7 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         "filename": None,
         "video_id": existing_task.get("video_id"),
         "cancel_requested": existing_task.get("cancel_requested", False),
+        "abort_requested": False,
         "url": url,
         "quality": quality,
         "format": format_ext,
@@ -390,8 +468,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     save_jobs(download_tasks)
 
     def hook(d):
-        if download_tasks[task_id].get("cancel_requested"):
-            download_tasks[task_id]["status"] = "cancelled"
+        task = download_tasks[task_id]
+        if task.get("abort_requested"):
+            raise TimeoutError(task.get("error") or "Download timed out before media transfer started")
+        if task.get("cancel_requested"):
+            task["status"] = "cancelled"
             raise Exception("Download cancelled")
 
         if d["status"] == "downloading":
@@ -488,21 +569,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         "outtmpl": (DOWNLOAD_DIR / "%(title)s (%(id)s).%(ext)s").as_posix(),
         "progress_hooks": [hook],
         "quiet": True,
+        "logger": _YtDlpTaskLogger(task_id),
         "noplaylist": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 1,
-        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
         "continuedl": True,
         "concurrent_fragment_downloads": 4,
         "windowsfilenames": True,
-        "js_runtimes": {
-            "node": {},
-        },
-        "remote_components": ["ejs:github"],
-        # Better defaults for public social sites
-        "nocheckcertificate": False,
-        "geo_bypass": True,
         "age_limit": None,
         "ignoreerrors": False,
         "http_headers": {
@@ -510,10 +581,8 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     }
-    add_generic_impersonation(ydl_opts)
-
-    apply_cookiefile(ydl_opts, url)
-    cookiefile = ydl_opts.get("cookiefile")
+    apply_reliable_ytdlp_options(ydl_opts, url)
+    cookie_report = cookiefile_report(url)
 
     if format_ext == "mp3":
         ydl_opts["postprocessors"] = [{
@@ -525,12 +594,18 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
+        validate_cookiefile_for_ytdlp(url)
         print(
             f"[download] preparing - quality={quality or 'best'} format={format_ext} "
-            f"cookies={'yes' if cookiefile else 'no'} timeout={YTDLP_SOCKET_TIMEOUT_SECONDS}s - {url}",
+            f"{pretty_cookie_summary(url)} timeout={YTDLP_SOCKET_TIMEOUT_SECONDS}s "
+            f"startup_timeout={YTDLP_STARTUP_TIMEOUT_SECONDS}s - {url}",
             flush=True,
         )
-        _set_task_message(task_id, "Contacting site and checking available formats...")
+        if cookie_report.get("warning"):
+            print(f"[download] cookie warning - {cookie_report['warning']}", flush=True)
+            _set_task_message(task_id, str(cookie_report["warning"]))
+        else:
+            _set_task_message(task_id, "Contacting site and checking available formats...")
         watchdog_stop, watchdog_thread = _start_download_watchdog(task_id, url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             _set_task_message(task_id, "Authenticating/extracting media info...")
@@ -539,6 +614,8 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             download_tasks[task_id]["title"] = info.get("title", "Unknown")
             download_tasks[task_id]["video_id"] = info.get("id")
             if download_tasks[task_id].get("status") == "cancelled":
+                return
+            if download_tasks[task_id].get("abort_requested") or download_tasks[task_id].get("status") == "error":
                 return
             # Small delay to allow Windows to release file locks from antivirus/indexing
             time.sleep(0.5)
@@ -613,6 +690,7 @@ async def retry_download_task(task_id: str) -> str | None:
             "eta": "",
             "filename": None,
             "cancel_requested": False,
+            "abort_requested": False,
             "url": safe_url,
             "queued_at": now,
             "updated_at": now,
@@ -622,6 +700,7 @@ async def retry_download_task(task_id: str) -> str | None:
             "error_category": None,
             "retryable": False,
             "next_retry_at": None,
+            "message": "Retry queued, waiting for an available download slot...",
             "manual_retry_count": int(task.get("manual_retry_count") or 0) + 1,
         })
         if task_id not in PENDING_TASK_IDS:
@@ -659,6 +738,7 @@ async def initiate_download(url: str, quality: str = "best", format_ext: str = "
             "filename": None,
             "video_id": None,
             "cancel_requested": False,
+            "abort_requested": False,
             "url": url,
             "quality": quality,
             "format": format_ext,
@@ -675,6 +755,7 @@ async def initiate_download(url: str, quality: str = "best", format_ext: str = "
             "error_category": None,
             "retryable": False,
             "next_retry_at": None,
+            "message": "Queued, waiting for an available download slot...",
         }
         PENDING_TASK_IDS.append(task_id)
         _refresh_queue_positions()

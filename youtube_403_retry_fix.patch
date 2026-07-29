@@ -1,0 +1,132 @@
+diff --git a/backend/services/yt_dlp_options.py b/backend/services/yt_dlp_options.py
+index a623003..d6a2c56 100644
+--- a/backend/services/yt_dlp_options.py
++++ b/backend/services/yt_dlp_options.py
+@@ -31,6 +31,7 @@ YTDLP_EXTRACTOR_RETRIES = max(0, int(os.environ.get("YTDLP_EXTRACTOR_RETRIES", "
+ YTDLP_RETRIES = max(0, int(os.environ.get("YTDLP_RETRIES", "3") or "3"))
+ YTDLP_FRAGMENT_RETRIES = max(0, int(os.environ.get("YTDLP_FRAGMENT_RETRIES", "3") or "3"))
+ YTDLP_STARTUP_TIMEOUT_SECONDS = max(0, int(os.environ.get("YTDLP_STARTUP_TIMEOUT_SECONDS", "180") or "180"))
++YTDLP_YOUTUBE_HTTP_CHUNK_MB = max(0, int(os.environ.get("YTDLP_YOUTUBE_HTTP_CHUNK_MB", "10") or "10"))
+ 
+ YOUTUBE_AUTH_COOKIE_NAMES = {
+     "SID",
+@@ -360,8 +361,11 @@ def apply_youtube_runtime_options(ydl_opts: dict[str, Any], url: str) -> dict[st
+             [component.strip() for component in remote_components.split(",") if component.strip()],
+         )
+ 
+-    configured_clients = os.environ.get("YTDLP_YOUTUBE_PLAYER_CLIENTS", "").strip()
+-    if configured_clients:
++    # For authenticated/member videos, yt-dlp's default TV client can sometimes
++    # extract media URLs that later fail with HTTP 403. Exclude it by default;
++    # users can set YTDLP_YOUTUBE_PLAYER_CLIENTS=off to restore yt-dlp defaults.
++    configured_clients = os.environ.get("YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,-tv_downgraded").strip()
++    if configured_clients.lower() not in {"", "off", "none", "false", "0"}:
+         _merge_extractor_args(
+             ydl_opts,
+             "youtube",
+@@ -405,6 +409,8 @@ def apply_reliable_ytdlp_options(ydl_opts: dict[str, Any], url: str) -> dict[str
+ 
+     add_generic_impersonation(ydl_opts)
+     apply_youtube_runtime_options(ydl_opts, url)
++    if is_youtube_url(url) and YTDLP_YOUTUBE_HTTP_CHUNK_MB > 0:
++        ydl_opts.setdefault("http_chunk_size", YTDLP_YOUTUBE_HTTP_CHUNK_MB * 1024 * 1024)
+     apply_cookiefile(ydl_opts, url)
+     return ydl_opts
+ 
+diff --git a/backend/services/downloader.py b/backend/services/downloader.py
+index feb96fb..84bc082 100644
+--- a/backend/services/downloader.py
++++ b/backend/services/downloader.py
+@@ -23,6 +23,7 @@ from services.yt_dlp_options import (
+     add_generic_impersonation,
+     apply_reliable_ytdlp_options,
+     cookiefile_report,
++    is_youtube_url,
+     pretty_cookie_summary,
+     validate_cookiefile_for_ytdlp,
+ )
+@@ -107,6 +108,7 @@ def _categorize_error(message: str) -> str:
+         "join this channel", "permission", "not authorized", "account", "subscriber-only",
+     ]
+     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
++    forbidden_markers = ["http error 403", "403: forbidden", "forbidden", "unable to download video data"]
+     geo_markers = ["not available in your country", "geo", "region"]
+     unsupported_markers = ["unsupported url", "no suitable extractor"]
+     removed_markers = ["video unavailable", "removed", "deleted", "does not exist"]
+@@ -114,6 +116,8 @@ def _categorize_error(message: str) -> str:
+         return "timeout"
+     if any(marker in text for marker in bot_markers):
+         return "bot_check"
++    if any(marker in text for marker in forbidden_markers):
++        return "forbidden"
+     if any(marker in text for marker in transient_markers):
+         return "network"
+     if any(marker in text for marker in auth_markers):
+@@ -128,7 +132,7 @@ def _categorize_error(message: str) -> str:
+ 
+ 
+ def _is_retryable_error(category: str) -> bool:
+-    return category in {"network", "timeout", "unknown"}
++    return category in {"network", "timeout", "forbidden", "unknown"}
+ 
+ 
+ def _queue_position(task_id: str) -> int | None:
+@@ -593,6 +597,25 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+     else:
+         ydl_opts["merge_output_format"] = "mp4"
+ 
++    def _youtube_403_retry_options() -> dict:
++        retry_opts = dict(ydl_opts)
++        retry_opts["continuedl"] = False
++        retry_opts["retries"] = max(5, int(retry_opts.get("retries") or 0))
++        retry_opts["fragment_retries"] = max(5, int(retry_opts.get("fragment_retries") or 0))
++        retry_opts["http_chunk_size"] = min(int(retry_opts.get("http_chunk_size") or 10 * 1024 * 1024), 10 * 1024 * 1024)
++        extractor_args = dict(retry_opts.get("extractor_args") or {})
++        youtube_args = dict(extractor_args.get("youtube") or {})
++        youtube_args["player_client"] = ["web_safari", "mweb", "web_creator"]
++        extractor_args["youtube"] = youtube_args
++        retry_opts["extractor_args"] = extractor_args
++        if format_ext != "mp3":
++            if quality in ("best", ""):
++                retry_opts["format"] = "bestvideo*+bestaudio/best"
++            else:
++                retry_opts["format"] = f"bestvideo*[height<={quality}]+bestaudio/best[height<={quality}]/best"
++            retry_opts["merge_output_format"] = "mp4"
++        return retry_opts
++
+     try:
+         validate_cookiefile_for_ytdlp(url)
+         print(
+@@ -656,6 +679,32 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+             except Exception as generic_error:
+                 clean_error = _clean(str(generic_error))
+ 
++        if is_youtube_url(url) and _categorize_error(clean_error) == "forbidden":
++            try:
++                print("[download] YouTube 403 detected; retrying with alternate web clients and fresh media URLs", flush=True)
++                _set_task_message(task_id, "YouTube returned 403 for the selected stream. Retrying with alternate web clients...")
++                retry_stop, retry_thread = _start_download_watchdog(task_id, url)
++                with yt_dlp.YoutubeDL(_youtube_403_retry_options()) as ydl_retry:
++                    info = ydl_retry.extract_info(url, download=True)
++                    retry_stop.set()
++                    download_tasks[task_id]["title"] = info.get("title", "Unknown")
++                    download_tasks[task_id]["video_id"] = info.get("id")
++                    if download_tasks[task_id].get("status") == "cancelled":
++                        return
++                    if download_tasks[task_id].get("abort_requested") or download_tasks[task_id].get("status") == "error":
++                        return
++                    time.sleep(0.5)
++                    _mark_completed(task_id, ydl_retry, info, format_ext)
++                    print(f"[download] completed after YouTube 403 retry - {download_tasks[task_id].get('filename')}", flush=True)
++                    return
++            except Exception as retry_error:
++                try:
++                    retry_stop.set()
++                except UnboundLocalError:
++                    pass
++                clean_error = _clean(str(retry_error))
++                print(f"[download] YouTube 403 retry failed - {clean_error}", flush=True)
++
+         _mark_error_or_retry(task_id, clean_error)
+     finally:
+         if download_tasks.get(task_id, {}).get("status") == "cancelled":

@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 import yt_dlp
 
 from services.files import DOWNLOAD_DIR, clean_title, extract_video_id
-from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, add_generic_impersonation, apply_cookiefile
+from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, apply_reliable_ytdlp_options
 
 _VIDEO_FORMAT_RE = re.compile(r"^(\d{3,4})p?$")
 
@@ -126,8 +126,7 @@ def _metadata_sync(url: str) -> Dict[str, Any]:
         "geo_bypass": True,
         "http_headers": PUBLIC_HTTP_HEADERS,
     }
-    add_generic_impersonation(ydl_opts)
-    apply_cookiefile(ydl_opts, url)
+    apply_reliable_ytdlp_options(ydl_opts, url)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)

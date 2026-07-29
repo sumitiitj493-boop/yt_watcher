@@ -406,6 +406,8 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
           </div>
         ) : null}
 
+        {active && item.message ? <p className="download-card__message">{item.message}</p> : null}
+        {item.status === 'error' && item.message && !item.error ? <p className="download-card__message">{item.message}</p> : null}
         {item.status === 'error' && item.error ? <p className="download-card__error">{item.error}</p> : null}
       </div>
 
@@ -662,6 +664,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [metadata, setMetadata] = useState(null);
   const [metadataError, setMetadataError] = useState('');
   const [metadataLoading, setMetadataLoading] = useState(false);
+  const [accessCheck, setAccessCheck] = useState(null);
+  const [accessChecking, setAccessChecking] = useState(false);
   const [socialUrl, setSocialUrl] = useState('');
   const [socialQuality, setSocialQuality] = useState('best');
   const [socialFormat, setSocialFormat] = useState('mp4');
@@ -721,6 +725,26 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       setMetadataError(safeFetchError(error, 'Unable to fetch video preview.'));
     } finally {
       setMetadataLoading(false);
+    }
+  };
+
+  const handleCheckYouTubeAccess = async () => {
+    const trimmed = url.trim();
+    if (!trimmed || accessChecking) return;
+
+    setAccessChecking(true);
+    setAccessCheck(null);
+    try {
+      const response = await api.post('/youtube-access-check', { url: trimmed });
+      setAccessCheck(response.data || null);
+    } catch (error) {
+      setAccessCheck({
+        ok: false,
+        error: safeFetchError(error, 'Unable to check YouTube access.'),
+        suggestions: ['Restart the backend and try again.'],
+      });
+    } finally {
+      setAccessChecking(false);
     }
   };
 
@@ -889,6 +913,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                   setUrl(event.target.value);
                   setMetadata(null);
                   setMetadataError('');
+                  setAccessCheck(null);
                 }}
                 placeholder="https://youtube.com/watch?v=..."
                 autoComplete="off"
@@ -916,6 +941,29 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
             </div>
 
             {metadataError ? <p className="download-card__error">{metadataError}</p> : null}
+
+            {accessCheck ? (
+              <div className={`diagnostic-card ${accessCheck.ok ? 'diagnostic-card--ok' : 'diagnostic-card--error'}`}>
+                <div className="diagnostic-card__head">
+                  <ShieldCheck size={16} />
+                  <strong>{accessCheck.ok ? 'YouTube access looks OK' : 'YouTube access needs attention'}</strong>
+                  {accessCheck.elapsed_seconds ? <span>{accessCheck.elapsed_seconds}s</span> : null}
+                </div>
+                <div className="download-card__meta">
+                  {accessCheck.title ? <span>{accessCheck.title}</span> : null}
+                  {accessCheck.formats?.count !== undefined ? <span>{accessCheck.formats.count} formats</span> : null}
+                  {accessCheck.cookies?.exists ? <span>cookies loaded</span> : <span>cookies missing</span>}
+                  {accessCheck.cookies?.has_auth_cookies ? <span>auth cookies found</span> : null}
+                  {accessCheck.runtime?.yt_dlp_version ? <span>yt-dlp {accessCheck.runtime.yt_dlp_version}</span> : null}
+                </div>
+                {accessCheck.error ? <p className="download-card__error">{accessCheck.error}</p> : null}
+                {accessCheck.suggestions?.length ? (
+                  <ul className="diagnostic-card__tips">
+                    {accessCheck.suggestions.map((tip, index) => <li key={`${tip}-${index}`}>{tip}</li>)}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
 
             {metadata ? (
               <div className="download-card" style={{ alignItems: 'stretch' }}>
@@ -955,6 +1003,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <button className="ghost-button" type="button" onClick={handleFetchMetadata} disabled={metadataLoading || !url.trim()}>
                 {metadataLoading ? <Loader2 className="spinner" size={16} /> : <Search size={16} />}
                 {metadataLoading ? 'Previewing…' : 'Preview Link'}
+              </button>
+              <button className="ghost-button" type="button" onClick={handleCheckYouTubeAccess} disabled={accessChecking || !url.trim()}>
+                {accessChecking ? <Loader2 className="spinner" size={16} /> : <ShieldCheck size={16} />}
+                {accessChecking ? 'Checking…' : 'Check Member Access'}
               </button>
               <button className="primary-button" type="submit" disabled={submitting || !url.trim()}>
                 {submitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
@@ -1080,6 +1132,8 @@ function WhisperTranscriptionPage({ onNotify }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [isStarting, setIsStarting] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [selectedAudioFile, setSelectedAudioFile] = useState(null);
   const [copyStatus, setCopyStatus] = useState('Copy Transcript');
   const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
   const transcriptText = transcriptSegmentsToText(result?.segments || []);
@@ -1170,6 +1224,37 @@ function WhisperTranscriptionPage({ onNotify }) {
     }
   };
 
+  const handleUploadSubmit = async (event) => {
+    event.preventDefault();
+    if (!selectedAudioFile || isUploading || isActive) return;
+
+    setIsUploading(true);
+    setError('');
+    setResult(null);
+    setCopyStatus('Copy Transcript');
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedAudioFile);
+      formData.append('force', String(force));
+      const response = await api.post('/whisper-upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const data = response.data || {};
+      if (data.already_done && data.result) {
+        setResult(data.result);
+        setJob(null);
+        notify('Loaded cached upload transcript', 'success');
+      } else {
+        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
+        notify('Uploaded audio transcription started', 'success');
+      }
+    } catch (uploadError) {
+      setError(safeFetchError(uploadError, 'Unable to upload audio for Whisper transcription.'));
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
   const handleCopy = async () => {
     if (!transcriptText) return;
     try {
@@ -1233,6 +1318,40 @@ function WhisperTranscriptionPage({ onNotify }) {
             <button className="ghost-button" type="button" onClick={handleCopy} disabled={!transcriptText}>
               <Clipboard size={16} />
               {copyStatus}
+            </button>
+          </div>
+        </form>
+
+        <div className="whisper-upload-divider"><span>or</span></div>
+
+        <form onSubmit={handleUploadSubmit} className="download-form whisper-upload-form">
+          <div className="field field--full">
+            <label className="field__label" htmlFor="whisper-audio-upload">UPLOAD AUDIO FROM PC</label>
+            <input
+              id="whisper-audio-upload"
+              className="input"
+              type="file"
+              accept="audio/*,video/mp4,video/webm,video/x-matroska,video/quicktime"
+              onChange={(event) => {
+                setSelectedAudioFile(event.target.files?.[0] || null);
+                setError('');
+              }}
+              disabled={isUploading || isActive}
+            />
+            <p className="field__help field__help--inline">
+              Supports MP3, WAV, M4A, AAC, OGG/OPUS, FLAC, WEBM, MP4/MOV/MKV audio/video containers.
+              {selectedAudioFile ? ` Selected: ${selectedAudioFile.name} (${formatBytes(selectedAudioFile.size)})` : ''}
+            </p>
+          </div>
+
+          <div className="transcript-actions">
+            <button className="primary-button" type="submit" disabled={isUploading || isActive || !selectedAudioFile}>
+              {isUploading || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
+              {isUploading ? 'Uploading...' : isActive ? 'Transcribing...' : 'Upload & Transcribe'}
+            </button>
+            <button className="ghost-button" type="button" onClick={() => setSelectedAudioFile(null)} disabled={!selectedAudioFile || isUploading || isActive}>
+              <X size={16} />
+              Clear File
             </button>
           </div>
         </form>
