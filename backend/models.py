@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 ALLOWED_FORMATS = {"mp4", "webm", "mkv", "mp3", "m4a"}
+ALLOWED_SOCIAL_FORMATS = ALLOWED_FORMATS | {"best"}
 ALLOWED_QUALITIES = {"best", "2160", "1440", "1080", "720", "480", "360", "240", "144"}
 class DownloadRequest(BaseModel):
     url: HttpUrl
@@ -42,13 +43,13 @@ class WhisperLibraryRequest(BaseModel):
 class SocialDownloadRequest(BaseModel):
     url: HttpUrl
     quality: str = Field(default="best")
-    format: str = Field(default="mp4")
+    format: str = Field(default="best")
 
     @field_validator("format")
     @classmethod
     def validate_format(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in ALLOWED_FORMATS:
+        if normalized not in ALLOWED_SOCIAL_FORMATS:
             raise ValueError("Unsupported format")
         return normalized
 

@@ -22,6 +22,7 @@ from services.yt_dlp_options import (
 )
 from services.youtube_access import check_youtube_access
 from services.url_guard import validate_public_url
+from services import instagram_images
 from services.downloader import (
     clear_downloads,
     delete_download,
@@ -206,6 +207,30 @@ async def social_cookies_delete():
     return {"message": "Instagram cookies removed"}
 
 
+@router.post("/instagram-photos")
+async def instagram_photos_download(request: MetadataRequest):
+    """Download every photo in an Instagram post / carousel into the Library.
+
+    Instagram posts are images; yt-dlp exposes them as thumbnails (not video
+    formats), so the normal video download path can't get them. This endpoint
+    grabs the best-resolution image for each carousel item directly.
+    """
+    try:
+        safe_url = await validate_public_url(str(request.url))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        saved = await asyncio.to_thread(instagram_images.download_instagram_photos, safe_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to download photos: {exc}")
+
+    if not saved:
+        raise HTTPException(status_code=404, detail="No photos found in this post")
+
+    return {"saved": saved, "count": len(saved)}
+
+
 @router.get("/whisper-transcriptions/{job_id}")
 async def whisper_transcription_status(job_id: str):
     job = get_url_transcription_job(job_id)
@@ -230,7 +255,7 @@ async def social_download_video(request: SocialDownloadRequest):
         safe_url = await validate_public_url(str(request.url))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    task_id = await initiate_download(safe_url, request.quality, request.format)
+    task_id = await initiate_download(safe_url, request.quality, "best")
     return {"message": "Social download started", "task_id": task_id}
 
 

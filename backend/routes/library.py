@@ -41,6 +41,7 @@ _files_cache = {"ts": 0.0, "data": []}
 MEDIA_EXTENSIONS = {
     "mp4", "webm", "mkv", "mov", "avi",
     "mp3", "m4a", "aac", "ogg", "flac", "wav",
+    "jpg", "jpeg", "png", "webp",
 }
 
 

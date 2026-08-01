@@ -5,7 +5,7 @@ import time
 import uuid
 import base64
 import urllib.request
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from threading import Event, RLock, Thread
 from typing import Dict, List
@@ -97,6 +97,29 @@ def _extract_custom_url(url: str) -> str | None:
     return None
 
 
+def _is_instagram_reel_url(url: str) -> bool:
+    path = (urlparse(str(url or "")).path or "").lower()
+    return "/reel/" in path or "/reels/" in path
+
+
+def _is_instagram_post_url(url: str) -> bool:
+    if not is_instagram_url(url):
+        return False
+    return not _is_instagram_reel_url(url)
+
+
+def _download_root_for_url(url: str) -> Path:
+    if _is_instagram_post_url(url):
+        return (DOWNLOAD_DIR / "_instagram_temp").resolve()
+    return DOWNLOAD_DIR
+
+
+def _normalize_download_profile(url: str, quality: str, format_ext: str) -> tuple[str, str]:
+    if is_instagram_url(url) and format_ext != "mp3":
+        return "best", "best"
+    return _normalize_quality(quality), str(format_ext).strip().lower()
+
+
 def _categorize_error(message: str) -> str:
     text = (message or "").lower()
     timeout_markers = ["startup timeout", "timed out before media transfer", "pre-download timed out"]
@@ -112,7 +135,7 @@ def _categorize_error(message: str) -> str:
     ]
     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
     geo_markers = ["not available in your country", "geo", "region"]
-    unsupported_markers = ["unsupported url", "no suitable extractor"]
+    unsupported_markers = ["unsupported url", "no suitable extractor", "no video formats found", "no video formats"]
     removed_markers = ["video unavailable", "removed", "deleted", "does not exist"]
     if any(marker in text for marker in timeout_markers):
         return "timeout"
@@ -438,7 +461,11 @@ def _start_download_watchdog(task_id: str, url: str) -> tuple[Event, Thread]:
 
 
 def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
-    quality = _normalize_quality(quality)
+    quality, format_ext = _normalize_download_profile(url, quality, format_ext)
+    is_instagram = is_instagram_url(url)
+    is_instagram_post = _is_instagram_post_url(url)
+    download_root = _download_root_for_url(url)
+    download_root.mkdir(parents=True, exist_ok=True)
     # Ensure we don't crash if the task wasn't pre-seeded; preserve queue metadata.
     existing_task = download_tasks.get(task_id, {})
     created_at = existing_task.get("created_at", time.time())
@@ -560,6 +587,8 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
     if format_ext == "mp3":
         format_string = "bestaudio/best"
+    elif is_instagram:
+        format_string = "bestvideo*+bestaudio/best"
     elif quality in ("best", ""):
         format_string = "bestvideo*[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
     else:
@@ -570,16 +599,16 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
     ydl_opts = {
         "format": format_string,
-        "outtmpl": (DOWNLOAD_DIR / "%(title)s (%(id)s).%(ext)s").as_posix(),
+        "outtmpl": (download_root / "%(title)s (%(id)s).%(ext)s").as_posix(),
         "progress_hooks": [hook],
         "quiet": True,
         "logger": _YtDlpTaskLogger(task_id),
-        "noplaylist": True,
+        "noplaylist": not is_instagram_post,
         "continuedl": True,
         "concurrent_fragment_downloads": 4,
         "windowsfilenames": True,
         "age_limit": None,
-        "ignoreerrors": False,
+        "ignoreerrors": is_instagram_post,
         "http_headers": {
             **PUBLIC_HTTP_HEADERS,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -667,8 +696,28 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
                     clean_error = _clean(str(insta_error))
                     print(f"[download] Instagram retry with {browser} failed: {clean_error}", flush=True)
 
-        # Some public sites are not recognized by platform extractors.
-        # Retry with yt-dlp generic extractor before failing.
+        # Some public sites are not recognized by platform extractors, or
+        # platform extractors may report "No video formats found" for
+        # certain Instagram/carousel posts. Retry with yt-dlp generic
+        # extractor before failing in those cases.
+        if "no video formats" in clean_error.lower() or "no video formats found" in clean_error.lower():
+            try:
+                generic_opts = dict(ydl_opts)
+                generic_opts["force_generic_extractor"] = True
+                add_generic_impersonation(generic_opts)
+                print(f"[download] retrying with generic extractor (no-video-formats fallback) - {url}", flush=True)
+                _set_task_message(task_id, "Retrying with generic extractor (no-video-formats fallback)...")
+                with yt_dlp.YoutubeDL(generic_opts) as ydl_generic:
+                    info = ydl_generic.extract_info(url, download=True)
+                    download_tasks[task_id]["title"] = info.get("title", "Unknown")
+                    download_tasks[task_id]["video_id"] = info.get("id")
+                    if download_tasks[task_id].get("status") == "cancelled":
+                        return
+                    _mark_completed(task_id, ydl_generic, info, format_ext)
+                    return
+            except Exception as generic_error:
+                clean_error = _clean(str(generic_error))
+
         if "Unsupported URL" in clean_error:
             custom_extracted = _extract_custom_url(url)
             if custom_extracted:

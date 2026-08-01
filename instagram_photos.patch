@@ -1,0 +1,562 @@
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index dfce86e..81f09c8 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,7 +1,7 @@
+ fastapi==0.136.1
+ uvicorn==0.46.0
+ yt-dlp
+-curl_cffi>=0.10,<0.15
++curl_cffi>=0.15
+ python-multipart
+ websockets
+ aiosqlite
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index 20972f4..feb3504 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -22,6 +22,7 @@ from services.yt_dlp_options import (
+ )
+ from services.youtube_access import check_youtube_access
+ from services.url_guard import validate_public_url
++from services import instagram_images
+ from services.downloader import (
+     clear_downloads,
+     delete_download,
+@@ -206,6 +207,30 @@ async def social_cookies_delete():
+     return {"message": "Instagram cookies removed"}
+ 
+ 
++@router.post("/instagram-photos")
++async def instagram_photos_download(request: MetadataRequest):
++    """Download every photo in an Instagram post / carousel into the Library.
++
++    Instagram posts are images; yt-dlp exposes them as thumbnails (not video
++    formats), so the normal video download path can't get them. This endpoint
++    grabs the best-resolution image for each carousel item directly.
++    """
++    try:
++        safe_url = await validate_public_url(str(request.url))
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++
++    try:
++        saved = await asyncio.to_thread(instagram_images.download_instagram_photos, safe_url)
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail=f"Unable to download photos: {exc}")
++
++    if not saved:
++        raise HTTPException(status_code=404, detail="No photos found in this post")
++
++    return {"saved": saved, "count": len(saved)}
++
++
+ @router.get("/whisper-transcriptions/{job_id}")
+ async def whisper_transcription_status(job_id: str):
+     job = get_url_transcription_job(job_id)
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index e8ea96a..0c8766d 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -41,6 +41,7 @@ _files_cache = {"ts": 0.0, "data": []}
+ MEDIA_EXTENSIONS = {
+     "mp4", "webm", "mkv", "mov", "avi",
+     "mp3", "m4a", "aac", "ogg", "flac", "wav",
++    "jpg", "jpeg", "png", "webp",
+ }
+ 
+ 
+diff --git a/backend/services/instagram_images.py b/backend/services/instagram_images.py
+new file mode 100644
+index 0000000..46d8849
+--- /dev/null
++++ b/backend/services/instagram_images.py
+@@ -0,0 +1,172 @@
++"""Instagram photo/post image download.
++
++For Instagram posts (single photos and photo carousels), yt-dlp's current
++extractor exposes the images only as *thumbnails*, not as *formats*, so the
++normal video pipeline reports "No video formats found". This module:
++
++1. extracts the post with yt-dlp (ignore_no_formats_error),
++2. picks the largest-resolution image URL for every carousel item,
++3. downloads each image directly (curl_cffi + browser impersonation)
++   into DOWNLOAD_DIR so they appear in the Library.
++"""
++import re
++import time
++import uuid
++from pathlib import Path
++from threading import RLock
++
++from curl_cffi import requests as cffi_requests
++
++from services.files import DOWNLOAD_DIR
++
++_PHOTO_JOBS: dict[str, dict] = {}
++_PHOTO_JOBS_LOCK = RLock()
++
++_HEADERS = {
++    "User-Agent": (
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++    ),
++    "Referer": "https://www.instagram.com/",
++    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
++}
++
++_PIXEL_RE = re.compile(r"_(?:s|p)(\d+)x(\d+)")
++
++IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
++
++
++def _best_photo_url(thumbnails) -> str | None:
++    """Pick the largest-resolution image URL from a thumbnail list."""
++    best_url = None
++    best_size = 0
++    for thumb in thumbnails or []:
++        url = (thumb or {}).get("url") or ""
++        if not url:
++            continue
++        match = _PIXEL_RE.search(url)
++        size = int(match.group(1)) * int(match.group(2)) if match else 0
++        if size > best_size:
++            best_size = size
++            best_url = url
++    return best_url
++
++
++def _clean_title(value: str, fallback: str = "Instagram post") -> str:
++    cleaned = re.sub(r"[^\w\-. ]+", " ", str(value or ""))
++    cleaned = re.sub(r"\s+", " ", cleaned).strip()
++    return cleaned[:120] or fallback
++
++
++def _unique_path(base_title: str, entry_id: str) -> Path:
++    candidate = DOWNLOAD_DIR / f"{base_title} ({entry_id}).jpg"
++    index = 1
++    while candidate.exists():
++        candidate = DOWNLOAD_DIR / f"{base_title} ({entry_id}) ({index}).jpg"
++        index += 1
++    return candidate
++
++
++def extract_instagram_entries(url: str, max_items: int = 30) -> tuple[dict, list]:
++    """Run yt-dlp on the URL and return (info, entries)."""
++    import yt_dlp
++
++    opts = {
++        "quiet": True,
++        "no_warnings": True,
++        "skip_download": True,
++        "ignore_no_formats_error": True,
++        "playlist_items": f"1:{max_items}",
++    }
++    with yt_dlp.YoutubeDL(opts) as ydl:
++        info = ydl.extract_info(url, download=False)
++    entries = info.get("entries") or [info]
++    return info, entries
++
++
++def download_instagram_photos(url: str, max_items: int = 30) -> list[str]:
++    """Download every image in an Instagram post/carousel into DOWNLOAD_DIR.
++
++    Returns the list of saved filenames (empty if nothing was found).
++    """
++    info, entries = extract_instagram_entries(url, max_items=max_items)
++    base_title = _clean_title(info.get("title")) or "Instagram post"
++    saved: list[str] = []
++    for entry in entries:
++        if not entry:
++            continue
++        photo_url = _best_photo_url(entry.get("thumbnails"))
++        if not photo_url:
++            continue
++        entry_id = str(entry.get("id") or uuid.uuid4().hex[:11])
++        path = _unique_path(base_title, entry_id)
++        try:
++            response = cffi_requests.get(
++                photo_url, headers=_HEADERS, impersonate="chrome", timeout=30
++            )
++            if response.status_code == 200 and len(response.content) > 1000:
++                path.write_bytes(response.content)
++                saved.append(path.name)
++        except Exception:
++            continue
++    return saved
++
++
++def get_photo_job(job_id: str) -> dict | None:
++    with _PHOTO_JOBS_LOCK:
++        job = _PHOTO_JOBS.get(job_id)
++        return dict(job) if job else None
++
++
++def start_photo_download(url: str) -> str:
++    """Queue an Instagram photo download in the background (mirrors the
++    Whisper/audio job pattern)."""
++    job_id = str(uuid.uuid4())
++    now = time.time()
++    job = {
++        "job_id": job_id,
++        "url": url,
++        "status": "queued",
++        "progress": 0,
++        "message": "Photo download queued",
++        "saved": [],
++        "created_at": now,
++        "completed_at": None,
++        "error": None,
++    }
++    with _PHOTO_JOBS_LOCK:
++        _PHOTO_JOBS[job_id] = job
++
++    import threading
++
++    def _runner() -> None:
++        job = _PHOTO_JOBS[job_id]
++        job["status"] = "downloading"
++        job["message"] = "Downloading photos..."
++        try:
++            saved = download_instagram_photos(url)
++            if saved:
++                job.update({
++                    "status": "completed",
++                    "progress": 100,
++                    "message": f"Saved {len(saved)} photo(s)",
++                    "saved": saved,
++                    "completed_at": time.time(),
++                })
++            else:
++                job.update({
++                    "status": "error",
++                    "progress": 100,
++                    "message": "No photos found in this post",
++                    "error": "No photos found in this post",
++                })
++        except Exception as exc:
++            job.update({
++                "status": "error",
++                "progress": 100,
++                "message": str(exc),
++                "error": str(exc),
++            })
++
++    threading.Thread(target=_runner, daemon=True).start()
++    return job_id
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 322af35..86afbe1 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3489,3 +3489,17 @@ body[data-theme='dark'] .main-stage {
+ 	font-size: 16px;
+ 	word-break: break-word;
+ }
++
++/* ===== Instagram photo previews ===== */
++.preview-image {
++	width: 100%;
++	max-height: 520px;
++	object-fit: contain;
++	border-radius: 22px;
++	background: rgba(0, 0, 0, 0.04);
++}
++
++.instagram-photos-row {
++	flex-wrap: wrap;
++	align-items: center;
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index ae671fd..9f31499 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -7,6 +7,7 @@ import {
+   CheckSquare,
+   ChevronRight,
+   FolderOpen,
++  Image as ImageIcon,
+   Clipboard,
+   Download,
+   FileText,
+@@ -281,9 +282,13 @@ function isVideoExt(ext) {
+   return ['mp4', 'webm', 'mkv', 'mov', 'avi'].includes(ext);
+ }
+ 
++function isImageExt(ext) {
++  return ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext);
++}
++
+ function isMediaFile(filename = '') {
+   const ext = mediaExt(filename);
+-  return isAudioExt(ext) || isVideoExt(ext);
++  return isAudioExt(ext) || isVideoExt(ext) || isImageExt(ext);
+ }
+ 
+ // Module-level mobile detection so components defined above `App` can use it
+@@ -320,6 +325,19 @@ function escapeHtml(s) {
+ function MediaThumb({ videoId, title, filename }) {
+   const [failed, setFailed] = useState(false);
+ 
++  // image files (e.g. Instagram post photos) show the actual image
++  if (filename && isImageExt(mediaExt(filename))) {
++    return (
++      <img
++        className="media-thumb"
++        src={`${API_BASE}/stream/${encodeURIComponent(filename)}`}
++        alt={title}
++        loading="lazy"
++        onError={() => setFailed(true)}
++      />
++    );
++  }
++
+   // if we have a YouTube id, try the thumbnail first
+   if (videoId && !failed) {
+     return (
+@@ -680,7 +698,7 @@ function AboutPage() {
+   );
+ }
+ 
+-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
++function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged }) {
+   const notify = useCallback((message, type = 'info') => {
+     if (onNotify) onNotify(message, type);
+   }, [onNotify]);
+@@ -701,6 +719,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
+   const [socialCookiesError, setSocialCookiesError] = useState('');
+   const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
++  const [photosDownloading, setPhotosDownloading] = useState(false);
++  const [photosResult, setPhotosResult] = useState(null);
+   const [transcriptUrl, setTranscriptUrl] = useState('');
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const [transcriptResult, setTranscriptResult] = useState(null);
+@@ -806,6 +826,27 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     }
+   };
+ 
++  const handleInstagramPhotos = async () => {
++    const trimmed = socialUrl.trim();
++    if (!trimmed || photosDownloading) return;
++    setPhotosDownloading(true);
++    setPhotosResult(null);
++    try {
++      const response = await api.post('/instagram-photos', { url: trimmed });
++      const data = response.data || {};
++      const count = data.count || (Array.isArray(data.saved) ? data.saved.length : 0);
++      setPhotosResult(data);
++      notify(`Saved ${count} photo${count === 1 ? '' : 's'} to your Library`, 'success', 3000);
++      if (onLibraryChanged) onLibraryChanged();
++    } catch (photosError) {
++      const msg = safeFetchError(photosError, 'Unable to download photos from this post.');
++      setPhotosResult({ error: msg });
++      notify(msg, 'error', 3500);
++    } finally {
++      setPhotosDownloading(false);
++    }
++  };
++
+   const loadSocialCookies = useCallback(async () => {
+     setSocialCookiesLoading(true);
+     setSocialCookiesError('');
+@@ -1154,6 +1195,26 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
+               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
+             </button>
++
++            <div className="transcript-actions instagram-photos-row">
++              <button
++                className="ghost-button"
++                type="button"
++                onClick={handleInstagramPhotos}
++                disabled={photosDownloading || !socialUrl.trim()}
++              >
++                {photosDownloading ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
++                {photosDownloading ? 'Downloading photos…' : 'Download post photos'}
++              </button>
++              {photosResult?.saved?.length ? (
++                <span className="field__help" style={{ margin: 0 }}>
++                  Saved {photosResult.saved.length} photo{photosResult.saved.length === 1 ? '' : 's'} to Library
++                </span>
++              ) : null}
++              {photosResult?.error ? (
++                <span className="field__help field__help--warn" style={{ margin: 0 }}>{photosResult.error}</span>
++              ) : null}
++            </div>
+           </form>
+ 
+           <div className="whisper-upload-divider"><span>Instagram note</span></div>
+@@ -2029,7 +2090,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+       {previewFile ? (
+         <section className="panel panel--preview">
+           <div className="preview-media">
+-            {isVideoExt(previewExt) ? (
++            {isImageExt(previewExt) ? (
++              <img
++                className="preview-image"
++                src={previewUrl}
++                alt={previewTitle}
++                loading="lazy"
++              />
++            ) : isVideoExt(previewExt) ? (
+               <video
+                 ref={videoRef}
+                 className="preview-player"
+@@ -2539,12 +2607,6 @@ export default function App() {
+     setPlaylistPickerRequest({ items });
+   }, [isUnlocked, files]);
+ 
+-  // Add one or more files to a playlist (opens picker)
+-  const addToPlaylist = useCallback((filenameOrList) => {
+-    if (!isUnlocked) return;
+-    openPlaylistPicker(filenameOrList);
+-  }, [isUnlocked, openPlaylistPicker]);
+-
+   const navigate = useNavigate();
+ 
+   const openDownloadFromHistory = useCallback(({ url, quality = 'best', format = 'mp4' }) => {
+@@ -2611,7 +2673,7 @@ export default function App() {
+         <Routes>
+           <Route path="/" element={<Navigate to="/about" replace />} />
+           <Route path="/about" element={<AboutPage />} />
+-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
++          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+diff --git a/testing/test_instagram_photos.py b/testing/test_instagram_photos.py
+new file mode 100644
+index 0000000..ef69bf0
+--- /dev/null
++++ b/testing/test_instagram_photos.py
+@@ -0,0 +1,67 @@
++"""End-to-end test: download photos from a real Instagram post.
++
++Run from the repo root:
++    python testing/test_instagram_photos.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_insta_"))
++POST_URL = "https://www.instagram.com/p/DbdjcLvjej6/"
++
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    from routes import download as download_routes
++
++    app = FastAPI()
++    app.include_router(download_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # 1. Invalid URL -> 400
++    resp = client.post("/api/instagram-photos", json={"url": "not-a-url"})
++    assert resp.status_code == 422, resp.text
++    print("[PASS] invalid URL -> 422")
++
++    # 2. Real post -> downloads photos
++    resp = client.post("/api/instagram-photos", json={"url": POST_URL})
++    print("  status:", resp.status_code, "| body:", resp.text[:300])
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    assert data["count"] >= 1, data
++    assert len(data["saved"]) == data["count"], data
++    for name in data["saved"]:
++        assert (tmp_dir / name).exists(), name
++        assert (tmp_dir / name).stat().st_size > 1000, name
++    print(f"[PASS] downloaded {data['count']} photo(s): {data['saved']}")
++
++    # 3. Saved files are real JPEGs
++    sample = tmp_dir / data["saved"][0]
++    head = sample.read_bytes()[:3]
++    assert head == b"\xff\xd8\xff", head  # JPEG magic
++    print("[PASS] files are valid JPEG images")
++
++    # 4. Files appear in library listing (image ext supported)
++    from routes import library as library_routes
++
++    app2 = FastAPI()
++    app2.include_router(library_routes.router, prefix="/api")
++    client2 = TestClient(app2)
++    names = [f["filename"] for f in client2.get("/api/files").json()["files"]]
++    for name in data["saved"]:
++        assert name in names, name
++    print("[PASS] photos listed in /api/files (Library)")
++
++    print("\nALL INSTAGRAM PHOTOS TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
+diff --git a/update_ytdlp.bat b/update_ytdlp.bat
+new file mode 100644
+index 0000000..89524d2
+--- /dev/null
++++ b/update_ytdlp.bat
+@@ -0,0 +1,57 @@
++@echo off
++REM ============================================================
++REM  One-click: update yt-dlp to the NIGHTLY build + curl_cffi
++REM
++REM  WHY: Instagram's "empty media response" is a known, ongoing
++REM  yt-dlp bug (even for public posts). The community fix
++REM  (pinned by yt-dlp maintainers) is the NIGHTLY build, plus
++REM  curl_cffi for impersonation.
++REM
++REM  Run this, then restart the backend (start.bat).
++REM ============================================================
++setlocal EnableExtensions
++set "ROOT=%~dp0"
++
++REM --- find the venv python ---
++set "PYTHON="
++if exist "%ROOT%.venv\Scripts\python.exe" set "PYTHON=%ROOT%.venv\Scripts\python.exe"
++if not defined PYTHON if exist "%ROOT%backend\venv\Scripts\python.exe" set "PYTHON=%ROOT%backend\venv\Scripts\python.exe"
++if not defined PYTHON (
++    echo ERROR: No virtualenv found. Run start.bat once first, then try again.
++    pause
++    exit /b 1
++)
++echo Using Python: %PYTHON%
++echo.
++
++echo [1/2] Updating curl_cffi (needed for Instagram impersonation) ...
++"%PYTHON%" -m pip install -U "curl_cffi>=0.15"
++if errorlevel 1 (
++    echo WARNING: curl_cffi update failed - continuing anyway.
++)
++
++echo.
++echo [2/2] Updating yt-dlp to the NIGHTLY build ...
++"%PYTHON%" -m pip install -U "https://github.com/yt-dlp/yt-dlp/archive/refs/heads/master.tar.gz"
++if errorlevel 1 (
++    echo.
++    echo ERROR: yt-dlp nightly update failed. Check your internet connection.
++    pause
++    exit /b 1
++)
++
++echo.
++echo --- Versions now installed ---
++"%PYTHON%" -m pip show yt-dlp curl_cffi 2>nul | findstr /i "Name Version"
++
++echo.
++echo ============================================
++echo  Done! Now:
++echo   1. Close all YT Suite windows.
++echo   2. Run start.bat.
++echo   3. In the app, make sure Instagram cookies
++echo      are set (see the "Instagram login
++echo      cookies" card on the Download page).
++echo ============================================
++echo.
++pause

@@ -7,6 +7,7 @@ import {
   CheckSquare,
   ChevronRight,
   FolderOpen,
+  Image as ImageIcon,
   Clipboard,
   Download,
   FileText,
@@ -281,9 +282,13 @@ function isVideoExt(ext) {
   return ['mp4', 'webm', 'mkv', 'mov', 'avi'].includes(ext);
 }
 
+function isImageExt(ext) {
+  return ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext);
+}
+
 function isMediaFile(filename = '') {
   const ext = mediaExt(filename);
-  return isAudioExt(ext) || isVideoExt(ext);
+  return isAudioExt(ext) || isVideoExt(ext) || isImageExt(ext);
 }
 
 // Module-level mobile detection so components defined above `App` can use it
@@ -319,6 +324,19 @@ function escapeHtml(s) {
 
 function MediaThumb({ videoId, title, filename }) {
   const [failed, setFailed] = useState(false);
+
+  // image files (e.g. Instagram post photos) show the actual image
+  if (filename && isImageExt(mediaExt(filename))) {
+    return (
+      <img
+        className="media-thumb"
+        src={`${API_BASE}/stream/${encodeURIComponent(filename)}`}
+        alt={title}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
 
   // if we have a YouTube id, try the thumbnail first
   if (videoId && !failed) {
@@ -379,6 +397,9 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
   const active = ACTIVE_STATUSES.has(item.status);
   const ext = mediaExt(item.filename || '');
   const format = String(item.format || '').toLowerCase();
+  const normalizedFilename = String(item.filename || '').replace(/\\/g, '/');
+  const isTemporaryDownload = normalizedFilename.includes('/_instagram_temp/');
+  const storageLocationLabel = isTemporaryDownload ? 'backend/downloads/_instagram_temp' : 'Library';
   const showExt = ext && ext !== format;
   const showProgress = active;
   const downloadUrl = item.filename ? `${API_BASE}/files/download/${encodeURIComponent(item.filename)}` : '';
@@ -396,6 +417,7 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
         <div className="download-card__meta">
           <span>{item.quality ? qualityLabel(item.quality) : 'Best available'}</span>
           <span>{item.format ? item.format.toUpperCase() : 'MP4'}</span>
+          <span>{isTemporaryDownload ? `Temporary: ${storageLocationLabel}` : storageLocationLabel}</span>
           {showExt ? <span>{ext.toUpperCase()}</span> : null}
           {item.queue_position ? <span>Queue #{item.queue_position}</span> : null}
           {item.retry_count ? <span>Retry {item.retry_count}/{item.max_auto_retries ?? item.retry_count}</span> : null}
@@ -694,7 +716,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [accessChecking, setAccessChecking] = useState(false);
   const [socialUrl, setSocialUrl] = useState('');
   const [socialQuality, setSocialQuality] = useState('best');
-  const [socialFormat, setSocialFormat] = useState('mp4');
   const [submitting, setSubmitting] = useState(false);
   const [socialSubmitting, setSocialSubmitting] = useState(false);
   const [socialCookies, setSocialCookies] = useState(null);
@@ -708,6 +729,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [transcriptCopyStatus, setTranscriptCopyStatus] = useState('Copy Transcript');
   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
+  const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
   const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
   const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
@@ -799,7 +821,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
 
     setSocialSubmitting(true);
     try {
-      await onStartSocialDownload({ url: trimmed, quality: socialQuality, format: socialFormat });
+      await onStartSocialDownload({ url: trimmed, quality: socialQuality, format: 'best' });
       setSocialUrl('');
     } finally {
       setSocialSubmitting(false);
@@ -1140,15 +1162,11 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
                   ))}
                 </select>
               </div>
-              <div className="field">
-                <label className="field__label" htmlFor="social-format">FORMAT</label>
-                <select id="social-format" className="select" value={socialFormat} onChange={(event) => setSocialFormat(event.target.value)}>
-                  {FORMAT_OPTIONS.map((option) => (
-                    <option key={option} value={option}>{option.toUpperCase()}</option>
-                  ))}
-                </select>
-              </div>
             </div>
+
+            <p className="field__help field__help--inline">
+              Instagram downloads use best available automatically.
+            </p>
 
             <button className="primary-button" type="submit" disabled={socialSubmitting || !socialUrl.trim()}>
               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
@@ -1242,7 +1260,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               Live progress, ETA, and cancel controls.
               {isMobileDevice
                 ? ' On phones, downloads are manual to avoid browser save issues.'
-                : ' Video saved to your PC Library.'}
+                : hasTemporaryInstagramDownloads
+                  ? ' Instagram posts can be saved temporarily outside the Library.'
+                  : ' Video saved to your PC Library.'}
             </p>
           </div>
           <span className="panel__badge">{activeDownloads.length}</span>
@@ -2347,7 +2367,12 @@ export default function App() {
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
         const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
         if (isRecentlyCompleted) {
-          pushToast('Video saved to your Library', 'success', 3000);
+          const isTemporaryInstagramDownload = String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/');
+          pushToast(
+            isTemporaryInstagramDownload ? 'Instagram post saved temporarily' : 'Video saved to your Library',
+            'success',
+            3000,
+          );
         }
       }
 
