@@ -1291,6 +1291,16 @@ def get_manual_transcription_job(job_id: str) -> dict | None:
     return MANUAL_TRANSCRIPT_JOBS.get(job_id)
 
 
+async def start_library_whisper_transcription(path: Path, filename: str, force: bool = False) -> dict:
+    """Start Whisper on a file already saved in the library/playlist.
+
+    The cache key is derived from the filename (stable across restarts), so a
+    file transcribed once can be reused unless ``force`` is set.
+    """
+    key = f"library_{_safe_url_key(filename)}"
+    return await start_uploaded_whisper_transcription(path, filename, key, force)
+
+
 async def start_url_whisper_transcription(url: str, force: bool = False) -> dict:
     url = str(url or "").strip()
     if not url:

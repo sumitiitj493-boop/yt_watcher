@@ -1,0 +1,4402 @@
+diff --git a/backend/models.py b/backend/models.py
+index a422254..6ef0460 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -33,6 +33,12 @@ class TranscriptUrlRequest(BaseModel):
+     force: bool = Field(default=False)
+ 
+ 
++class WhisperLibraryRequest(BaseModel):
++    """Transcribe a file that is already saved in the library (e.g. from a playlist)."""
++    filename: str = Field(min_length=1, max_length=500)
++    force: bool = Field(default=False)
++
++
+ class SocialDownloadRequest(BaseModel):
+     url: HttpUrl
+     quality: str = Field(default="best")
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index e3c611c..20972f4 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -3,15 +3,23 @@ import asyncio
+ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket
+ from starlette.websockets import WebSocketDisconnect
+ 
+-from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
++from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest, WhisperLibraryRequest
+ from services.metadata import fetch_metadata
+ from services.transcripts import (
++    UPLOAD_AUDIO_EXTENSIONS,
+     fetch_url_transcript,
+     get_url_transcription_job,
+     save_uploaded_audio_file,
++    start_library_whisper_transcription,
+     start_uploaded_whisper_transcription,
+     start_url_whisper_transcription,
+ )
++from services.yt_dlp_options import (
++    cookiefile_report,
++    safe_cookie_report_for_response,
++    social_cookies_browsers,
++    social_cookies_file,
++)
+ from services.youtube_access import check_youtube_access
+ from services.url_guard import validate_public_url
+ from services.downloader import (
+@@ -27,7 +35,7 @@ from services.downloader import (
+     TERMINAL_STATUSES,
+ )
+ from pathlib import Path
+-from services.files import DOWNLOAD_DIR
++from services.files import DOWNLOAD_DIR, resolve_download_path
+ 
+ router = APIRouter()
+ 
+@@ -99,6 +107,105 @@ async def whisper_transcription_upload(
+             pass
+ 
+ 
++@router.post("/whisper-library")
++async def whisper_library_transcription(request: WhisperLibraryRequest):
++    """Transcribe a file already saved in the library (e.g. a playlist item).
++
++    No upload is needed — the backend reads the local file directly and runs
++    the same Whisper pipeline used for uploads.
++    """
++    try:
++        safe_path = resolve_download_path(request.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++
++    if safe_path.suffix.lower().lstrip(".") not in UPLOAD_AUDIO_EXTENSIONS:
++        raise HTTPException(
++            status_code=400,
++            detail=f"Unsupported file type .{safe_path.suffix.lower().lstrip('.') or 'unknown'}",
++        )
++
++    size_bytes = safe_path.stat().st_size
++    response = await start_library_whisper_transcription(safe_path, safe_path.name, request.force)
++    response["filename"] = safe_path.name
++    response["size_bytes"] = size_bytes
++    return response
++
++
++# --- Instagram / social cookies -------------------------------------------
++# Instagram blocks downloads without login. Users can upload a Netscape-format
++# cookies.txt exported from their logged-in browser, or rely on
++# SOCIAL_COOKIES_BROWSER (cookiesfrombrowser) configured in the backend env.
++SOCIAL_COOKIES_PROBE_URL = "https://www.instagram.com/"
++
++
++@router.get("/social-cookies")
++async def social_cookies_status():
++    report = safe_cookie_report_for_response(cookiefile_report(SOCIAL_COOKIES_PROBE_URL))
++    report["browsers_configured"] = social_cookies_browsers()
++    return report
++
++
++@router.post("/social-cookies")
++async def social_cookies_upload(file: UploadFile = File(...)):
++    filename = Path(getattr(file, "filename", "") or "").name
++    if filename and not filename.lower().endswith(".txt"):
++        raise HTTPException(status_code=400, detail="Cookie file must be a .txt file (Netscape format).")
++
++    target = social_cookies_file()
++    target.parent.mkdir(parents=True, exist_ok=True)
++    try:
++        raw = await file.read(2_000_000)
++    finally:
++        try:
++            await file.close()
++        except Exception:
++            pass
++
++    if not raw.strip():
++        raise HTTPException(status_code=400, detail="Cookie file is empty.")
++
++    try:
++        text = raw.decode("utf-8")
++    except UnicodeDecodeError:
++        raise HTTPException(status_code=400, detail="Cookie file must be UTF-8 text (Netscape format).")
++
++    first_content = next((line.strip() for line in text.splitlines() if line.strip()), "")
++    if first_content.startswith("{") or first_content.startswith("["):
++        raise HTTPException(
++            status_code=400,
++            detail="This looks like a JSON cookie file. yt-dlp needs Netscape/Mozilla cookies.txt format. "
++            "Export cookies as Netscape format (e.g. with the 'Get cookies.txt LOCALLY' extension).",
++        )
++
++    # Only keep Netscape rows; require at least one real cookie row.
++    rows = [line for line in text.splitlines() if line.strip() and (line.lstrip().startswith("#") or "\t" in line)]
++    valid_rows = [line for line in rows if "\t" in line and not line.lstrip().startswith("#")]
++    if not valid_rows:
++        raise HTTPException(
++            status_code=400,
++            detail="No Netscape cookie rows found. Export cookies in Netscape/Mozilla cookies.txt format.",
++        )
++
++    target.write_bytes(raw)
++    report = safe_cookie_report_for_response(cookiefile_report(SOCIAL_COOKIES_PROBE_URL))
++    return {"message": "Instagram cookies saved", **report}
++
++
++@router.delete("/social-cookies")
++async def social_cookies_delete():
++    target = social_cookies_file()
++    if target.exists():
++        try:
++            target.unlink()
++        except OSError as exc:
++            raise HTTPException(status_code=500, detail=f"Unable to remove cookie file: {exc}")
++    return {"message": "Instagram cookies removed"}
++
++
+ @router.get("/whisper-transcriptions/{job_id}")
+ async def whisper_transcription_status(job_id: str):
+     job = get_url_transcription_job(job_id)
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index 7151d8f..e8ea96a 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -7,11 +7,17 @@ from pydantic import BaseModel, Field
+ 
+ from services.database import (
+     add_playlist_item,
++    add_playlist_items,
+     create_note,
++    create_playlist,
+     delete_note,
+-    get_playlist,
++    delete_playlist,
++    get_default_playlist_id,
++    get_playlist_items,
+     list_notes,
++    list_playlists,
+     remove_playlist_item,
++    rename_playlist,
+     reorder_playlist,
+     update_note,
+ )
+@@ -19,9 +25,14 @@ from services.database import (
+ import os
+ import gc
+ import stat
++import sys
+ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id, resolve_download_path
+ from services.stream_state import active_streams
+ from services.transcripts import fetch_online_transcript
++from services.audio_extractor import (
++    get_audio_extraction_job,
++    start_audio_extraction,
++)
+ 
+ router = APIRouter()
+ 
+@@ -47,6 +58,24 @@ class NoteUpdateRequest(BaseModel):
+     color: str | None = Field(default=None, max_length=40)
+ 
+ 
++class PlaylistNameRequest(BaseModel):
++    name: str = Field(min_length=1, max_length=120)
++
++
++class PlaylistAddItemRequest(BaseModel):
++    filename: str = Field(min_length=1, max_length=500)
++
++
++class PlaylistAddItemsRequest(BaseModel):
++    filenames: list[str] = Field(default_factory=list, max_length=1000)
++
++
++class AudioExtractRequest(BaseModel):
++    filename: str = Field(min_length=1, max_length=500)
++    format: str = Field(default="mp3", max_length=10)
++    bitrate: str = Field(default="192k", max_length=10)
++
++
+ def _get_cached_files() -> list[dict]:
+     now = time.time()
+     if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
+@@ -115,6 +144,63 @@ async def get_storage():
+     return {"total_bytes": total, "file_count": count}
+ 
+ 
++def _open_downloads_folder() -> None:
++    """Open the downloads folder in the OS file explorer (server-side, so it
++    works because this app is self-hosted on the user's machine)."""
++    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
++    if sys.platform == "win32":
++        os.startfile(str(DOWNLOAD_DIR))  # type: ignore[attr-defined]
++        return
++    import subprocess
++
++    opener = "open" if sys.platform == "darwin" else "xdg-open"
++    subprocess.Popen([opener, str(DOWNLOAD_DIR)])
++
++
++@router.post("/open-downloads-folder")
++async def open_downloads_folder():
++    try:
++        _open_downloads_folder()
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=f"Unable to open downloads folder: {exc}")
++    return {"message": "Opened"}
++
++
++# --- Video -> audio extraction -------------------------------------------
++@router.post("/extract-audio")
++async def extract_audio(payload: AudioExtractRequest):
++    try:
++        safe_path = resolve_download_path(payload.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++
++    if safe_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
++        raise HTTPException(status_code=400, detail="Not a media file")
++
++    try:
++        job_id = start_audio_extraction(safe_path, payload.format, payload.bitrate)
++    except (ValueError, FileNotFoundError) as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++
++    return {
++        "job_id": job_id,
++        "status": "queued",
++        "source": safe_path.name,
++        "output_format": payload.format,
++    }
++
++
++@router.get("/extract-audio/{job_id}")
++async def extract_audio_status(job_id: str):
++    job = get_audio_extraction_job(job_id)
++    if not job:
++        raise HTTPException(status_code=404, detail="Extraction job not found")
++    return job
++
++
+ @router.delete("/delete/{filename}")
+ async def delete_file(filename: str):
+     try:
+@@ -278,38 +364,153 @@ async def remove_note(note_id: int):
+     return {"message": "Deleted"}
+ 
+ 
+-# --- Playlist endpoints -------------------------------------------------
++# --- Playlist endpoints (multiple, named) ---------------------------------
++def _playlist_exists(playlist_id: int) -> bool:
++    return any(item["id"] == playlist_id for item in list_playlists())
++
++
++def _default_playlist_id_or_create() -> int:
++    """Return the default (oldest) playlist, creating one if none remain."""
++    playlist_id = get_default_playlist_id()
++    if playlist_id is None:
++        try:
++            create_playlist("My Playlist")
++            playlist_id = get_default_playlist_id()
++        except ValueError:
++            playlist_id = get_default_playlist_id()
++    if playlist_id is None:
++        raise HTTPException(status_code=404, detail="No playlist available")
++    return playlist_id
++
++
++@router.get('/playlists')
++async def playlists_list():
++    return {"playlists": list_playlists()}
++
++
++@router.post('/playlists')
++async def playlists_create(payload: PlaylistNameRequest):
++    try:
++        playlist = create_playlist(payload.name)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc))
++    return {"playlist": playlist}
++
++
++@router.patch('/playlists/{playlist_id}')
++async def playlists_rename(playlist_id: int, payload: PlaylistNameRequest):
++    try:
++        playlist = rename_playlist(playlist_id, payload.name)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc))
++    if not playlist:
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return {"playlist": playlist}
++
++
++@router.delete('/playlists/{playlist_id}')
++async def playlists_delete(playlist_id: int):
++    if not delete_playlist(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return {"message": "Deleted"}
++
++
++@router.get('/playlists/{playlist_id}/items')
++async def playlists_items(playlist_id: int):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return get_playlist_items(playlist_id)
++
++
++@router.post('/playlists/{playlist_id}/items')
++async def playlists_add_item(playlist_id: int, payload: PlaylistAddItemRequest):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    try:
++        safe_path = resolve_download_path(payload.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++    return add_playlist_item(playlist_id, safe_path.name)
++
++
++@router.post('/playlists/{playlist_id}/items/batch')
++async def playlists_add_items_batch(playlist_id: int, payload: PlaylistAddItemsRequest):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    safe_filenames: list[str] = []
++    for filename in payload.filenames or []:
++        try:
++            safe_path = resolve_download_path(filename)
++        except ValueError:
++            continue
++        if safe_path.exists():
++            safe_filenames.append(safe_path.name)
++    return add_playlist_items(playlist_id, safe_filenames)
++
++
++@router.delete('/playlists/{playlist_id}/items/{filename}')
++async def playlists_remove_item(playlist_id: int, filename: str):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    try:
++        safe_path = resolve_download_path(filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++    return remove_playlist_item(playlist_id, safe_path.name)
++
++
++@router.post('/playlists/{playlist_id}/reorder')
++async def playlists_reorder(playlist_id: int, order: list[str]):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    safe_order: list[str] = []
++    for filename in order or []:
++        try:
++            safe_order.append(resolve_download_path(filename).name)
++        except ValueError:
++            continue
++    return reorder_playlist(playlist_id, safe_order)
++
++
++# --- Legacy single-playlist endpoints (kept for compatibility) ------------
++# These operate on the default (oldest) playlist.
+ @router.get('/playlist')
+-async def playlist_get():
+-    return get_playlist()
++async def playlist_get_legacy():
++    playlist_id = _default_playlist_id_or_create()
++    return get_playlist_items(playlist_id)
+ 
+ 
+ @router.post('/playlist/add/{filename}')
+-async def add_to_playlist(filename: str):
++async def add_to_playlist_legacy(filename: str):
+     try:
+         safe_path = resolve_download_path(filename)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="Invalid filename")
+     if not safe_path.exists():
+         raise HTTPException(status_code=404, detail="File not found")
+-    return add_playlist_item(safe_path.name)
++    playlist_id = _default_playlist_id_or_create()
++    return add_playlist_item(playlist_id, safe_path.name)
+ 
+ 
+ @router.delete('/playlist/remove/{filename}')
+-async def remove_from_playlist(filename: str):
++async def remove_from_playlist_legacy(filename: str):
+     try:
+         safe_path = resolve_download_path(filename)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="Invalid filename")
+-    return remove_playlist_item(safe_path.name)
++    playlist_id = _default_playlist_id_or_create()
++    return remove_playlist_item(playlist_id, safe_path.name)
+ 
+ 
+ @router.post('/playlist/reorder')
+-async def playlist_reorder(order: list[str]):
++async def playlist_reorder_legacy(order: list[str]):
++    playlist_id = _default_playlist_id_or_create()
+     safe_order: list[str] = []
+     for filename in order or []:
+         try:
+             safe_order.append(resolve_download_path(filename).name)
+         except ValueError:
+             continue
+-    return reorder_playlist(safe_order)
++    return reorder_playlist(playlist_id, safe_order)
+diff --git a/backend/services/audio_extractor.py b/backend/services/audio_extractor.py
+new file mode 100644
+index 0000000..8147c0b
+--- /dev/null
++++ b/backend/services/audio_extractor.py
+@@ -0,0 +1,205 @@
++"""Video -> audio extraction for files already saved in the library.
++
++Runs ffmpeg in a background thread and reports progress via an in-memory
++job dict (mirrors the Whisper job pattern). The resulting audio file is
++written to DOWNLOAD_DIR, so it automatically appears in the Library.
++"""
++import shutil
++import subprocess
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Optional
++
++from services.files import DOWNLOAD_DIR
++
++FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
++FFPROBE = shutil.which("ffprobe") or "ffprobe"
++
++EXTRACT_AUDIO_JOBS: dict[str, dict] = {}
++_JOBS_LOCK = threading.RLock()
++
++# format -> (extension, ffmpeg audio codec, lossy)
++AUDIO_FORMATS = {
++    "mp3": ("mp3", "libmp3lame", True),
++    "m4a": ("m4a", "aac", True),
++    "aac": ("aac", "aac", True),
++    "ogg": ("ogg", "libvorbis", True),
++    "opus": ("opus", "libopus", True),
++    "wav": ("wav", "pcm_s16le", False),
++    "flac": ("flac", "flac", False),
++    "aiff": ("aiff", "pcm_s16be", False),
++}
++
++SUPPORTED_BITRATES = ("96k", "128k", "192k", "256k", "320k")
++DEFAULT_BITRATE = "192k"
++
++
++def ffmpeg_available() -> bool:
++    return shutil.which("ffmpeg") is not None
++
++
++def _probe_duration(path: Path) -> Optional[float]:
++    try:
++        result = subprocess.run(
++            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
++             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        return float(result.stdout.strip())
++    except Exception:
++        return None
++
++
++def _unique_output_path(source: Path, ext: str) -> Path:
++    stem = source.stem or source.name
++    candidate = DOWNLOAD_DIR / f"{stem} (audio).{ext}"
++    index = 1
++    while candidate.exists():
++        candidate = DOWNLOAD_DIR / f"{stem} (audio) ({index}).{ext}"
++        index += 1
++    return candidate
++
++
++def start_audio_extraction(source: Path, output_format: str, bitrate: str = DEFAULT_BITRATE) -> str:
++    """Queue an ffmpeg audio extraction. Returns a job_id."""
++    if not ffmpeg_available():
++        raise ValueError("ffmpeg was not found on this system. Install ffmpeg and restart the backend.")
++
++    fmt = (output_format or "").strip().lower().lstrip(".")
++    if fmt not in AUDIO_FORMATS:
++        raise ValueError(f"Unsupported audio format '{fmt}'. Supported: {', '.join(sorted(AUDIO_FORMATS))}")
++
++    ext, codec, lossy = AUDIO_FORMATS[fmt]
++    bitrate = (bitrate or "").strip().lower()
++    if lossy and bitrate not in SUPPORTED_BITRATES:
++        raise ValueError(f"Unsupported bitrate '{bitrate}'. Supported: {', '.join(SUPPORTED_BITRATES)}")
++
++    if not source.exists():
++        raise FileNotFoundError("Source file not found")
++
++    out_path = _unique_output_path(source, ext)
++    job_id = str(uuid.uuid4())
++    now = time.time()
++    job = {
++        "job_id": job_id,
++        "source": source.name,
++        "output": out_path.name,
++        "format": fmt,
++        "bitrate": bitrate,
++        "status": "queued",
++        "progress": 0,
++        "message": "Audio extraction queued",
++        "created_at": now,
++        "started_at": None,
++        "completed_at": None,
++        "source_duration": None,
++        "elapsed_seconds": 0,
++        "filename": None,
++        "size_bytes": None,
++        "error": None,
++    }
++    with _JOBS_LOCK:
++        EXTRACT_AUDIO_JOBS[job_id] = job
++
++    threading.Thread(
++        target=_run_extraction,
++        args=(job_id, source, out_path, codec, lossy, bitrate),
++        daemon=True,
++    ).start()
++    return job_id
++
++
++def _run_extraction(job_id: str, source: Path, out_path: Path, codec: str, lossy: bool, bitrate: str) -> None:
++    job = EXTRACT_AUDIO_JOBS[job_id]
++    started = time.time()
++    job["started_at"] = started
++    try:
++        duration = _probe_duration(source)
++        job["source_duration"] = duration
++        job["status"] = "extracting"
++        job["message"] = "Extracting audio..."
++
++        cmd = [
++            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
++            "-i", str(source), "-vn",
++        ]
++        if lossy:
++            cmd += ["-acodec", codec, "-b:a", bitrate]
++        else:
++            cmd += ["-acodec", codec]
++        cmd += ["-progress", "pipe:1", "-nostats", str(out_path)]
++
++        proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            encoding="utf-8",
++            errors="replace",
++        )
++
++        error_lines: list[str] = []
++
++        def _read_stderr() -> None:
++            assert proc.stderr is not None
++            for line in proc.stderr:
++                error_lines.append(line)
++
++        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
++        stderr_thread.start()
++
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            stripped = line.strip()
++            if stripped.startswith("out_time_ms="):
++                try:
++                    ms = int(stripped.split("=", 1)[1])
++                except ValueError:
++                    continue
++                seconds = ms / 1_000_000
++                if duration and duration > 0:
++                    job["progress"] = min(99, round(seconds / duration * 100))
++                    job["message"] = f"Extracting audio... {job['progress']}%"
++                job["elapsed_seconds"] = round(time.time() - started)
++
++        proc.wait()
++        stderr_thread.join(timeout=5)
++
++        if proc.returncode != 0 or not out_path.exists():
++            err_text = "".join(error_lines[-8:]).strip() or "ffmpeg exited with an error"
++            raise RuntimeError(err_text)
++
++        job.update({
++            "status": "completed",
++            "progress": 100,
++            "message": "Audio extracted",
++            "filename": out_path.name,
++            "size_bytes": out_path.stat().st_size,
++            "elapsed_seconds": round(time.time() - started),
++            "completed_at": time.time(),
++        })
++    except Exception as exc:
++        job.update({
++            "status": "error",
++            "message": str(exc),
++            "error": str(exc),
++            "elapsed_seconds": round(time.time() - started),
++        })
++        try:
++            out_path.unlink(missing_ok=True)
++        except Exception:
++            pass
++
++
++def get_audio_extraction_job(job_id: str) -> Optional[dict]:
++    job = EXTRACT_AUDIO_JOBS.get(job_id)
++    if job is None:
++        return None
++    result = dict(job)
++    if result.get("status") in ("queued", "extracting"):
++        result["elapsed_seconds"] = round(time.time() - (result.get("started_at") or result.get("created_at") or time.time()))
++    return result
+diff --git a/backend/services/database.py b/backend/services/database.py
+index 258b21c..69f973c 100644
+--- a/backend/services/database.py
++++ b/backend/services/database.py
+@@ -20,9 +20,93 @@ def _connect() -> sqlite3.Connection:
+     return conn
+ 
+ 
++def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
++    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
++
++
++def _migrate_legacy_playlist_schema(conn: sqlite3.Connection) -> None:
++    """
++    The very first release had a single unnamed playlist stored in a flat
++    `playlist_items` table (filename UNIQUE, position, created_at). This
++    migration renames that table, creates the new multi-playlist tables and
++    moves the old items into a default playlist named "My Playlist".
++    """
++    columns = _table_columns(conn, "playlist_items")
++    if not columns:
++        return
++    # New schema already applied (has playlist_id) -> nothing to do.
++    if "playlist_id" in columns:
++        return
++
++    conn.execute("ALTER TABLE playlist_items RENAME TO playlist_items_legacy")
++    conn.execute("DROP INDEX IF EXISTS idx_playlist_items_position")
++
++    conn.executescript(
++        """
++        CREATE TABLE IF NOT EXISTS playlists (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            name TEXT NOT NULL UNIQUE,
++            created_at REAL NOT NULL
++        );
++
++        CREATE TABLE IF NOT EXISTS playlist_items (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
++            filename TEXT NOT NULL,
++            position INTEGER NOT NULL,
++            created_at REAL NOT NULL,
++            UNIQUE(playlist_id, filename)
++        );
++
++        CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
++            ON playlist_items(playlist_id, position);
++        """
++    )
++
++    now = time.time()
++    conn.execute(
++        "INSERT OR IGNORE INTO playlists (name, created_at) VALUES ('My Playlist', ?)",
++        (now,),
++    )
++    conn.execute(
++        """
++        INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at)
++        SELECT p.id, legacy.filename, legacy.position, legacy.created_at
++        FROM playlist_items_legacy legacy
++        JOIN playlists p ON p.name = 'My Playlist'
++        """
++    )
++    conn.execute("DROP TABLE playlist_items_legacy")
++    conn.commit()
++
++
++def _ensure_default_playlist(conn: sqlite3.Connection) -> None:
++    """
++    Create the starter "My Playlist" once per install (first boot, or when a
++    legacy install is migrated). After that the user is free to delete every
++    playlist and have none.
++    """
++    meta = conn.execute(
++        "SELECT value FROM app_meta WHERE key = 'default_playlist_created'"
++    ).fetchone()
++    if meta is not None:
++        return
++    count = conn.execute("SELECT COUNT(*) AS c FROM playlists").fetchone()["c"]
++    if count == 0:
++        conn.execute(
++            "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
++            ("My Playlist", time.time()),
++        )
++    conn.execute(
++        "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('default_playlist_created', '1')"
++    )
++    conn.commit()
++
++
+ def ensure_db_initialized() -> None:
+     with _SCHEMA_LOCK:
+         with _connect() as conn:
++            _migrate_legacy_playlist_schema(conn)
+             conn.executescript(
+                 """
+                 CREATE TABLE IF NOT EXISTS download_jobs (
+@@ -57,16 +141,31 @@ def ensure_db_initialized() -> None:
+ 
+                 CREATE INDEX IF NOT EXISTS idx_notes_filename_time ON notes(filename, time_seconds);
+ 
++                CREATE TABLE IF NOT EXISTS app_meta (
++                    key TEXT PRIMARY KEY,
++                    value TEXT NOT NULL DEFAULT ''
++                );
++
++                CREATE TABLE IF NOT EXISTS playlists (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    name TEXT NOT NULL UNIQUE,
++                    created_at REAL NOT NULL
++                );
++
+                 CREATE TABLE IF NOT EXISTS playlist_items (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    filename TEXT NOT NULL UNIQUE,
++                    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
++                    filename TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+-                    created_at REAL NOT NULL
++                    created_at REAL NOT NULL,
++                    UNIQUE(playlist_id, filename)
+                 );
+ 
+-                CREATE INDEX IF NOT EXISTS idx_playlist_items_position ON playlist_items(position);
++                CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
++                    ON playlist_items(playlist_id, position);
+                 """
+             )
++            _ensure_default_playlist(conn)
+             conn.commit()
+ 
+ 
+@@ -218,55 +317,181 @@ def delete_note(note_id: int) -> bool:
+         return cursor.rowcount > 0
+ 
+ 
+-def get_playlist() -> List[str]:
++# --- Playlists (multiple, named) ------------------------------------------
++def _playlist_row(conn: sqlite3.Connection, playlist_id: int) -> Optional[dict]:
++    row = conn.execute(
++        """
++        SELECT p.id, p.name, p.created_at,
++               (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
++        FROM playlists p
++        WHERE p.id = ?
++        """,
++        (playlist_id,),
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def list_playlists() -> List[dict]:
+     ensure_db_initialized()
+     with _connect() as conn:
+-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
++        rows = conn.execute(
++            """
++            SELECT p.id, p.name, p.created_at,
++                   (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
++            FROM playlists p
++            ORDER BY p.created_at ASC, p.id ASC
++            """
++        ).fetchall()
++    return [dict(row) for row in rows]
++
++
++def get_default_playlist_id() -> Optional[int]:
++    """The default playlist is simply the oldest one (used by legacy endpoints)."""
++    ensure_db_initialized()
++    with _connect() as conn:
++        row = conn.execute("SELECT id FROM playlists ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
++    return row["id"] if row else None
++
++
++def create_playlist(name: str) -> dict:
++    ensure_db_initialized()
++    cleaned = name.strip()
++    if not cleaned:
++        raise ValueError("Playlist name cannot be empty")
++    with _connect() as conn:
++        try:
++            cursor = conn.execute(
++                "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
++                (cleaned, time.time()),
++            )
++            conn.commit()
++        except sqlite3.IntegrityError:
++            raise ValueError(f"A playlist named '{cleaned}' already exists")
++        row = _playlist_row(conn, cursor.lastrowid)
++    return row
++
++
++def rename_playlist(playlist_id: int, name: str) -> Optional[dict]:
++    ensure_db_initialized()
++    cleaned = name.strip()
++    if not cleaned:
++        raise ValueError("Playlist name cannot be empty")
++    with _connect() as conn:
++        try:
++            conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (cleaned, playlist_id))
++            conn.commit()
++        except sqlite3.IntegrityError:
++            raise ValueError(f"A playlist named '{cleaned}' already exists")
++        row = _playlist_row(conn, playlist_id)
++    return row
++
++
++def delete_playlist(playlist_id: int) -> bool:
++    ensure_db_initialized()
++    with _connect() as conn:
++        cursor = conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
++        conn.commit()
++        return cursor.rowcount > 0
++
++
++def get_playlist_items(playlist_id: int) -> List[str]:
++    ensure_db_initialized()
++    with _connect() as conn:
++        rows = conn.execute(
++            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
++            (playlist_id,),
++        ).fetchall()
+     return [row["filename"] for row in rows]
+ 
+ 
+-def add_playlist_item(filename: str) -> List[str]:
++def add_playlist_item(playlist_id: int, filename: str) -> List[str]:
+     ensure_db_initialized()
+     now = time.time()
+     with _connect() as conn:
+-        max_position = conn.execute("SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items").fetchone()["pos"]
++        max_position = conn.execute(
++            "SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items WHERE playlist_id = ?",
++            (playlist_id,),
++        ).fetchone()["pos"]
+         conn.execute(
+-            "INSERT OR IGNORE INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
+-            (filename, int(max_position) + 1, now),
++            "INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
++            (playlist_id, filename, int(max_position) + 1, now),
+         )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+-def remove_playlist_item(filename: str) -> List[str]:
++def add_playlist_items(playlist_id: int, filenames: List[str]) -> List[str]:
++    """Add many files to a playlist in one transaction (skips duplicates)."""
++    ensure_db_initialized()
++    now = time.time()
++    with _connect() as conn:
++        existing = {
++            row["filename"]
++            for row in conn.execute(
++                "SELECT filename FROM playlist_items WHERE playlist_id = ?",
++                (playlist_id,),
++            ).fetchall()
++        }
++        max_position = conn.execute(
++            "SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items WHERE playlist_id = ?",
++            (playlist_id,),
++        ).fetchone()["pos"]
++        position = int(max_position) + 1
++        seen = set()
++        for filename in filenames or []:
++            if not filename or filename in seen:
++                continue
++            seen.add(filename)
++            if filename in existing:
++                continue
++            conn.execute(
++                "INSERT INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
++                (playlist_id, filename, position, now),
++            )
++            existing.add(filename)
++            position += 1
++        conn.commit()
++    return get_playlist_items(playlist_id)
++
++
++def remove_playlist_item(playlist_id: int, filename: str) -> List[str]:
+     ensure_db_initialized()
+     with _connect() as conn:
+-        conn.execute("DELETE FROM playlist_items WHERE filename = ?", (filename,))
+-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
++        conn.execute(
++            "DELETE FROM playlist_items WHERE playlist_id = ? AND filename = ?",
++            (playlist_id, filename),
++        )
++        rows = conn.execute(
++            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
++            (playlist_id,),
++        ).fetchall()
+         for index, row in enumerate(rows):
+-            conn.execute("UPDATE playlist_items SET position = ? WHERE filename = ?", (index, row["filename"]))
++            conn.execute(
++                "UPDATE playlist_items SET position = ? WHERE playlist_id = ? AND filename = ?",
++                (index, playlist_id, row["filename"]),
++            )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+-def reorder_playlist(filenames: List[str]) -> List[str]:
++def reorder_playlist(playlist_id: int, filenames: List[str]) -> List[str]:
+     ensure_db_initialized()
+-    unique = []
++    unique: List[str] = []
+     seen = set()
+     for filename in filenames or []:
+         if filename and filename not in seen:
+             unique.append(filename)
+             seen.add(filename)
++    now = time.time()
+     with _connect() as conn:
+-        conn.execute("DELETE FROM playlist_items")
+-        now = time.time()
++        conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
+         for index, filename in enumerate(unique):
+             conn.execute(
+-                "INSERT INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
+-                (filename, index, now),
++                "INSERT INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
++                (playlist_id, filename, index, now),
+             )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+ async def init_db():
+diff --git a/backend/services/downloader.py b/backend/services/downloader.py
+index feb96fb..7554c93 100644
+--- a/backend/services/downloader.py
++++ b/backend/services/downloader.py
+@@ -23,7 +23,10 @@ from services.yt_dlp_options import (
+     add_generic_impersonation,
+     apply_reliable_ytdlp_options,
+     cookiefile_report,
++    is_instagram_url,
++    instagram_error_help,
+     pretty_cookie_summary,
++    social_cookies_browsers,
+     validate_cookiefile_for_ytdlp,
+ )
+ 
+@@ -105,6 +108,7 @@ def _categorize_error(message: str) -> str:
+     auth_markers = [
+         "sign in", "login", "cookies", "private video", "members-only", "members only",
+         "join this channel", "permission", "not authorized", "account", "subscriber-only",
++        "empty media response", "not logged", "logged-in", "login required",
+     ]
+     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
+     geo_markers = ["not available in your country", "geo", "region"]
+@@ -632,6 +636,37 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+         clean_error = _clean(str(e))
+         print(f"[download] error - {clean_error}", flush=True)
+ 
++        # Instagram blocks media without login. If we haven't used any cookies
++        # yet (no cookie file, no browser cookies), retry once pulling cookies
++        # from the user's configured browser profile (SOCIAL_COOKIES_BROWSER).
++        insta_retried = False
++        if (
++            is_instagram_url(url)
++            and "cookiefile" not in ydl_opts
++            and "cookiesfrombrowser" not in ydl_opts
++            and social_cookies_browsers()
++            and any(marker in clean_error.lower() for marker in ("empty media response", "login", "sign in", "authentication", "not logged"))
++        ):
++            insta_retried = True
++            print(f"[download] Instagram needs login - retrying with browser cookies ({', '.join(social_cookies_browsers())})", flush=True)
++            _set_task_message(task_id, "Instagram requires login — retrying with browser cookies...")
++            for browser in social_cookies_browsers():
++                try:
++                    insta_opts = dict(ydl_opts)
++                    insta_opts["cookiesfrombrowser"] = (browser, None, None, None)
++                    add_generic_impersonation(insta_opts)
++                    with yt_dlp.YoutubeDL(insta_opts) as ydl_insta:
++                        info = ydl_insta.extract_info(url, download=True)
++                        download_tasks[task_id]["title"] = info.get("title", "Unknown")
++                        download_tasks[task_id]["video_id"] = info.get("id")
++                        if download_tasks[task_id].get("status") == "cancelled":
++                            return
++                        _mark_completed(task_id, ydl_insta, info, format_ext)
++                        return
++                except Exception as insta_error:
++                    clean_error = _clean(str(insta_error))
++                    print(f"[download] Instagram retry with {browser} failed: {clean_error}", flush=True)
++
+         # Some public sites are not recognized by platform extractors.
+         # Retry with yt-dlp generic extractor before failing.
+         if "Unsupported URL" in clean_error:
+@@ -656,6 +691,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+             except Exception as generic_error:
+                 clean_error = _clean(str(generic_error))
+ 
++        if is_instagram_url(url):
++            help_text = instagram_error_help(clean_error)
++            if help_text:
++                clean_error = f"{clean_error}\n\n{help_text}"
++
+         _mark_error_or_retry(task_id, clean_error)
+     finally:
+         if download_tasks.get(task_id, {}).get("status") == "cancelled":
+diff --git a/backend/services/transcripts.py b/backend/services/transcripts.py
+index 0e345e2..0495df2 100644
+--- a/backend/services/transcripts.py
++++ b/backend/services/transcripts.py
+@@ -1291,6 +1291,16 @@ def get_manual_transcription_job(job_id: str) -> dict | None:
+     return MANUAL_TRANSCRIPT_JOBS.get(job_id)
+ 
+ 
++async def start_library_whisper_transcription(path: Path, filename: str, force: bool = False) -> dict:
++    """Start Whisper on a file already saved in the library/playlist.
++
++    The cache key is derived from the filename (stable across restarts), so a
++    file transcribed once can be reused unless ``force`` is set.
++    """
++    key = f"library_{_safe_url_key(filename)}"
++    return await start_uploaded_whisper_transcription(path, filename, key, force)
++
++
+ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict:
+     url = str(url or "").strip()
+     if not url:
+diff --git a/backend/services/yt_dlp_options.py b/backend/services/yt_dlp_options.py
+index 453ae37..9beecd3 100644
+--- a/backend/services/yt_dlp_options.py
++++ b/backend/services/yt_dlp_options.py
+@@ -78,6 +78,16 @@ def social_cookies_file() -> Path:
+     return _env_path("SOCIAL_COOKIES_FILE", DEFAULT_SOCIAL_COOKIES_FILE)
+ 
+ 
++def social_cookies_browsers() -> list[str]:
++    """Browsers to pull Instagram/social cookies from, via yt-dlp
++    ``cookiesfrombrowser``. Configure with SOCIAL_COOKIES_BROWSER
++    (comma-separated, e.g. ``chrome,edge,firefox``)."""
++    raw = os.environ.get("SOCIAL_COOKIES_BROWSER", "").strip()
++    if not raw:
++        return []
++    return [part.strip().lower() for part in raw.split(",") if part.strip()]
++
++
+ def is_youtube_url(url: str) -> bool:
+     host = (urlparse(str(url or "")).hostname or "").lower()
+     return (
+@@ -94,6 +104,46 @@ def is_youtube_url(url: str) -> bool:
+     )
+ 
+ 
++def is_instagram_url(url: str) -> bool:
++    host = (urlparse(str(url or "")).hostname or "").lower()
++    return host == "instagram.com" or host.endswith(".instagram.com")
++
++
++def instagram_error_help(error: str) -> str:
++    """Turn a raw yt-dlp Instagram error into actionable guidance."""
++    text = (error or "").lower()
++    if any(marker in text for marker in ("app-bound", "appbound", "failed to decrypt", "dpapi", "decrypt", "keyring", "keychain")):
++        return (
++            "The browser cookie file could not be decrypted. Recent Chrome/Edge encrypt cookies "
++            "(app-bound encryption) so yt-dlp cannot read them. Fix: 1) Use Firefox and set "
++            "SOCIAL_COOKIES_BROWSER=firefox, OR 2) upload an instagram_cookies.txt file exported "
++            "from your logged-in browser (see the 'Instagram login cookies' card on this page)."
++        )
++    if "empty media response" in text:
++        return (
++            "Instagram now blocks downloads unless you're logged in. Fix, easiest first: "
++            "1) On this page, use the 'Instagram login cookies' card to upload an "
++            "instagram_cookies.txt file exported from your logged-in browser (install the "
++            "'Get cookies.txt LOCALLY' browser extension, log into Instagram, export cookies). "
++            "2) Or set the backend environment variable SOCIAL_COOKIES_BROWSER=firefox "
++            "(Firefox cookies work best — recent Chrome/Edge encrypt cookies and yt-dlp may not "
++            "read them), then restart the backend. 3) Or save the cookies file directly to "
++            "backend/instagram_cookies.txt."
++        )
++    if any(marker in text for marker in ("login", "sign in", "log in", "authentication", "not logged")):
++        return (
++            "Instagram requires login for this post. Log in on this PC and either set "
++            "SOCIAL_COOKIES_BROWSER=firefox (or chrome/edge) and restart the backend, or upload "
++            "a Netscape-format instagram_cookies.txt via the 'Instagram login cookies' card."
++        )
++    if "unsupported url" in text:
++        return (
++            "yt-dlp does not support this link. Make sure you pasted a direct post/reel/story URL "
++            "from instagram.com."
++        )
++    return ""
++
++
+ def _candidate_cookie_paths(url: str) -> list[Path]:
+     if is_youtube_url(url):
+         candidates = [youtube_cookies_file(), LEGACY_COOKIES_FILE]
+@@ -255,6 +305,28 @@ def apply_cookiefile(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+     return ydl_opts
+ 
+ 
++def apply_cookiesfrombrowser(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
++    """Pass cookies straight from a local browser profile (e.g. Chrome/Edge
++    where the user is logged into Instagram). This is the easiest fix for
++    Instagram's "empty media response" auth wall: no file to export."""
++    if "cookiefile" in ydl_opts:
++        return ydl_opts
++    browsers = social_cookies_browsers()
++    if not browsers:
++        return ydl_opts
++    ydl_opts["cookiesfrombrowser"] = (browsers[0], None, None, None)
++    return ydl_opts
++
++
++def apply_social_auth_options(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
++    """Authentication helpers for non-YouTube (Instagram / social) URLs."""
++    if is_youtube_url(url):
++        return ydl_opts
++    apply_cookiefile(ydl_opts, url)
++    apply_cookiesfrombrowser(ydl_opts, url)
++    return ydl_opts
++
++
+ def _merge_extractor_args(ydl_opts: dict[str, Any], ie_key: str, values: dict[str, list[str]]) -> None:
+     extractor_args = dict(ydl_opts.get("extractor_args") or {})
+     existing = dict(extractor_args.get(ie_key) or {})
+@@ -345,7 +417,10 @@ def apply_reliable_ytdlp_options(ydl_opts: dict[str, Any], url: str) -> dict[str
+ 
+     add_generic_impersonation(ydl_opts)
+     apply_youtube_runtime_options(ydl_opts, url)
+-    apply_cookiefile(ydl_opts, url)
++    if is_youtube_url(url):
++        apply_cookiefile(ydl_opts, url)
++    else:
++        apply_social_auth_options(ydl_opts, url)
+     return ydl_opts
+ 
+ 
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index a821ab7..322af35 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -2778,3 +2778,714 @@ body[data-theme='dark'] .main-stage {
+ 		font-size: 14px;
+ 	}
+ }
++
++/* ===== Multi-playlist (chips, forms) ===== */
++.panel--playlists {
++	padding: 18px;
++	display: grid;
++	gap: 14px;
++}
++
++.playlist-bar {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 10px;
++	align-items: center;
++}
++
++.playlist-chip-wrap {
++	position: relative;
++	display: inline-flex;
++	align-items: center;
++}
++
++.playlist-chip {
++	display: inline-flex;
++	align-items: center;
++	gap: 10px;
++	padding: 10px 16px;
++	border-radius: 999px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text-muted);
++	font: inherit;
++	font-weight: 600;
++	cursor: pointer;
++	transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
++}
++
++.playlist-chip:hover {
++	border-color: var(--accent);
++	color: var(--text);
++	transform: translateY(-1px);
++}
++
++.playlist-chip-wrap--active .playlist-chip {
++	background: linear-gradient(135deg, var(--accent), var(--accent-strong));
++	border-color: transparent;
++	color: #fff;
++	box-shadow: 0 10px 24px rgba(124, 58, 237, 0.35);
++}
++
++.playlist-chip__count {
++	font-size: 12px;
++	font-weight: 700;
++	padding: 2px 9px;
++	border-radius: 999px;
++	background: rgba(255, 255, 255, 0.16);
++	color: inherit;
++}
++
++.playlist-chip-wrap--active .playlist-chip__count {
++	background: rgba(255, 255, 255, 0.24);
++}
++
++.playlist-chip--new {
++	border-style: dashed;
++	background: transparent;
++}
++
++.playlist-chip--new:hover {
++	border-color: var(--accent);
++	background: var(--surface-muted);
++}
++
++.playlist-chip__tools {
++	display: inline-flex;
++	align-items: center;
++	gap: 2px;
++	margin-left: 4px;
++}
++
++.playlist-chip__tools .icon-button {
++	width: 26px;
++	height: 26px;
++	border-radius: 50%;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++}
++
++.playlist-chip__confirm {
++	background: rgba(244, 63, 94, 0.18) !important;
++	border-color: rgba(244, 63, 94, 0.5) !important;
++	color: #f43f5e !important;
++	animation: confirm-pulse 900ms ease-in-out infinite;
++}
++
++@keyframes confirm-pulse {
++	0%, 100% { transform: scale(1); }
++	50% { transform: scale(1.14); }
++}
++
++.inline-form {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 10px;
++	align-items: center;
++	padding: 14px;
++	border-radius: 16px;
++	border: 1px dashed var(--border);
++	background: var(--surface-muted);
++}
++
++.inline-form__input {
++	flex: 1 1 220px;
++}
++
++/* ===== Add-to-playlist picker modal ===== */
++.modal-overlay {
++	position: fixed;
++	inset: 0;
++	z-index: 2000;
++	display: grid;
++	place-items: center;
++	padding: 24px;
++	background: rgba(5, 8, 22, 0.62);
++	backdrop-filter: blur(10px);
++	-webkit-backdrop-filter: blur(10px);
++	animation: modal-fade-in 160ms ease-out;
++}
++
++.modal-card {
++	width: min(460px, 100%);
++	max-height: min(640px, calc(100vh - 48px));
++	display: flex;
++	flex-direction: column;
++	background:
++		linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03)),
++		var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 24px;
++	box-shadow: 0 40px 90px rgba(0, 0, 0, 0.5);
++	overflow: hidden;
++	animation: modal-pop-in 200ms ease-out;
++}
++
++.modal-card__header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	padding: 20px 22px 0;
++}
++
++.modal-card__header h2 {
++	margin: 0;
++	font-family: var(--font-heading);
++	font-size: 20px;
++}
++
++.modal-card__subtitle {
++	margin: 4px 0 0;
++	padding: 0 22px;
++	color: var(--text-muted);
++	font-size: 13px;
++	white-space: nowrap;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.modal-card__body {
++	padding: 18px 22px;
++	overflow-y: auto;
++	display: grid;
++	gap: 14px;
++}
++
++.modal-card__body--center {
++	place-items: center;
++	justify-content: center;
++	min-height: 140px;
++	color: var(--text-muted);
++}
++
++.modal-card__footer {
++	display: flex;
++	justify-content: flex-end;
++	gap: 10px;
++	padding: 16px 22px 20px;
++	border-top: 1px solid var(--border);
++}
++
++@keyframes modal-fade-in {
++	from { opacity: 0; }
++	to { opacity: 1; }
++}
++
++@keyframes modal-pop-in {
++	from { opacity: 0; transform: translateY(12px) scale(0.98); }
++	to { opacity: 1; transform: translateY(0) scale(1); }
++}
++
++.playlist-pick-list {
++	display: grid;
++	gap: 8px;
++	max-height: 260px;
++	overflow-y: auto;
++}
++
++.playlist-pick-row {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	padding: 12px 14px;
++	border-radius: 14px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.playlist-pick-row:hover {
++	border-color: var(--accent);
++}
++
++.playlist-pick-row--selected {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.12);
++}
++
++.playlist-pick-row input[type='radio'] {
++	accent-color: var(--accent);
++	width: 16px;
++	height: 16px;
++	flex: none;
++}
++
++.playlist-pick-row__name {
++	flex: 1;
++	font-weight: 600;
++	white-space: nowrap;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.playlist-pick-row__count {
++	font-size: 12px;
++	color: var(--text-muted);
++	flex: none;
++}
++
++.playlist-pick-empty {
++	margin: 0;
++	color: var(--text-muted);
++	font-size: 14px;
++	text-align: center;
++	padding: 18px 0;
++}
++
++.playlist-pick-new {
++	display: grid;
++	gap: 10px;
++}
++
++.playlist-pick-new__toggle {
++	display: inline-flex;
++	align-items: center;
++	gap: 8px;
++	align-self: flex-start;
++	padding: 10px 14px;
++	border-radius: 12px;
++	border: 1px dashed var(--border);
++	background: transparent;
++	color: var(--text-muted);
++	font: inherit;
++	font-weight: 600;
++	cursor: pointer;
++	transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
++}
++
++.playlist-pick-new__toggle:hover,
++.playlist-pick-new__toggle--active {
++	border-color: var(--accent);
++	color: var(--text);
++	background: var(--surface-muted);
++}
++
++.form-error {
++	margin: 0;
++	padding: 10px 14px;
++	border-radius: 12px;
++	border: 1px solid rgba(244, 63, 94, 0.4);
++	background: rgba(244, 63, 94, 0.1);
++	color: #f43f5e;
++	font-size: 13px;
++}
++
++@media (max-width: 640px) {
++	.modal-overlay {
++		padding: 12px;
++	}
++
++	.modal-card {
++		max-height: calc(100vh - 24px);
++	}
++}
++
++/* ===== Batch add: multi-select in Playlist page ===== */
++.multiselect-header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++	margin-bottom: 10px;
++}
++
++.multiselect-header__actions {
++	display: flex;
++	gap: 8px;
++}
++
++.ghost-button--small {
++	padding: 8px 12px;
++	border-radius: 12px;
++	font-size: 13px;
++}
++
++.ghost-button--active {
++	border-color: var(--accent);
++	color: var(--accent);
++	background: rgba(124, 58, 237, 0.1);
++}
++
++.multiselect-search {
++	position: relative;
++	margin-bottom: 10px;
++}
++
++.multiselect-search__icon {
++	position: absolute;
++	left: 14px;
++	top: 50%;
++	transform: translateY(-50%);
++	color: var(--text-muted);
++	pointer-events: none;
++}
++
++.multiselect-search .input--search {
++	padding-left: 40px;
++}
++
++.multiselect-list {
++	display: grid;
++	gap: 8px;
++	max-height: 340px;
++	overflow-y: auto;
++	padding-right: 4px;
++}
++
++.multiselect-row {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	padding: 8px 12px;
++	border-radius: 14px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.multiselect-row:hover {
++	border-color: var(--accent);
++}
++
++.multiselect-row--checked {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.1);
++}
++
++.multiselect-row input[type='checkbox'] {
++	accent-color: var(--accent);
++	width: 16px;
++	height: 16px;
++	flex: none;
++}
++
++.multiselect-row .media-thumb {
++	width: 56px;
++	height: 38px;
++	border-radius: 10px;
++}
++
++.multiselect-row__title {
++	flex: 1;
++	min-width: 0;
++	font-size: 14px;
++	font-weight: 600;
++	white-space: nowrap;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.multiselect-row__ext {
++	flex: none;
++	font-size: 11px;
++	font-weight: 700;
++	padding: 3px 8px;
++	border-radius: 999px;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	color: var(--text-muted);
++	text-transform: uppercase;
++}
++
++/* ===== Library multi-select mode ===== */
++.toolbar-actions {
++	display: flex;
++	align-items: center;
++	gap: 8px;
++	flex-wrap: wrap;
++}
++
++.file-card {
++	position: relative;
++}
++
++.file-card__check {
++	position: absolute;
++	top: 10px;
++	right: 10px;
++	z-index: 2;
++	width: 24px;
++	height: 24px;
++	border-radius: 50%;
++	border: 2px solid rgba(148, 163, 184, 0.6);
++	background: rgba(15, 23, 42, 0.55);
++	display: grid;
++	place-items: center;
++	color: #fff;
++	transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
++}
++
++.file-card__check--on {
++	background: var(--accent);
++	border-color: var(--accent);
++	transform: scale(1.06);
++}
++
++.file-card--select-mode {
++	box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.18);
++}
++
++.file-card--selected {
++	border-color: var(--accent);
++	box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.22);
++}
++
++@media (max-width: 640px) {
++	.multiselect-header {
++		flex-direction: column;
++		align-items: flex-start;
++	}
++}
++
++/* Toolbar becomes a flex row so selection actions sit beside the search box */
++.panel--toolbar {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.panel--toolbar .search-box {
++	flex: 1 1 240px;
++}
++
++/* ===== Visual library picker (Whisper "from playlist/library") ===== */
++.whisper-picker-header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++	margin-bottom: 10px;
++}
++
++.library-picker {
++	display: grid;
++	gap: 10px;
++}
++
++.library-picker__search {
++	position: relative;
++}
++
++.library-picker__search-icon {
++	position: absolute;
++	left: 14px;
++	top: 50%;
++	transform: translateY(-50%);
++	color: var(--text-muted);
++	pointer-events: none;
++}
++
++.library-picker__search .input--search {
++	padding-left: 40px;
++}
++
++.library-picker__grid {
++	display: grid;
++	grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
++	gap: 10px;
++	max-height: 380px;
++	overflow-y: auto;
++	padding: 2px;
++}
++
++.library-picker__card {
++	position: relative;
++	display: flex;
++	flex-direction: column;
++	gap: 8px;
++	padding: 10px;
++	border-radius: 16px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	text-align: left;
++	font: inherit;
++	color: var(--text);
++	transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, box-shadow 140ms ease;
++}
++
++.library-picker__card:hover {
++	border-color: var(--accent);
++	transform: translateY(-1px);
++}
++
++.library-picker__card--selected {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.12);
++	box-shadow: 0 0 0 2px rgba(124, 58, 237, 0.18);
++}
++
++.library-picker__thumb {
++	width: 100%;
++	height: 84px;
++	object-fit: cover;
++	border-radius: 12px;
++	background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(124, 58, 237, 0.12));
++}
++
++.library-picker__thumb--fallback {
++	display: flex;
++	flex-direction: column;
++	align-items: center;
++	justify-content: center;
++	gap: 4px;
++	color: var(--text-muted);
++	font-size: 11px;
++	font-weight: 700;
++}
++
++.library-picker__card-check {
++	position: absolute;
++	top: 8px;
++	right: 8px;
++	width: 20px;
++	height: 20px;
++	border-radius: 50%;
++	display: grid;
++	place-items: center;
++	background: rgba(15, 23, 42, 0.55);
++	border: 2px solid rgba(148, 163, 184, 0.6);
++	color: #fff;
++	transition: background 140ms ease, border-color 140ms ease;
++}
++
++.library-picker__card--selected .library-picker__card-check {
++	background: var(--accent);
++	border-color: var(--accent);
++}
++
++.library-picker__card-title {
++	font-size: 13px;
++	font-weight: 600;
++	line-height: 1.25;
++	overflow: hidden;
++	display: -webkit-box;
++	-webkit-line-clamp: 2;
++	-webkit-box-orient: vertical;
++}
++
++.library-picker__card-meta {
++	font-size: 11px;
++	color: var(--text-muted);
++}
++
++.library-picker__empty {
++	padding: 24px;
++	text-align: center;
++	color: var(--text-muted);
++	border: 1px dashed var(--border);
++	border-radius: 16px;
++	font-size: 14px;
++}
++
++@media (max-width: 640px) {
++	.whisper-picker-header {
++		flex-direction: column;
++		align-items: flex-start;
++	}
++}
++
++/* ===== Instagram / social cookies card ===== */
++.social-cookies-card {
++	display: grid;
++	gap: 12px;
++	padding: 16px;
++	border-radius: 18px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++}
++
++.social-cookies-card__header {
++	display: flex;
++	align-items: flex-start;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.social-cookies-card__actions {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	flex-wrap: wrap;
++}
++
++.social-cookies-card__upload {
++	position: relative;
++	cursor: pointer;
++}
++
++.social-cookies-card__upload input[type='file'] {
++	position: absolute;
++	inset: 0;
++	opacity: 0;
++	cursor: pointer;
++}
++
++.field__help--warn {
++	color: #d97706;
++}
++
++.social-cookies-help {
++	border: 1px dashed var(--border);
++	border-radius: 14px;
++	padding: 10px 14px;
++	color: var(--text-muted);
++	font-size: 13px;
++}
++
++.social-cookies-help summary {
++	cursor: pointer;
++	font-weight: 600;
++	color: var(--text);
++}
++
++.social-cookies-help ol {
++	margin: 10px 0 4px;
++	padding-left: 20px;
++	display: grid;
++	gap: 8px;
++}
++
++.social-cookies-help code {
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	border-radius: 6px;
++	padding: 1px 6px;
++	font-size: 12px;
++}
++
++/* ===== Audio Extractor page ===== */
++.audio-extractor-job {
++	display: grid;
++	gap: 14px;
++}
++
++.audio-extractor-result {
++	display: flex;
++	align-items: center;
++	gap: 14px;
++	flex-wrap: wrap;
++	padding: 16px;
++	border-radius: 18px;
++	border: 1px solid rgba(22, 163, 74, 0.35);
++	background: rgba(22, 163, 74, 0.08);
++	color: #16a34a;
++}
++
++.audio-extractor-result > div {
++	flex: 1 1 220px;
++	min-width: 0;
++}
++
++.audio-extractor-result .panel__title {
++	margin: 0;
++	font-size: 16px;
++	word-break: break-word;
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 085863c..c6523ce 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,8 +1,12 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { Link, Navigate, NavLink, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
+ import {
++  AudioLines,
+   BadgeCheck,
++  Check,
++  CheckSquare,
+   ChevronRight,
++  FolderOpen,
+   Clipboard,
+   Download,
+   FileText,
+@@ -21,6 +25,7 @@ import {
+   ShieldCheck,
+   Sparkles,
+   Trash2,
++  Upload,
+   X,
+   Music2,
+   Plus,
+@@ -30,6 +35,9 @@ import {
+ import './App.css';
+ import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
+ import PlaylistPage from './pages/Playlist';
++import PlaylistPicker from './components/PlaylistPicker';
++import LibraryPicker from './components/LibraryPicker';
++import AudioExtractorPage from './pages/AudioExtractor';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -447,15 +455,30 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
+   );
+ }
+ 
+-function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist }) {
++function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMode = false, selected = false, onToggleSelect }) {
+   const title = file.title || cleanTitle(file.filename || 'Unknown file');
+   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
+   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
++  const handlePrimary = () => {
++    if (selectMode) onToggleSelect?.(file.filename);
++    else onSelect(file);
++  };
+ 
+   return (
+-    <article className={`file-card ${active ? 'file-card--active' : ''}`} role="button" tabIndex={0} onClick={() => onSelect(file)} onKeyDown={(event) => {
+-      if (event.key === 'Enter') onSelect(file);
+-    }}>
++    <article
++      className={`file-card ${active ? 'file-card--active' : ''} ${selectMode && selected ? 'file-card--selected' : ''} ${selectMode ? 'file-card--select-mode' : ''}`}
++      role="button"
++      tabIndex={0}
++      onClick={handlePrimary}
++      onKeyDown={(event) => {
++        if (event.key === 'Enter') handlePrimary();
++      }}
++    >
++      {selectMode ? (
++        <span className={`file-card__check ${selected ? 'file-card__check--on' : ''}`} aria-hidden="true">
++          {selected ? <Check size={14} /> : null}
++        </span>
++      ) : null}
+       <div className="file-card__thumb">
+         <MediaThumb videoId={file.video_id} title={title} filename={file.filename} />
+       </div>
+@@ -657,7 +680,10 @@ function AboutPage() {
+   );
+ }
+ 
+-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload }) {
++function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
++  const notify = useCallback((message, type = 'info') => {
++    if (onNotify) onNotify(message, type);
++  }, [onNotify]);
+   const [url, setUrl] = useState('');
+   const [quality, setQuality] = useState('1080');
+   const [format, setFormat] = useState('mp4');
+@@ -671,6 +697,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [socialFormat, setSocialFormat] = useState('mp4');
+   const [submitting, setSubmitting] = useState(false);
+   const [socialSubmitting, setSocialSubmitting] = useState(false);
++  const [socialCookies, setSocialCookies] = useState(null);
++  const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
++  const [socialCookiesError, setSocialCookiesError] = useState('');
++  const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
+   const [transcriptUrl, setTranscriptUrl] = useState('');
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const [transcriptResult, setTranscriptResult] = useState(null);
+@@ -776,6 +806,56 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     }
+   };
+ 
++  const loadSocialCookies = useCallback(async () => {
++    setSocialCookiesLoading(true);
++    setSocialCookiesError('');
++    try {
++      const response = await api.get('/social-cookies');
++      setSocialCookies(response.data || null);
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to check Instagram cookie status.'));
++    } finally {
++      setSocialCookiesLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch cookie status on mount
++    loadSocialCookies();
++  }, [loadSocialCookies]);
++
++  const handleSocialCookiesUpload = async (event) => {
++    const file = event.target.files?.[0];
++    event.target.value = '';
++    if (!file) return;
++    setSocialCookiesUploading(true);
++    setSocialCookiesError('');
++    try {
++      const formData = new FormData();
++      formData.append('file', file);
++      const response = await api.post('/social-cookies', formData, {
++        headers: { 'Content-Type': 'multipart/form-data' },
++      });
++      setSocialCookies(response.data || null);
++      notify('Instagram cookies saved', 'success');
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to save Instagram cookies.'));
++    } finally {
++      setSocialCookiesUploading(false);
++    }
++  };
++
++  const handleSocialCookiesRemove = async () => {
++    setSocialCookiesError('');
++    try {
++      await api.delete('/social-cookies');
++      setSocialCookies(null);
++      notify('Instagram cookies removed', 'info');
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to remove Instagram cookies.'));
++    }
++  };
++
+   const handleFetchTranscript = async (event) => {
+     event.preventDefault();
+     const trimmed = transcriptUrl.trim();
+@@ -1075,6 +1155,82 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
+             </button>
+           </form>
++
++          <div className="whisper-upload-divider"><span>Instagram note</span></div>
++
++          <div className="social-cookies-card">
++            <div className="social-cookies-card__header">
++              <div>
++                <h3 className="panel__title panel__title--tight">Instagram login cookies</h3>
++                <p className="panel__subtitle">
++                  Instagram blocks downloads unless you're logged in. Give the app cookies from your
++                  logged-in browser so downloads work.
++                </p>
++              </div>
++              <span
++                className={`status-pill ${socialCookies?.exists ? 'status-pill--completed' : 'status-pill--error'}`}
++              >
++                {socialCookiesLoading
++                  ? 'Checking…'
++                  : socialCookies?.exists
++                    ? 'Cookies configured'
++                    : 'No cookies'}
++              </span>
++            </div>
++
++            {socialCookies?.cookie_count > 0 ? (
++              <p className="field__help">
++                {socialCookies.cookie_count} cookie rows loaded from{' '}
++                <code>{socialCookies.selected_path || 'instagram_cookies.txt'}</code>.
++              </p>
++            ) : null}
++            {socialCookies?.browsers_configured?.length > 0 ? (
++              <p className="field__help">
++                Browser cookie mode active:{' '}
++                <code>SOCIAL_COOKIES_BROWSER={socialCookies.browsers_configured.join(',')}</code>
++              </p>
++            ) : null}
++            {socialCookies?.warning ? (
++              <p className="field__help field__help--warn">{socialCookies.warning}</p>
++            ) : null}
++            {socialCookiesError ? <p className="download-card__error">{socialCookiesError}</p> : null}
++
++            <div className="social-cookies-card__actions">
++              <label className="primary-button social-cookies-card__upload">
++                {socialCookiesUploading ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
++                {socialCookiesUploading ? 'Saving…' : 'Upload instagram_cookies.txt'}
++                <input
++                  type="file"
++                  accept=".txt,text/plain"
++                  onChange={handleSocialCookiesUpload}
++                  disabled={socialCookiesUploading}
++                  hidden
++                />
++              </label>
++              {socialCookies?.exists ? (
++                <button className="ghost-button ghost-button--danger" type="button" onClick={handleSocialCookiesRemove}>
++                  <Trash2 size={16} />
++                  Remove
++                </button>
++              ) : null}
++            </div>
++
++            <details className="social-cookies-help">
++              <summary>How do I get Instagram cookies?</summary>
++              <ol>
++                <li>Open Instagram in Chrome/Edge/Firefox on this PC and log in.</li>
++                <li>
++                  Easiest: set the environment variable <code>SOCIAL_COOKIES_BROWSER=chrome</code>{' '}
++                  (or <code>edge</code>/<code>firefox</code>) in the backend's environment, then
++                  restart. The app pulls cookies straight from that browser — no file needed.
++                </li>
++                <li>
++                  Or export cookies as Netscape format (e.g. with the “Get cookies.txt LOCALLY”
++                  browser extension) and upload the <code>.txt</code> file above.
++                </li>
++              </ol>
++            </details>
++          </div>
+         </section>
+       )}
+ 
+@@ -1125,7 +1281,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   );
+ }
+ 
+-function WhisperTranscriptionPage({ onNotify }) {
++function WhisperTranscriptionPage({ onNotify, files = [] }) {
+   const [url, setUrl] = useState('');
+   const [force, setForce] = useState(false);
+   const [job, setJob] = useState(null);
+@@ -1133,7 +1289,13 @@ function WhisperTranscriptionPage({ onNotify }) {
+   const [error, setError] = useState('');
+   const [isStarting, setIsStarting] = useState(false);
+   const [isUploading, setIsUploading] = useState(false);
++  const [isLibraryStarting, setIsLibraryStarting] = useState(false);
++  const [selectedLibraryFilename, setSelectedLibraryFilename] = useState('');
+   const [selectedAudioFile, setSelectedAudioFile] = useState(null);
++  const libraryFiles = useMemo(
++    () => (files || []).filter((file) => isMediaFile(file.filename || '')),
++    [files],
++  );
+   const [copyStatus, setCopyStatus] = useState('Copy Transcript');
+   const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
+   const transcriptText = transcriptSegmentsToText(result?.segments || []);
+@@ -1255,6 +1417,44 @@ function WhisperTranscriptionPage({ onNotify }) {
+     }
+   };
+ 
++  const handleLibrarySubmit = async (event) => {
++    event.preventDefault();
++    if (!selectedLibraryFilename || isLibraryStarting || isActive) return;
++
++    setIsLibraryStarting(true);
++    setError('');
++    setResult(null);
++    setCopyStatus('Copy Transcript');
++    try {
++      const response = await api.post('/whisper-library', {
++        filename: selectedLibraryFilename,
++        force,
++      });
++      const data = response.data || {};
++      if (data.already_done && data.result) {
++        setResult(data.result);
++        setJob(null);
++        notify('Loaded cached transcript for saved file', 'success');
++      } else {
++        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
++        notify('Whisper transcription of saved file started', 'success');
++      }
++    } catch (libraryError) {
++      setError(safeFetchError(libraryError, 'Unable to start Whisper transcription for this file.'));
++    } finally {
++      setIsLibraryStarting(false);
++    }
++  };
++
++  const handleOpenDownloadsFolder = async () => {
++    try {
++      await api.post('/open-downloads-folder');
++      notify('Downloads folder opened in File Explorer', 'info');
++    } catch (folderError) {
++      setError(safeFetchError(folderError, 'Unable to open downloads folder.'));
++    }
++  };
++
+   const handleCopy = async () => {
+     if (!transcriptText) return;
+     try {
+@@ -1356,6 +1556,65 @@ function WhisperTranscriptionPage({ onNotify }) {
+           </div>
+         </form>
+ 
++        <div className="whisper-upload-divider"><span>or</span></div>
++
++        <form onSubmit={handleLibrarySubmit} className="download-form whisper-upload-form">
++          <div className="field field--full">
++            <div className="whisper-picker-header">
++              <label className="field__label" htmlFor="whisper-library-file">TRANSCRIBE SAVED FILE (FROM PLAYLIST / LIBRARY)</label>
++              <button
++                className="ghost-button ghost-button--small"
++                type="button"
++                onClick={handleOpenDownloadsFolder}
++                title="Open the downloads folder in File Explorer"
++              >
++                <FolderOpen size={14} />
++                Open downloads folder
++              </button>
++            </div>
++            {libraryFiles.length > 0 ? (
++              <>
++                <LibraryPicker
++                  files={libraryFiles}
++                  value={selectedLibraryFilename}
++                  onSelect={(filename) => {
++                    setSelectedLibraryFilename(filename);
++                    setError('');
++                  }}
++                />
++                <p className="field__help field__help--inline">
++                  Click a file to select it — same files as in your Library/Playlists (stored in the backend downloads folder).
++                  Whisper transcribes it directly from disk, no upload needed.
++                </p>
++              </>
++            ) : (
++              <p className="field__help field__help--inline">
++                Your library is empty — download or save some videos first, then you can transcribe them right here.
++              </p>
++            )}
++          </div>
++
++          <div className="transcript-actions">
++            <button
++              className="primary-button"
++              type="submit"
++              disabled={isLibraryStarting || isActive || !selectedLibraryFilename}
++            >
++              {isLibraryStarting || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
++              {isLibraryStarting ? 'Starting...' : isActive ? 'Transcribing...' : selectedLibraryFilename ? 'Transcribe Selected File' : 'Select a File Above'}
++            </button>
++            <button
++              className="ghost-button"
++              type="button"
++              onClick={() => setSelectedLibraryFilename('')}
++              disabled={!selectedLibraryFilename || isLibraryStarting || isActive}
++            >
++              <X size={16} />
++              Clear Selection
++            </button>
++          </div>
++        </form>
++
+         {job ? (
+           <div className="whisper-job-card">
+             <div className="download-card__title-row">
+@@ -1481,7 +1740,33 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+   const [previewPlaybackRate, setPreviewPlaybackRate] = useState(1);
+   const [transcriptButtonLabel, setTranscriptButtonLabel] = useState('Get Transcript');
+   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
++  const [selectionMode, setSelectionMode] = useState(false);
++  const [selectedFiles, setSelectedFiles] = useState(() => new Set());
+   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
++
++  const toggleSelectionMode = useCallback(() => {
++    setSelectionMode((current) => {
++      if (current) setSelectedFiles(new Set());
++      return !current;
++    });
++  }, []);
++
++  const toggleSelectFile = useCallback((filename) => {
++    setSelectedFiles((current) => {
++      const next = new Set(current);
++      if (next.has(filename)) next.delete(filename);
++      else next.add(filename);
++      return next;
++    });
++  }, []);
++
++  const addSelectedToPlaylist = useCallback(() => {
++    if (selectedFiles.size === 0) return;
++    const list = [...selectedFiles];
++    setSelectedFiles(new Set());
++    setSelectionMode(false);
++    onAddToPlaylist?.(list);
++  }, [selectedFiles, onAddToPlaylist]);
+   const videoRef = useRef(null);
+ 
+   const releasePreviewPlayers = useCallback(async () => {
+@@ -1710,6 +1995,35 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+             placeholder="Search files..."
+           />
+         </div>
++        <div className="toolbar-actions">
++          {selectionMode ? (
++            <>
++              <button
++                className="ghost-button"
++                type="button"
++                onClick={() => setSelectedFiles(new Set(mediaFiles.map((file) => file.filename)))}
++                disabled={mediaFiles.length === 0}
++              >
++                Select all
++              </button>
++              <button className="ghost-button" type="button" onClick={() => setSelectedFiles(new Set())} disabled={selectedFiles.size === 0}>
++                Clear
++              </button>
++            </>
++          ) : null}
++          {mediaFiles.length > 0 ? (
++            <button className={`ghost-button ${selectionMode ? 'ghost-button--active' : ''}`} type="button" onClick={toggleSelectionMode}>
++              {selectionMode ? <X size={16} /> : <CheckSquare size={16} />}
++              {selectionMode ? 'Cancel select' : 'Select'}
++            </button>
++          ) : null}
++          {selectionMode && selectedFiles.size > 0 ? (
++            <button className="primary-button" type="button" onClick={addSelectedToPlaylist}>
++              <Plus size={16} />
++              Add {selectedFiles.size} to playlist
++            </button>
++          ) : null}
++        </div>
+       </section>
+ 
+       {previewFile ? (
+@@ -1814,6 +2128,9 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+                 onSelect={setSelectedFile}
+                 onDelete={handleDeleteFile}
+                 onAddToPlaylist={onAddToPlaylist}
++                selectMode={selectionMode}
++                selected={selectedFiles.has(file.filename)}
++                onToggleSelect={toggleSelectFile}
+                 compact
+               />
+             ))}
+@@ -1862,6 +2179,11 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
+           <span>Whisper</span>
+         </NavLink>
+ 
++        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/extract-audio" end>
++          <AudioLines size={18} />
++          <span>Audio Extractor</span>
++        </NavLink>
++
+         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/library" end>
+           <LibraryBig size={18} />
+           <span>Library</span>
+@@ -2201,16 +2523,21 @@ export default function App() {
+     }
+   }, [isUnlocked, pushToast, refreshFiles]);
+ 
+-  const addToPlaylist = useCallback(async (filename) => {
++  const [playlistPickerRequest, setPlaylistPickerRequest] = useState(null);
++
++  // Open the "which playlist?" dialog for one or many files.
++  const openPlaylistPicker = useCallback((filenameOrList) => {
+     if (!isUnlocked) return;
+-    if (!filename) return;
+-    try {
+-      await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
+-      pushToast('Added to playlist', 'success', 2000);
+-    } catch (error) {
+-      pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
+-    }
+-  }, [isUnlocked, pushToast]);
++    const list = Array.isArray(filenameOrList) ? filenameOrList : [filenameOrList];
++    const items = list
++      .filter(Boolean)
++      .map((filename) => {
++        const file = files.find((item) => item.filename === filename);
++        return { filename, title: file?.title || cleanTitle(filename) };
++      });
++    if (items.length === 0) return;
++    setPlaylistPickerRequest({ items });
++  }, [isUnlocked, files]);
+ 
+   const navigate = useNavigate();
+ 
+@@ -2278,9 +2605,10 @@ export default function App() {
+         <Routes>
+           <Route path="/" element={<Navigate to="/about" replace />} />
+           <Route path="/about" element={<AboutPage />} />
+-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
++          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+-          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} />} />
++          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
++          <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+           <Route path="*" element={<Navigate to="/download" replace />} />
+@@ -2313,6 +2641,14 @@ export default function App() {
+       ) : null}
+       <ToastStack toasts={toasts} />
+ 
++      {playlistPickerRequest ? (
++        <PlaylistPicker
++          items={playlistPickerRequest.items}
++          onClose={() => setPlaylistPickerRequest(null)}
++          onAdded={(playlistName) => pushToast(`Added to ${playlistName}`, 'success', 2000)}
++        />
++      ) : null}
++
+       {!authReady || !isUnlocked ? (
+         <AccessGate
+           password={accessPassword}
+diff --git a/frontend/src/components/LibraryPicker.jsx b/frontend/src/components/LibraryPicker.jsx
+new file mode 100644
+index 0000000..588773a
+--- /dev/null
++++ b/frontend/src/components/LibraryPicker.jsx
+@@ -0,0 +1,125 @@
++import { useMemo, useState } from 'react';
++import { Check, FileAudio, FileVideo, Search } from 'lucide-react';
++
++const mediaExt = (filename = '') => filename.split('.').pop()?.toLowerCase() || '';
++const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'ogg', 'flac', 'wav', 'opus', 'aiff', 'aif']);
++
++const cleanTitle = (filename = '') => (
++  filename
++    .replace(/\.[^.]+$/, '')
++    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
++    .trim()
++);
++
++const extractVideoId = (filename = '') => {
++  const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
++  return match ? match[1] : '';
++};
++
++const formatBytes = (bytes = 0) => {
++  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
++  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
++};
++
++function FileThumb({ file }) {
++  const title = file.title || cleanTitle(file.filename || '');
++  const videoId = file.video_id || extractVideoId(file.filename || '');
++
++  if (videoId) {
++    return (
++      <img
++        className="library-picker__thumb"
++        src={`https://img.youtube.com/vi/${videoId}/mqdefault.jpg`}
++        alt={title}
++        loading="lazy"
++        onError={(event) => {
++          event.currentTarget.style.display = 'none';
++        }}
++      />
++    );
++  }
++
++  const ext = mediaExt(file.filename || '');
++  const isAudio = AUDIO_EXTS.has(ext);
++  return (
++    <div className="library-picker__thumb library-picker__thumb--fallback" aria-hidden="true">
++      {isAudio ? <FileAudio size={22} /> : <FileVideo size={22} />}
++      <span>{ext.toUpperCase() || 'FILE'}</span>
++    </div>
++  );
++}
++
++/**
++ * Visual file browser for choosing a saved file (e.g. in Whisper).
++ * Shows thumbnails + titles from the backend downloads folder instead of
++ * a text-only dropdown.
++ */
++export default function LibraryPicker({
++  files = [],
++  value = '',
++  onSelect,
++  searchPlaceholder = 'Search saved files...',
++}) {
++  const [query, setQuery] = useState('');
++
++  const filtered = useMemo(() => {
++    const needle = query.trim().toLowerCase();
++    if (!needle) return files;
++    return files.filter((file) => {
++      const title = (file.title || cleanTitle(file.filename || '')).toLowerCase();
++      const filename = (file.filename || '').toLowerCase();
++      return title.includes(needle) || filename.includes(needle);
++    });
++  }, [files, query]);
++
++  return (
++    <div className="library-picker">
++      <div className="library-picker__search">
++        <Search size={15} className="library-picker__search-icon" />
++        <input
++          className="input input--search"
++          value={query}
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder={searchPlaceholder}
++        />
++      </div>
++
++      {filtered.length === 0 ? (
++        <div className="library-picker__empty">
++          {files.length === 0
++            ? 'No saved files yet. Download some videos first, then you can transcribe them here.'
++            : 'No files match your search.'}
++        </div>
++      ) : (
++        <div className="library-picker__grid">
++          {filtered.map((file) => {
++            const selected = file.filename === value;
++            return (
++              <button
++                key={file.filename}
++                type="button"
++                className={`library-picker__card ${selected ? 'library-picker__card--selected' : ''}`}
++                onClick={() => onSelect?.(file.filename)}
++                title={file.filename}
++              >
++                <FileThumb file={file} />
++                <span className="library-picker__card-check" aria-hidden="true">
++                  {selected ? <Check size={12} /> : null}
++                </span>
++                <span className="library-picker__card-title">
++                  {file.title || cleanTitle(file.filename)}
++                </span>
++                <span className="library-picker__card-meta">
++                  {mediaExt(file.filename).toUpperCase()} · {formatBytes(file.size)}
++                </span>
++              </button>
++            );
++          })}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/frontend/src/components/PlaylistPicker.jsx b/frontend/src/components/PlaylistPicker.jsx
+new file mode 100644
+index 0000000..16196a1
+--- /dev/null
++++ b/frontend/src/components/PlaylistPicker.jsx
+@@ -0,0 +1,204 @@
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { Loader2, Plus, X } from 'lucide-react';
++import { api } from '../lib/api';
++
++/**
++ * Modal shown when the user wants to add file(s) to a playlist.
++ * Lets them pick an existing playlist or type a name to create a new one,
++ * exactly like YouTube's "Save to playlist" dialog.
++ *
++ * Props:
++ *  - items: [{ filename, title }]  — one or many files to add
++ */
++export default function PlaylistPicker({ items = [], onClose, onAdded }) {
++  const filenames = items.map((item) => item.filename).filter(Boolean);
++  const single = filenames.length === 1;
++  const displayName = single
++    ? (items[0]?.title || items[0]?.filename || 'this item')
++    : `${filenames.length} items selected`;
++
++  const [playlists, setPlaylists] = useState([]);
++  const [loading, setLoading] = useState(true);
++  const [submitting, setSubmitting] = useState(false);
++  const [selectedId, setSelectedId] = useState(null);
++  const [mode, setMode] = useState('existing'); // 'existing' | 'new'
++  const [newName, setNewName] = useState('');
++  const [error, setError] = useState('');
++  const newNameRef = useRef(null);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError('');
++    try {
++      const response = await api.get('/playlists');
++      const list = Array.isArray(response.data?.playlists) ? response.data.playlists : [];
++      setPlaylists(list);
++      setSelectedId((current) => (
++        current !== null && list.some((playlist) => playlist.id === current)
++          ? current
++          : (list[0]?.id ?? null)
++      ));
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to load playlists');
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
++    load();
++  }, [load]);
++
++  useEffect(() => {
++    if (mode === 'new') newNameRef.current?.focus();
++  }, [mode]);
++
++  const submit = async () => {
++    if (submitting || filenames.length === 0) return;
++    setError('');
++    let targetId;
++    let targetName;
++
++    if (mode === 'new') {
++      const name = newName.trim();
++      if (!name) {
++        setError('Enter a name for the new playlist');
++        newNameRef.current?.focus();
++        return;
++      }
++      setSubmitting(true);
++      try {
++        const created = await api.post('/playlists', { name });
++        targetId = created.data?.playlist?.id;
++        targetName = created.data?.playlist?.name || name;
++      } catch (err) {
++        setError(err?.response?.data?.detail || 'Unable to create playlist');
++        setSubmitting(false);
++        return;
++      }
++    } else {
++      targetId = selectedId;
++      targetName = playlists.find((playlist) => playlist.id === selectedId)?.name || '';
++    }
++
++    if (!targetId) {
++      setError('Choose a playlist first');
++      setSubmitting(false);
++      return;
++    }
++
++    try {
++      if (single) {
++        await api.post(`/playlists/${targetId}/items`, { filename: filenames[0] });
++      } else {
++        await api.post(`/playlists/${targetId}/items/batch`, { filenames });
++      }
++      onAdded?.(targetName);
++      onClose?.();
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to add item to playlist');
++      setSubmitting(false);
++    }
++  };
++
++  return (
++    <div
++      className="modal-overlay"
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="playlist-picker-title"
++      onClick={(event) => {
++        if (event.target === event.currentTarget) onClose?.();
++      }}
++    >
++      <div className="modal-card">
++        <div className="modal-card__header">
++          <h2 id="playlist-picker-title">Add to playlist</h2>
++          <button className="icon-button" type="button" onClick={onClose} title="Close" aria-label="Close">
++            <X size={16} />
++          </button>
++        </div>
++        <p className="modal-card__subtitle" title={displayName}>
++          {single ? displayName : `${displayName} — choose a playlist or create one`}
++        </p>
++
++        {loading ? (
++          <div className="modal-card__body modal-card__body--center">
++            <Loader2 size={18} className="spin" /> Loading playlists…
++          </div>
++        ) : (
++          <div className="modal-card__body">
++            <div className="playlist-pick-list">
++              {playlists.length === 0 ? (
++                <p className="playlist-pick-empty">No playlists yet — create the first one below.</p>
++              ) : (
++                playlists.map((playlist) => (
++                  <label
++                    key={playlist.id}
++                    className={`playlist-pick-row ${mode === 'existing' && selectedId === playlist.id ? 'playlist-pick-row--selected' : ''}`}
++                  >
++                    <input
++                      type="radio"
++                      name="playlist-target"
++                      checked={mode === 'existing' && selectedId === playlist.id}
++                      onChange={() => {
++                        setMode('existing');
++                        setSelectedId(playlist.id);
++                      }}
++                    />
++                    <span className="playlist-pick-row__name">{playlist.name}</span>
++                    <span className="playlist-pick-row__count">
++                      {playlist.item_count} item{playlist.item_count === 1 ? '' : 's'}
++                    </span>
++                  </label>
++                ))
++              )}
++            </div>
++
++            <div className="playlist-pick-new">
++              <button
++                type="button"
++                className={`playlist-pick-new__toggle ${mode === 'new' ? 'playlist-pick-new__toggle--active' : ''}`}
++                onClick={() => setMode(mode === 'new' ? 'existing' : 'new')}
++              >
++                <Plus size={14} />
++                {mode === 'new' ? 'Pick an existing playlist instead' : 'Create a new playlist…'}
++              </button>
++              {mode === 'new' ? (
++                <input
++                  ref={newNameRef}
++                  className="input"
++                  type="text"
++                  value={newName}
++                  onChange={(event) => setNewName(event.target.value)}
++                  onKeyDown={(event) => {
++                    if (event.key === 'Enter') submit();
++                  }}
++                  placeholder="New playlist name"
++                  maxLength={120}
++                />
++              ) : null}
++            </div>
++
++            {error ? <div className="form-error">{error}</div> : null}
++          </div>
++        )}
++
++        <div className="modal-card__footer">
++          <button className="ghost-button" type="button" onClick={onClose} disabled={submitting}>
++            Cancel
++          </button>
++          <button className="primary-button" type="button" onClick={submit} disabled={submitting || loading || filenames.length === 0}>
++            {submitting ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
++            {submitting
++              ? 'Adding…'
++              : single
++                ? 'Add'
++                : `Add ${filenames.length} items`}
++          </button>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/AudioExtractor.jsx b/frontend/src/pages/AudioExtractor.jsx
+new file mode 100644
+index 0000000..b6abe5c
+--- /dev/null
++++ b/frontend/src/pages/AudioExtractor.jsx
+@@ -0,0 +1,293 @@
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { AudioLines, CheckCircle2, Download, Loader2, Music, RefreshCw } from 'lucide-react';
++import { API_BASE, api } from '../lib/api';
++import LibraryPicker from '../components/LibraryPicker';
++
++const VIDEO_EXTS = new Set(['mp4', 'webm', 'mkv', 'mov', 'avi', 'm4v']);
++const LOSSLESS_FORMATS = new Set(['wav', 'flac', 'aiff']);
++
++const FORMATS = [
++  { value: 'mp3', label: 'MP3' },
++  { value: 'm4a', label: 'M4A (AAC)' },
++  { value: 'aac', label: 'AAC' },
++  { value: 'ogg', label: 'OGG (Vorbis)' },
++  { value: 'opus', label: 'OPUS' },
++  { value: 'wav', label: 'WAV (lossless)' },
++  { value: 'flac', label: 'FLAC (lossless)' },
++  { value: 'aiff', label: 'AIFF (lossless)' },
++];
++
++const BITRATES = [
++  { value: '96k', label: '96 kbps' },
++  { value: '128k', label: '128 kbps' },
++  { value: '192k', label: '192 kbps' },
++  { value: '256k', label: '256 kbps' },
++  { value: '320k', label: '320 kbps' },
++];
++
++const formatDuration = (seconds = 0) => {
++  const safe = Math.max(0, Math.floor(Number(seconds) || 0));
++  const m = Math.floor(safe / 60);
++  const s = safe % 60;
++  return m > 0 ? `${m}m ${s}s` : `${s}s`;
++};
++
++const formatBytes = (bytes = 0) => {
++  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
++  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
++};
++
++export default function AudioExtractorPage({ files = [], onNotify }) {
++  const videos = useMemo(
++    () => (files || []).filter((file) => VIDEO_EXTS.has((file.ext || '').toLowerCase() || String(file.filename).split('.').pop()?.toLowerCase())),
++    [files],
++  );
++  const [selectedFilename, setSelectedFilename] = useState('');
++  const [format, setFormat] = useState('mp3');
++  const [bitrate, setBitrate] = useState('192k');
++  const [job, setJob] = useState(null);
++  const [isStarting, setIsStarting] = useState(false);
++  const [error, setError] = useState('');
++  const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
++  const timerRef = useRef(null);
++
++  const isActive = job && ['queued', 'extracting'].includes(job.status);
++  const elapsed = job
++    ? Math.max(0, Math.floor(nowSeconds - (job.started_at || job.created_at || nowSeconds)))
++    : 0;
++  const lossless = LOSSLESS_FORMATS.has(format);
++
++  const notify = useCallback((message, type = 'info') => {
++    if (onNotify) onNotify(message, type);
++  }, [onNotify]);
++
++  // Refresh the picker list when the job completes (new file appears in library).
++  useEffect(() => {
++    if (job?.status === 'completed') notify('Audio extracted and saved to your Library', 'success');
++  }, [job?.status, notify]);
++
++  useEffect(() => {
++    if (!isActive) {
++      window.clearInterval(timerRef.current);
++      return undefined;
++    }
++    timerRef.current = window.setInterval(() => setNowSeconds(Date.now() / 1000), 1000);
++    return () => window.clearInterval(timerRef.current);
++  }, [isActive]);
++
++  useEffect(() => {
++    if (!job?.job_id || !isActive) return undefined;
++    let cancelled = false;
++    const poll = async () => {
++      try {
++        const response = await api.get(`/extract-audio/${encodeURIComponent(job.job_id)}`);
++        if (cancelled) return;
++        setJob(response.data || null);
++      } catch (pollError) {
++        if (!cancelled) setError(pollError?.response?.data?.detail || 'Unable to check extraction status');
++      }
++    };
++    poll();
++    const timer = window.setInterval(poll, 800);
++    return () => {
++      cancelled = true;
++      window.clearInterval(timer);
++    };
++  }, [job?.job_id, isActive]);
++
++  const startExtraction = async (event) => {
++    event.preventDefault();
++    if (!selectedFilename || isStarting || isActive) return;
++    setIsStarting(true);
++    setError('');
++    setJob(null);
++    setNowSeconds(Date.now() / 1000);
++    try {
++      const response = await api.post('/extract-audio', {
++        filename: selectedFilename,
++        format,
++        bitrate: lossless ? '192k' : bitrate,
++      });
++      const data = response.data || {};
++      setJob({ ...data, created_at: Date.now() / 1000 });
++      notify('Audio extraction started', 'success');
++    } catch (startError) {
++      setError(startError?.response?.data?.detail || 'Unable to start audio extraction');
++    } finally {
++      setIsStarting(false);
++    }
++  };
++
++  return (
++    <div className="page-shell">
++      <div className="page-header">
++        <div>
++          <h1 className="page-title">Audio Extractor</h1>
++          <p className="page-subtitle">
++            Pick any saved video and convert it to audio (MP3, M4A, FLAC, WAV and more).
++            The result is saved straight to your Library.
++          </p>
++        </div>
++      </div>
++
++      <section className="panel panel--form">
++        <div className="form-grid">
++          <div className="field field--full">
++            <label className="field__label" htmlFor="extract-video">SELECT A VIDEO FROM LIBRARY</label>
++            {videos.length > 0 ? (
++              <>
++                <LibraryPicker
++                  files={videos}
++                  value={selectedFilename}
++                  onSelect={(filename) => {
++                    setSelectedFilename(filename);
++                    setError('');
++                  }}
++                  searchPlaceholder="Search videos..."
++                />
++                <p className="field__help field__help--inline">
++                  Click a video to select it. {videos.length} video{videos.length === 1 ? '' : 's'} in your library.
++                </p>
++              </>
++            ) : (
++              <p className="field__help field__help--inline">
++                No videos in your library yet. Download some first, then come back to convert them to audio.
++              </p>
++            )}
++          </div>
++
++          <div className="field">
++            <label className="field__label" htmlFor="extract-format">AUDIO FORMAT</label>
++            <select
++              id="extract-format"
++              className="select"
++              value={format}
++              onChange={(event) => setFormat(event.target.value)}
++              disabled={isStarting || isActive}
++            >
++              {FORMATS.map((option) => (
++                <option key={option.value} value={option.value}>{option.label}</option>
++              ))}
++            </select>
++          </div>
++
++          <div className="field">
++            <label className="field__label" htmlFor="extract-bitrate">BITRATE {lossless ? '(lossless — ignored)' : ''}</label>
++            <select
++              id="extract-bitrate"
++              className="select"
++              value={bitrate}
++              onChange={(event) => setBitrate(event.target.value)}
++              disabled={isStarting || isActive || lossless}
++            >
++              {BITRATES.map((option) => (
++                <option key={option.value} value={option.value}>{option.label}</option>
++              ))}
++            </select>
++          </div>
++        </div>
++
++        {error ? <p className="download-card__error">{error}</p> : null}
++
++        <button
++          className="primary-button"
++          type="button"
++          onClick={startExtraction}
++          disabled={!selectedFilename || isStarting || isActive}
++        >
++          {isStarting || isActive ? <Loader2 size={16} className="spin" /> : <AudioLines size={16} />}
++          {isStarting ? 'Starting...'
++            : isActive ? `Extracting... ${Math.round(job?.progress || 0)}%`
++              : selectedFilename ? 'Extract Audio' : 'Select a video first'}
++        </button>
++      </section>
++
++      {job ? (
++        <section className="panel panel--list audio-extractor-job">
++          <div className="panel__header">
++            <div>
++              <h2 className="panel__title">
++                {job.status === 'completed' ? 'Extraction complete' : job.status === 'error' ? 'Extraction failed' : 'Extracting audio'}
++              </h2>
++              <p className="panel__subtitle">
++                {job.source ? cleanSourceName(job.source) : ''} → <strong>{job.format?.toUpperCase()}</strong>
++              </p>
++            </div>
++            <span className={`status-pill ${
++              job.status === 'completed' ? 'status-pill--completed'
++                : job.status === 'error' ? 'status-pill--error'
++                  : 'status-pill--processing'
++            }`}>
++              {job.status}
++            </span>
++          </div>
++
++          {job.status === 'error' ? (
++            <p className="download-card__error">{job.error || job.message}</p>
++          ) : null}
++
++          {isActive ? (
++            <div className="whisper-job-card">
++              <div className="download-card__title-row">
++                <div>
++                  <h3 className="download-card__title">{job.message || 'Extracting audio...'}</h3>
++                  <p className="download-card__meta">
++                    {job.source_duration ? `Source ${formatDuration(job.source_duration)} · ` : ''}Elapsed {formatDuration(elapsed)}
++                  </p>
++                </div>
++              </div>
++              <div className="progress-track">
++                <div className="progress-fill" style={{ width: `${Math.min(100, Math.max(0, job.progress || 0))}%` }} />
++              </div>
++              <div className="whisper-job-stats">
++                <span>{Math.min(100, Math.max(0, job.progress || 0)).toFixed(0)}%</span>
++                <span>ffmpeg is running — this usually takes a few seconds to a minute</span>
++              </div>
++            </div>
++          ) : null}
++
++          {job.status === 'completed' && job.filename ? (
++            <div className="audio-extractor-result">
++              <CheckCircle2 size={22} />
++              <div>
++                <h3 className="panel__title panel__title--tight">{job.filename}</h3>
++                <p className="panel__subtitle">
++                  {formatBytes(job.size_bytes)} · saved to your Library · done in {formatDuration(job.elapsed_seconds)}
++                </p>
++              </div>
++              <a className="primary-button" href={`${API_BASE}/files/download/${encodeURIComponent(job.filename)}`} download>
++                <Download size={16} /> Download
++              </a>
++              <button
++                className="ghost-button"
++                type="button"
++                onClick={() => { setJob(null); setSelectedFilename(''); }}
++              >
++                <RefreshCw size={16} /> Extract another
++              </button>
++            </div>
++          ) : null}
++        </section>
++      ) : null}
++
++      {!job && videos.length === 0 ? (
++        <section className="panel panel--list">
++          <div className="empty-state">
++            <Music size={28} />
++            <p>Download videos first, then convert them to audio here.</p>
++          </div>
++        </section>
++      ) : null}
++    </div>
++  );
++}
++
++function cleanSourceName(filename = '') {
++  return String(filename)
++    .replace(/\.[^.]+$/, '')
++    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
++    .trim() || filename;
++}
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index b1a56e7..dd18fff 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -1,5 +1,5 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+-import { Download, Pause, Play, Shuffle, Trash2 } from 'lucide-react';
++import { Download, Edit3, Loader2, Pause, Play, Plus, RefreshCw, Search, Shuffle, Trash2, X } from 'lucide-react';
+ import { API_BASE, api } from '../lib/api';
+ 
+ const cleanTitle = (filename = '') => (
+@@ -127,8 +127,24 @@ function PlaylistThumb({ file }) {
+ }
+ 
+ export default function PlaylistPage({ files = [], onNotify }) {
+-  const [playlist, setPlaylist] = useState([]);
+-  const [selectedFilename, setSelectedFilename] = useState('');
++  // Multi-playlist state
++  const [playlists, setPlaylists] = useState([]);                 // [{ id, name, created_at, item_count }]
++  const [activePlaylistId, setActivePlaylistId] = useState(null);
++  const [playlist, setPlaylist] = useState([]);                   // filenames of the active playlist
++  const [isCreating, setIsCreating] = useState(false);            // inline "create playlist" form
++  const [newPlaylistName, setNewPlaylistName] = useState('');
++  const [isRenaming, setIsRenaming] = useState(false);            // inline "rename playlist" form
++  const [renameValue, setRenameValue] = useState('');
++  const [confirmDeleteId, setConfirmDeleteId] = useState(null);   // two-step delete guard
++
++  // Add-from-library state (multi-select)
++  const [selectedFilenames, setSelectedFilenames] = useState([]);
++  const [libraryQuery, setLibraryQuery] = useState('');
++  const [addTarget, setAddTarget] = useState('current');          // 'current' | playlist-id | 'new'
++  const [addNewName, setAddNewName] = useState('');
++  const [isAdding, setIsAdding] = useState(false);
++
++  // Player state
+   const [currentIndex, setCurrentIndex] = useState(0);
+   const [isPlaying, setIsPlaying] = useState(false);
+   const [playbackRate, setPlaybackRate] = useState(1);
+@@ -138,6 +154,8 @@ export default function PlaylistPage({ files = [], onNotify }) {
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const playerRef = useRef(null);
+ 
++  const activePlaylist = playlists.find((item) => item.id === activePlaylistId) || null;
++
+   const fileMap = useMemo(() => new Map(files.map((file) => [file.filename, file])), [files]);
+   const playlistFiles = useMemo(
+     () => playlist.map((filename) => fileMap.get(filename) || { filename, title: cleanTitle(filename), missing: true }),
+@@ -147,6 +165,15 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     () => files.filter((file) => !playlist.includes(file.filename)),
+     [files, playlist],
+   );
++  const filteredAvailable = useMemo(() => {
++    const needle = libraryQuery.trim().toLowerCase();
++    if (!needle) return availableFiles;
++    return availableFiles.filter((file) => {
++      const title = (file.title || cleanTitle(file.filename || '')).toLowerCase();
++      const filename = (file.filename || '').toLowerCase();
++      return title.includes(needle) || filename.includes(needle);
++    });
++  }, [availableFiles, libraryQuery]);
+   const currentFile = playlistFiles[currentIndex] || null;
+   const currentUrl = currentFile?.filename
+     ? `${API_BASE}/${isAudio(currentFile.filename) || !useCompatiblePlayback ? 'stream' : 'stream-compatible'}/${encodeURIComponent(currentFile.filename)}`
+@@ -156,27 +183,59 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     if (onNotify) onNotify(message, type);
+   }, [onNotify]);
+ 
+-  const refreshPlaylist = useCallback(async () => {
++  const loadPlaylists = useCallback(async () => {
++    try {
++      const response = await api.get('/playlists');
++      const list = Array.isArray(response.data?.playlists) ? response.data.playlists : [];
++      setPlaylists(list);
++      setActivePlaylistId((current) => (
++        current !== null && list.some((playlist) => playlist.id === current)
++          ? current
++          : (list[0]?.id ?? null)
++      ));
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to load playlists', 'error');
++    }
++  }, [notify]);
++
++  const loadItems = useCallback(async (playlistId) => {
+     setIsLoading(true);
+     try {
+-      const response = await api.get('/playlist');
++      const response = await api.get(`/playlists/${playlistId}/items`);
+       setPlaylist(Array.isArray(response.data) ? response.data : []);
+     } catch (error) {
+-      notify(error?.response?.data?.detail || 'Unable to load playlist', 'error');
++      notify(error?.response?.data?.detail || 'Unable to load playlist items', 'error');
+     } finally {
+       setIsLoading(false);
+     }
+   }, [notify]);
+ 
+   useEffect(() => {
+-    refreshPlaylist();
+-  }, [refreshPlaylist]);
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
++    loadPlaylists();
++  }, [loadPlaylists]);
+ 
+   useEffect(() => {
++    if (activePlaylistId) {
++      // eslint-disable-next-line react-hooks/set-state-in-effect -- load items for the newly active playlist
++      loadItems(activePlaylistId);
++    } else {
++      setPlaylist([]);
++    }
++  }, [activePlaylistId, loadItems]);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- when no playlists remain, force the "new" target
++    if (playlists.length === 0) setAddTarget('new');
++  }, [playlists.length]);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset player on file change
+     setUseCompatiblePlayback(false);
+   }, [currentFile?.filename]);
+ 
+   useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset transcript state on file change
+     setTranscriptStatus('Get Transcript');
+     setTranscriptLoading(false);
+   }, [currentFile?.filename]);
+@@ -189,59 +248,191 @@ export default function PlaylistPage({ files = [], onNotify }) {
+ 
+   useEffect(() => {
+     if (currentIndex >= playlistFiles.length) {
++      // eslint-disable-next-line react-hooks/set-state-in-effect -- clamp index when list shrinks
+       setCurrentIndex(Math.max(0, playlistFiles.length - 1));
+     }
+   }, [currentIndex, playlistFiles.length]);
+ 
+-  const saveOrder = async (nextOrder) => {
+-    setPlaylist(nextOrder);
++  // --- Playlist management ------------------------------------------------
++  const createPlaylist = async (name) => {
++    const clean = name.trim();
++    if (!clean) {
++      notify('Enter a playlist name', 'error');
++      return;
++    }
+     try {
+-      const response = await api.post('/playlist/reorder', nextOrder);
+-      setPlaylist(Array.isArray(response.data) ? response.data : nextOrder);
++      const response = await api.post('/playlists', { name: clean });
++      const created = response.data?.playlist;
++      await loadPlaylists();
++      if (created?.id) setActivePlaylistId(created.id);
++      setIsCreating(false);
++      setNewPlaylistName('');
++      notify(`Playlist "${clean}" created`, 'success');
+     } catch (error) {
+-      notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
+-      refreshPlaylist();
++      notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
+     }
+   };
+ 
+-  const sortPlaylist = (direction) => {
+-    if (playlist.length < 2) return;
+-    const next = [...playlist].sort((left, right) => {
+-      const leftTitle = fileMap.get(left)?.title || cleanTitle(left);
+-      const rightTitle = fileMap.get(right)?.title || cleanTitle(right);
+-      return naturalCompare(leftTitle, rightTitle);
+-    });
++  const renamePlaylist = async (playlistId, name) => {
++    const clean = name.trim();
++    if (!clean) {
++      notify('Enter a playlist name', 'error');
++      return;
++    }
++    try {
++      await api.patch(`/playlists/${playlistId}`, { name: clean });
++      await loadPlaylists();
++      setIsRenaming(false);
++      setRenameValue('');
++      notify('Playlist renamed', 'success');
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to rename playlist', 'error');
++    }
++  };
+ 
+-    if (direction === 'desc') {
+-      next.reverse();
++  const deletePlaylist = async (playlistId) => {
++    try {
++      await api.delete(`/playlists/${playlistId}`);
++      setConfirmDeleteId(null);
++      if (activePlaylistId === playlistId) {
++        setPlaylist([]);
++        setCurrentIndex(0);
++      }
++      await loadPlaylists();
++      notify('Playlist deleted', 'info');
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to delete playlist', 'error');
+     }
++  };
+ 
+-    setCurrentIndex(0);
+-    saveOrder(next);
++  const handleDeleteClick = (playlist) => {
++    if (confirmDeleteId === playlist.id) {
++      deletePlaylist(playlist.id);
++    } else {
++      setConfirmDeleteId(playlist.id);
++      notify(`Click delete again to confirm removing "${playlist.name}"`, 'info');
++    }
++  };
++
++  const refreshAll = useCallback(async () => {
++    await loadPlaylists();
++    if (activePlaylistId) await loadItems(activePlaylistId);
++  }, [loadPlaylists, loadItems, activePlaylistId]);
++
++  // --- Adding items (multi-select, one click) -----------------------------
++  const toggleSelectFile = (filename) => {
++    setSelectedFilenames((current) => (
++      current.includes(filename)
++        ? current.filter((item) => item !== filename)
++        : [...current, filename]
++    ));
+   };
+ 
++  const selectAllFiltered = () => {
++    setSelectedFilenames(filteredAvailable.map((file) => file.filename));
++  };
++
++  const clearSelection = () => setSelectedFilenames([]);
++
+   const addSelected = async () => {
+-    if (!selectedFilename) return;
++    const count = selectedFilenames.length;
++    if (count === 0 || isAdding) return;
++    setIsAdding(true);
++
++    let targetId;
++    let targetName;
++
++    if (addTarget === 'current') {
++      targetId = activePlaylistId;
++      targetName = activePlaylist?.name || '';
++    } else if (addTarget === 'new') {
++      const clean = addNewName.trim();
++      if (!clean) {
++        notify('Enter a name for the new playlist', 'error');
++        setIsAdding(false);
++        return;
++      }
++      try {
++        const created = await api.post('/playlists', { name: clean });
++        targetId = created.data?.playlist?.id;
++        targetName = created.data?.playlist?.name || clean;
++      } catch (error) {
++        notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
++        setIsAdding(false);
++        return;
++      }
++    } else {
++      targetId = Number(addTarget);
++      targetName = playlists.find((playlist) => playlist.id === targetId)?.name || 'playlist';
++    }
++
++    if (!targetId) {
++      notify('Choose a playlist to add to', 'error');
++      setIsAdding(false);
++      return;
++    }
++
+     try {
+-      const response = await api.post(`/playlist/add/${encodeURIComponent(selectedFilename)}`);
+-      setPlaylist(Array.isArray(response.data) ? response.data : [...playlist, selectedFilename]);
+-      setSelectedFilename('');
+-      notify('Added to playlist', 'success');
++      await api.post(`/playlists/${targetId}/items/batch`, { filenames: selectedFilenames });
++      clearSelection();
++      if (addTarget === 'new') {
++        setAddTarget('current');
++        setAddNewName('');
++        setActivePlaylistId(targetId);
++      }
++      await loadPlaylists();
++      // Only refresh the visible queue when the target is the active playlist.
++      // (A brand-new playlist is activated above, which triggers its own load.)
++      if (activePlaylistId === targetId) await loadItems(activePlaylistId);
++      notify(`Added ${count} item${count === 1 ? '' : 's'} to "${targetName}"`, 'success');
+     } catch (error) {
+-      notify(error?.response?.data?.detail || 'Unable to add item', 'error');
++      notify(error?.response?.data?.detail || 'Unable to add items', 'error');
++    } finally {
++      setIsAdding(false);
+     }
+   };
+ 
+   const removeItem = async (filename) => {
++    if (!activePlaylistId) return;
+     try {
+-      const response = await api.delete(`/playlist/remove/${encodeURIComponent(filename)}`);
++      const response = await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
+       setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
++      await loadPlaylists();
+       notify('Removed from playlist', 'info');
+     } catch (error) {
+       notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
+     }
+   };
+ 
++  // --- Ordering -----------------------------------------------------------
++  const saveOrder = async (nextOrder) => {
++    if (!activePlaylistId) return;
++    setPlaylist(nextOrder);
++    try {
++      const response = await api.post(`/playlists/${activePlaylistId}/reorder`, nextOrder);
++      setPlaylist(Array.isArray(response.data) ? response.data : nextOrder);
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
++      loadItems(activePlaylistId);
++    }
++  };
++
++  const sortPlaylist = (direction) => {
++    if (playlist.length < 2) return;
++    const next = [...playlist].sort((left, right) => {
++      const leftTitle = fileMap.get(left)?.title || cleanTitle(left);
++      const rightTitle = fileMap.get(right)?.title || cleanTitle(right);
++      return naturalCompare(leftTitle, rightTitle);
++    });
++
++    if (direction === 'desc') {
++      next.reverse();
++    }
++
++    setCurrentIndex(0);
++    saveOrder(next);
++  };
++
+   const moveItem = (index, direction) => {
+     const target = index + direction;
+     if (target < 0 || target >= playlist.length) return;
+@@ -260,6 +451,7 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     saveOrder(next);
+   };
+ 
++  // --- Playback -----------------------------------------------------------
+   const playIndex = (index) => {
+     setCurrentIndex(index);
+     setIsPlaying(true);
+@@ -310,45 +502,260 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     }
+   };
+ 
++  const otherPlaylists = playlists.filter((playlist) => playlist.id !== activePlaylistId);
++
+   return (
+     <div className="page-shell">
+       <div className="page-header">
+         <div>
+-          <h1 className="page-title">Playlist</h1>
+-          <p className="page-subtitle">Build a private queue from your saved library, reorder it, and play continuously.</p>
++          <h1 className="page-title">Playlists</h1>
++          <p className="page-subtitle">Create as many playlists as you like, add your saved library items to any of them, and play continuously.</p>
+         </div>
+         <div className="page-header__actions">
++          <button className="ghost-button" type="button" onClick={refreshAll} title="Refresh playlists">
++            <RefreshCw size={16} /> Refresh
++          </button>
+           <button className="ghost-button" type="button" onClick={() => sortPlaylist('asc')} disabled={playlist.length < 2}>
+             Sort 1-9
+           </button>
+           <button className="ghost-button" type="button" onClick={() => sortPlaylist('desc')} disabled={playlist.length < 2}>
+             Sort 9-1
+           </button>
+-          <button className="ghost-button" type="button" onClick={refreshPlaylist}>Refresh</button>
+           <button className="ghost-button" type="button" onClick={shufflePlaylist} disabled={playlist.length < 2}>
+             <Shuffle size={16} /> Shuffle
+           </button>
+         </div>
+       </div>
+ 
+-      <section className="panel panel--form">
+-        <div className="form-grid">
+-          <div className="field field--full">
+-            <label className="field__label" htmlFor="playlist-add">ADD FROM LIBRARY</label>
+-            <select
+-              id="playlist-add"
+-              className="select"
+-              value={selectedFilename}
+-              onChange={(event) => setSelectedFilename(event.target.value)}
++      {/* Playlist switcher + management */}
++      <section className="panel panel--playlists">
++        <div className="playlist-bar">
++          {playlists.map((playlist) => {
++            const isActive = playlist.id === activePlaylistId;
++            const isConfirming = confirmDeleteId === playlist.id;
++            return (
++              <div key={playlist.id} className={`playlist-chip-wrap ${isActive ? 'playlist-chip-wrap--active' : ''}`}>
++                <button
++                  className="playlist-chip"
++                  type="button"
++                  onClick={() => {
++                    setConfirmDeleteId(null);
++                    setActivePlaylistId(playlist.id);
++                  }}
++                >
++                  <span className="playlist-chip__name">{playlist.name}</span>
++                  <span className="playlist-chip__count">{playlist.item_count}</span>
++                </button>
++                {isActive ? (
++                  <span className="playlist-chip__tools">
++                    <button
++                      className="icon-button"
++                      type="button"
++                      title="Rename playlist"
++                      onClick={(event) => {
++                        event.stopPropagation();
++                        setIsRenaming(true);
++                        setRenameValue(playlist.name);
++                      }}
++                    >
++                      <Edit3 size={13} />
++                    </button>
++                    <button
++                      className={`icon-button ${isConfirming ? 'icon-button--danger playlist-chip__confirm' : 'icon-button--danger'}`}
++                      type="button"
++                      title={isConfirming ? 'Click again to confirm deletion' : 'Delete playlist'}
++                      onClick={(event) => {
++                        event.stopPropagation();
++                        handleDeleteClick(playlist);
++                      }}
++                    >
++                      {isConfirming ? <X size={13} /> : <Trash2 size={13} />}
++                    </button>
++                  </span>
++                ) : null}
++              </div>
++            );
++          })}
++          <button className="playlist-chip playlist-chip--new" type="button" onClick={() => setIsCreating(true)}>
++            <Plus size={14} /> New playlist
++          </button>
++        </div>
++
++        {isCreating ? (
++          <div className="inline-form">
++            <input
++              className="input inline-form__input"
++              type="text"
++              value={newPlaylistName}
++              onChange={(event) => setNewPlaylistName(event.target.value)}
++              onKeyDown={(event) => {
++                if (event.key === 'Enter') createPlaylist(newPlaylistName);
++                if (event.key === 'Escape') {
++                  setIsCreating(false);
++                  setNewPlaylistName('');
++                }
++              }}
++              placeholder="Playlist name"
++              maxLength={120}
++              autoFocus
++            />
++            <button className="primary-button" type="button" onClick={() => createPlaylist(newPlaylistName)}>
++              Create
++            </button>
++            <button
++              className="ghost-button"
++              type="button"
++              onClick={() => {
++                setIsCreating(false);
++                setNewPlaylistName('');
++              }}
+             >
+-              <option value="">Choose a saved file...</option>
+-              {availableFiles.map((file) => (
+-                <option key={file.filename} value={file.filename}>{file.title || cleanTitle(file.filename)}</option>
+-              ))}
+-            </select>
++              Cancel
++            </button>
++          </div>
++        ) : null}
++
++        {isRenaming && activePlaylist ? (
++          <div className="inline-form">
++            <input
++              className="input inline-form__input"
++              type="text"
++              value={renameValue}
++              onChange={(event) => setRenameValue(event.target.value)}
++              onKeyDown={(event) => {
++                if (event.key === 'Enter') renamePlaylist(activePlaylist.id, renameValue);
++                if (event.key === 'Escape') setIsRenaming(false);
++              }}
++              placeholder="New playlist name"
++              maxLength={120}
++              autoFocus
++            />
++            <button className="primary-button" type="button" onClick={() => renamePlaylist(activePlaylist.id, renameValue)}>
++              Rename
++            </button>
++            <button className="ghost-button" type="button" onClick={() => setIsRenaming(false)}>
++              Cancel
++            </button>
+           </div>
++        ) : null}
++      </section>
++
++      {/* Add from library — asks which playlist (existing or brand new) */}
++      <section className="panel panel--form">
++        <div className="form-grid">
++          <div className="field">
++            <label className="field__label" htmlFor="playlist-target">ADD TO WHICH PLAYLIST?</label>
++              <select
++                id="playlist-target"
++                className="select"
++                value={addTarget}
++                onChange={(event) => {
++                  setAddTarget(event.target.value);
++                  setConfirmDeleteId(null);
++                }}
++              >
++                {activePlaylist ? (
++                  <option value="current">Current playlist: {activePlaylist.name}</option>
++                ) : null}
++                {otherPlaylists.map((playlist) => (
++                  <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
++                ))}
++                <option value="new">＋ Create new playlist…</option>
++              </select>
++            </div>
++            {addTarget === 'new' ? (
++              <div className="field">
++                <label className="field__label" htmlFor="playlist-target-name">NEW PLAYLIST NAME</label>
++                <input
++                  id="playlist-target-name"
++                  className="input"
++                  type="text"
++                  value={addNewName}
++                  onChange={(event) => setAddNewName(event.target.value)}
++                  onKeyDown={(event) => {
++                    if (event.key === 'Enter') addSelected();
++                  }}
++                  placeholder="e.g. Workout Mix, Study, Road Trip…"
++                  maxLength={120}
++                  autoFocus
++                />
++              </div>
++            ) : null}
++            <div className="field field--full">
++              <div className="multiselect-header">
++                <label className="field__label" style={{ margin: 0 }}>
++                  SELECT VIDEOS — {selectedFilenames.length} selected
++                </label>
++                <div className="multiselect-header__actions">
++                  <button
++                    className="ghost-button ghost-button--small"
++                    type="button"
++                    onClick={selectAllFiltered}
++                    disabled={filteredAvailable.length === 0}
++                  >
++                    Select all
++                  </button>
++                  <button
++                    className="ghost-button ghost-button--small"
++                    type="button"
++                    onClick={clearSelection}
++                    disabled={selectedFilenames.length === 0}
++                  >
++                    Clear
++                  </button>
++                </div>
++              </div>
++              <div className="multiselect-search">
++                <Search size={15} className="multiselect-search__icon" />
++                <input
++                  className="input input--search"
++                  value={libraryQuery}
++                  onChange={(event) => setLibraryQuery(event.target.value)}
++                  placeholder="Search library..."
++                />
++              </div>
++              <div className="multiselect-list">
++                {filteredAvailable.length === 0 ? (
++                  <div className="empty-state empty-state--compact">
++                    <p>
++                      {libraryQuery.trim()
++                        ? 'No files match your search.'
++                        : 'No files left to add — everything in your library is already in this playlist.'}
++                    </p>
++                  </div>
++                ) : (
++                  filteredAvailable.map((file) => {
++                    const checked = selectedFilenames.includes(file.filename);
++                    return (
++                      <label
++                        key={file.filename}
++                        className={`multiselect-row ${checked ? 'multiselect-row--checked' : ''}`}
++                      >
++                        <input
++                          type="checkbox"
++                          checked={checked}
++                          onChange={() => toggleSelectFile(file.filename)}
++                        />
++                        <PlaylistThumb file={file} />
++                        <span className="multiselect-row__title" title={file.title || cleanTitle(file.filename)}>
++                          {file.title || cleanTitle(file.filename)}
++                        </span>
++                        <span className="multiselect-row__ext">{mediaExt(file.filename).toUpperCase()}</span>
++                      </label>
++                    );
++                  })
++                )}
++              </div>
++            </div>
+         </div>
+-        <button className="primary-button" type="button" onClick={addSelected} disabled={!selectedFilename}>Add to Playlist</button>
++        <button className="primary-button" type="button" onClick={addSelected} disabled={selectedFilenames.length === 0 || isAdding}>
++          {isAdding ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
++          {isAdding
++            ? 'Adding…'
++            : selectedFilenames.length > 0
++              ? `Add ${selectedFilenames.length} item${selectedFilenames.length === 1 ? '' : 's'} to playlist`
++              : 'Select videos to add'}
++        </button>
+       </section>
+ 
+       {currentFile ? (
+@@ -422,16 +829,24 @@ export default function PlaylistPage({ files = [], onNotify }) {
+       <section className="panel panel--list">
+         <div className="panel__header">
+           <div>
+-            <h2 className="panel__title">Queue</h2>
+-            <p className="panel__subtitle">{playlist.length} item{playlist.length === 1 ? '' : 's'} in your playlist.</p>
++            <h2 className="panel__title">{activePlaylist ? activePlaylist.name : 'Queue'}</h2>
++            <p className="panel__subtitle">
++              {activePlaylist
++                ? `${playlist.length} item${playlist.length === 1 ? '' : 's'} in this playlist.`
++                : 'Create a playlist to get started.'}
++            </p>
+           </div>
+           <span className="panel__badge">{playlist.length}</span>
+         </div>
+ 
+         {isLoading ? (
+           <div className="empty-state"><p>Loading playlist...</p></div>
++        ) : playlists.length === 0 ? (
++          <div className="empty-state">
++            <p>You have no playlists yet. Click “New playlist” above to create your first one.</p>
++          </div>
+         ) : playlistFiles.length === 0 ? (
+-          <div className="empty-state"><p>Your playlist is empty. Add files from the library above.</p></div>
++          <div className="empty-state"><p>This playlist is empty. Add files from the library above.</p></div>
+         ) : (
+           <div className="stack-list">
+             {playlistFiles.map((file, index) => (
+diff --git a/start.bat b/start.bat
+index 905d139..ca5c588 100644
+--- a/start.bat
++++ b/start.bat
+@@ -85,6 +85,10 @@ if not exist "%FRONTEND_DIR%\node_modules" (
+     popd >nul
+ )
+ 
++echo [2.5/3] Freeing ports 8000 and 8080 from stale processes ...
++powershell -NoProfile -ExecutionPolicy Bypass -Command "foreach ($port in @(8000,8080)) { Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }"
++timeout /t 2 /nobreak >nul
++
+ if "%CHECK_ONLY%"=="1" (
+     echo.
+     echo Launcher check passed.
+diff --git a/testing/test_audio_extractor.py b/testing/test_audio_extractor.py
+new file mode 100644
+index 0000000..98bf42f
+--- /dev/null
++++ b/testing/test_audio_extractor.py
+@@ -0,0 +1,112 @@
++"""End-to-end test for video -> audio extraction (uses real ffmpeg).
++
++Run from the repo root:
++    python testing/test_audio_extractor.py
++"""
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++if shutil.which("ffmpeg") is None:
++    print("SKIP: ffmpeg not installed")
++    sys.exit(0)
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_audio_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Generate a tiny real video (12 seconds, with audio track) with ffmpeg.
++    # Long enough that the extracted mp3 exceeds the library's 100KB filter.
++    src = tmp_dir / "Sample Clip (dQw4w9WgXcQ).mp4"
++    subprocess.run(
++        [
++            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
++            "-f", "lavfi", "-i", "testsrc=duration=12:size=320x240:rate=10",
++            "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
++            "-c:v", "libx264", "-c:a", "aac", "-shortest", str(src),
++        ],
++        check=True,
++        capture_output=True,
++    )
++    assert src.exists() and src.stat().st_size > 0
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- 1. start extraction (mp3) ---
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "mp3", "bitrate": "128k"})
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    job_id = data["job_id"]
++    assert data["status"] == "queued", data
++    assert data["source"] == src.name, data
++    print("[PASS] extraction job started:", job_id)
++
++    # --- 2. poll until done ---
++    status = None
++    for _ in range(120):
++        resp = client.get(f"/api/extract-audio/{job_id}")
++        assert resp.status_code == 200, resp.text
++        status = resp.json()
++        if status["status"] in ("completed", "error"):
++            break
++        time.sleep(0.25)
++
++    assert status["status"] == "completed", status
++    assert status["progress"] == 100, status
++    assert status["filename"] and status["size_bytes"] > 0, status
++    output_path = tmp_dir / status["filename"]
++    assert output_path.exists(), status
++    assert output_path.suffix.lower() == ".mp3", status
++    print(f"[PASS] completed -> {status['filename']} ({status['size_bytes']} bytes)")
++
++    # --- 3. output appears in /api/files (library listing) ---
++    resp = client.get("/api/files")
++    names = [f["filename"] for f in resp.json()["files"]]
++    assert status["filename"] in names, names
++    print("[PASS] extracted audio shows up in the library listing")
++
++    # --- 4. unknown job -> 404 ---
++    resp = client.get("/api/extract-audio/nope")
++    assert resp.status_code == 404, resp.text
++    print("[PASS] unknown job -> 404")
++
++    # --- 5. missing file -> 404, invalid format -> 400 ---
++    resp = client.post("/api/extract-audio", json={"filename": "missing.mp4", "format": "mp3"})
++    assert resp.status_code == 404, resp.text
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "wma"})
++    assert resp.status_code == 400, resp.text
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "mp3", "bitrate": "999k"})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] validation: missing->404, bad format->400, bad bitrate->400")
++
++    # --- 6. lossless format (flac) ignores bitrate ---
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "flac", "bitrate": "128k"})
++    assert resp.status_code == 200, resp.text
++    job_id2 = resp.json()["job_id"]
++    for _ in range(120):
++        status = client.get(f"/api/extract-audio/{job_id2}").json()
++        if status["status"] in ("completed", "error"):
++            break
++        time.sleep(0.25)
++    assert status["status"] == "completed", status
++    assert status["filename"].endswith(".flac"), status
++    print(f"[PASS] flac extraction -> {status['filename']}")
++
++    print("\nALL AUDIO EXTRACTOR TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
+diff --git a/testing/test_multi_playlist.py b/testing/test_multi_playlist.py
+new file mode 100644
+index 0000000..75dc8bf
+--- /dev/null
++++ b/testing/test_multi_playlist.py
+@@ -0,0 +1,141 @@
++"""Quick sanity tests for the multi-playlist feature (DB layer + migration).
++
++Run from the repo root:
++    python testing/test_multi_playlist.py
++"""
++import shutil
++import sqlite3
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++# --------------------------------------------------------------------------
++# 1. Build a LEGACY database (old single-playlist schema) so we can verify
++#    the migration path that existing installs will hit.
++# --------------------------------------------------------------------------
++legacy_dir = Path(tempfile.mkdtemp(prefix="yt_legacy_"))
++try:
++    legacy_dir.mkdir(parents=True, exist_ok=True)
++    db_path = legacy_dir / "yt_private_suite.db"
++    conn = sqlite3.connect(db_path)
++    conn.executescript(
++        """
++        CREATE TABLE download_jobs (
++            task_id TEXT PRIMARY KEY, url TEXT NOT NULL,
++            quality TEXT NOT NULL DEFAULT 'best', format TEXT NOT NULL DEFAULT 'mp4',
++            status TEXT NOT NULL DEFAULT 'starting', title TEXT, filename TEXT, video_id TEXT,
++            payload TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
++            updated_at REAL NOT NULL, completed_at REAL
++        );
++        CREATE TABLE notes (
++            id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL,
++            time_seconds INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,
++            tag TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '',
++            created_at REAL NOT NULL, updated_at REAL NOT NULL
++        );
++        CREATE TABLE playlist_items (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            filename TEXT NOT NULL UNIQUE,
++            position INTEGER NOT NULL,
++            created_at REAL NOT NULL
++        );
++        CREATE INDEX idx_playlist_items_position ON playlist_items(position);
++        """
++    )
++    now = time.time()
++    for index, name in enumerate(["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]):
++        conn.execute(
++            "INSERT INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
++            (name, index, now - index),
++        )
++    conn.commit()
++    conn.close()
++
++    # Point the app at this fake install directory, then import the DB module.
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = legacy_dir
++
++    import services.database as db
++
++    db.DOWNLOAD_DIR = legacy_dir  # module imported DOWNLOAD_DIR by value; sync it
++    db.DB_PATH = legacy_dir / "yt_private_suite.db"
++
++    db.ensure_db_initialized()
++
++    playlists = db.list_playlists()
++    assert len(playlists) == 1, f"expected 1 default playlist after migration, got {playlists}"
++    default_id = playlists[0]["id"]
++    assert playlists[0]["name"] == "My Playlist"
++    assert playlists[0]["item_count"] == 3, playlists
++    items = db.get_playlist_items(default_id)
++    assert items == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"], items
++    print("[PASS] legacy schema migrated into default playlist with 3 items")
++
++    # ----------------------------------------------------------------------
++    # 2. New multi-playlist behaviour.
++    # ----------------------------------------------------------------------
++    created = db.create_playlist("Workout")
++    workout_id = created["id"]
++    assert created["name"] == "Workout" and created["item_count"] == 0
++
++    # Duplicate name is rejected
++    try:
++        db.create_playlist("Workout")
++        raise AssertionError("duplicate playlist name should have raised")
++    except ValueError:
++        pass
++
++    # Add items to each playlist independently
++    db.add_playlist_item(workout_id, "Song One.mp3")
++    db.add_playlist_item(workout_id, "Clip Three.webm")
++    db.add_playlist_item(default_id, "Song One.mp3")  # same file, different playlist
++    assert db.get_playlist_items(workout_id) == ["Song One.mp3", "Clip Three.webm"]
++    assert db.get_playlist_items(default_id) == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]
++    print("[PASS] items are scoped per playlist; same file can live in two playlists")
++
++    # Adding the same file twice to one playlist is a no-op
++    db.add_playlist_item(workout_id, "Song One.mp3")
++    assert db.get_playlist_items(workout_id) == ["Song One.mp3", "Clip Three.webm"]
++    print("[PASS] duplicate item in the same playlist is ignored")
++
++    # Reorder only touches the target playlist
++    db.reorder_playlist(workout_id, ["Clip Three.webm", "Song One.mp3"])
++    assert db.get_playlist_items(workout_id) == ["Clip Three.webm", "Song One.mp3"]
++    assert db.get_playlist_items(default_id) == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]
++    print("[PASS] reorder is scoped to one playlist")
++
++    # Rename
++    renamed = db.rename_playlist(workout_id, "Gym Mix")
++    assert renamed["name"] == "Gym Mix"
++    try:
++        db.rename_playlist(workout_id, "My Playlist")
++        raise AssertionError("rename to duplicate name should have raised")
++    except ValueError:
++        pass
++    print("[PASS] rename works and duplicate names are rejected")
++
++    # Counts stay correct after mutations
++    counts = {p["name"]: p["item_count"] for p in db.list_playlists()}
++    assert counts == {"My Playlist": 3, "Gym Mix": 2}, counts
++    print("[PASS] item counts are accurate")
++
++    # Delete playlist cascades to its items
++    assert db.delete_playlist(workout_id) is True
++    assert db.get_playlist_items(workout_id) == []
++    assert db.delete_playlist(99999) is False
++    remaining = db.list_playlists()
++    assert len(remaining) == 1 and remaining[0]["name"] == "My Playlist"
++    print("[PASS] deleting a playlist removes only its own items")
++
++    # Default playlist id picks the oldest remaining one
++    assert db.get_default_playlist_id() == default_id
++    print("[PASS] get_default_playlist_id returns oldest playlist")
++
++    print("\nALL BACKEND PLAYLIST TESTS PASSED")
++finally:
++    shutil.rmtree(legacy_dir, ignore_errors=True)
+diff --git a/testing/test_multi_playlist_api.py b/testing/test_multi_playlist_api.py
+new file mode 100644
+index 0000000..2fdbbe7
+--- /dev/null
++++ b/testing/test_multi_playlist_api.py
+@@ -0,0 +1,137 @@
++"""API-level sanity test for the new multi-playlist endpoints.
++
++Run from the repo root:
++    python testing/test_multi_playlist_api.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++# Point the app at a throwaway downloads directory BEFORE importing the router.
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_api_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Fake saved media files
++    (tmp_dir / "Song One.mp3").write_bytes(b"0" * 2048)
++    (tmp_dir / "Video Two.mp4").write_bytes(b"0" * 2048)
++    (tmp_dir / "Clip Three.webm").write_bytes(b"0" * 2048)
++    (tmp_dir / "ignore.tmp").write_bytes(b"0" * 2048)
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- playlist CRUD ---
++    resp = client.get("/api/playlists")
++    assert resp.status_code == 200, resp.text
++    playlists = resp.json()["playlists"]
++    assert len(playlists) == 1 and playlists[0]["name"] == "My Playlist", playlists
++    default_id = playlists[0]["id"]
++
++    resp = client.post("/api/playlists", json={"name": "Workout"})
++    assert resp.status_code == 200, resp.text
++    workout = resp.json()["playlist"]
++    workout_id = workout["id"]
++
++    resp = client.post("/api/playlists", json={"name": "Workout"})
++    assert resp.status_code == 409, resp.text
++
++    resp = client.post("/api/playlists", json={"name": "   "})
++    assert resp.status_code == 409, resp.text  # whitespace-only name rejected
++
++    # --- add items ---
++    resp = client.post(f"/api/playlists/{workout_id}/items", json={"filename": "Song One.mp3"})
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- batch add (multiple files at once) ---
++    resp = client.post(
++        f"/api/playlists/{workout_id}/items/batch",
++        json={"filenames": ["Video Two.mp4", "Clip Three.webm", "Video Two.mp4", "missing.mp4", "Song One.mp3"]},
++    )
++    assert resp.status_code == 200, resp.text
++    # missing file skipped, duplicate skipped, already-present file skipped
++    assert resp.json() == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"], resp.text
++
++    resp = client.post(
++        f"/api/playlists/{default_id}/items/batch",
++        json={"filenames": ["Song One.mp3", "Video Two.mp4"]},
++    )
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3", "Video Two.mp4"], resp.text
++
++    resp = client.post("/api/playlists/99999/items/batch", json={"filenames": ["Song One.mp3"]})
++    assert resp.status_code == 404, resp.text
++    print("    batch endpoint OK")
++
++    resp = client.post(f"/api/playlists/{workout_id}/items", json={"filename": "missing.mp3"})
++    assert resp.status_code == 404, resp.text
++
++    resp = client.post(f"/api/playlists/{default_id}/items", json={"filename": "Song One.mp3"})
++    # already added via batch above -> ignored, list unchanged
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3", "Video Two.mp4"], resp.text
++
++    # --- rename ---
++    resp = client.patch(f"/api/playlists/{workout_id}", json={"name": "Gym Mix"})
++    assert resp.status_code == 200 and resp.json()["playlist"]["name"] == "Gym Mix", resp.text
++
++    resp = client.patch(f"/api/playlists/{workout_id}", json={"name": "My Playlist"})
++    assert resp.status_code == 409, resp.text
++
++    resp = client.patch("/api/playlists/99999", json={"name": "Nope"})
++    assert resp.status_code == 404, resp.text
++
++    # --- counts reflect items ---
++    resp = client.get("/api/playlists")
++    counts = {p["name"]: p["item_count"] for p in resp.json()["playlists"]}
++    assert counts == {"My Playlist": 2, "Gym Mix": 3}, counts
++
++    # --- reorder (scoped) ---
++    client.post(f"/api/playlists/{workout_id}/items", json={"filename": "Clip Three.webm"})
++    resp = client.post(f"/api/playlists/{workout_id}/reorder", json=["Clip Three.webm", "Song One.mp3"])
++    assert resp.json() == ["Clip Three.webm", "Song One.mp3"], resp.text
++    assert client.get(f"/api/playlists/{default_id}/items").json() == ["Song One.mp3", "Video Two.mp4"]
++
++    # --- remove item ---
++    resp = client.delete(f"/api/playlists/{workout_id}/items/Clip%20Three.webm")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- delete playlist ---
++    resp = client.delete(f"/api/playlists/{workout_id}")
++    assert resp.status_code == 200, resp.text
++    resp = client.delete(f"/api/playlists/{workout_id}")
++    assert resp.status_code == 404, resp.text
++    assert client.get(f"/api/playlists/{workout_id}/items").status_code == 404
++
++    # --- legacy endpoints still work on the default playlist ---
++    resp = client.get("/api/playlist")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3", "Video Two.mp4"], resp.text
++    resp = client.post("/api/playlist/add/Video%20Two.mp4")
++    # already present -> list unchanged
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3", "Video Two.mp4"], resp.text
++    resp = client.delete("/api/playlist/remove/Video%20Two.mp4")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++    resp = client.post("/api/playlist/reorder", json=["Song One.mp3"])
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- after deleting every playlist, the legacy endpoints recreate a default ---
++    client.delete(f"/api/playlists/{default_id}")
++    assert client.get("/api/playlists").json()["playlists"] == []
++    resp = client.get("/api/playlist")
++    assert resp.status_code == 200 and resp.json() == [], resp.text
++    names = [p["name"] for p in client.get("/api/playlists").json()["playlists"]]
++    assert names == ["My Playlist"], names
++
++    print("ALL API PLAYLIST TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
+diff --git a/testing/test_open_downloads_folder.py b/testing/test_open_downloads_folder.py
+new file mode 100644
+index 0000000..115bc81
+--- /dev/null
++++ b/testing/test_open_downloads_folder.py
+@@ -0,0 +1,47 @@
++"""Sanity test for POST /api/open-downloads-folder.
++
++Run from the repo root:
++    python testing/test_open_downloads_folder.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++from unittest import mock
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_folder_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # The OS folder-open call is mocked; we just verify the endpoint wiring.
++    with mock.patch.object(library_routes, "_open_downloads_folder", return_value=None) as opener:
++        resp = client.post("/api/open-downloads-folder")
++        assert resp.status_code == 200, resp.text
++        assert resp.json() == {"message": "Opened"}, resp.text
++        opener.assert_called_once()
++
++    # If the OS call fails, we surface a 500 with a clear message.
++    with mock.patch.object(
++        library_routes, "_open_downloads_folder", side_effect=RuntimeError("boom")
++    ):
++        resp = client.post("/api/open-downloads-folder")
++        assert resp.status_code == 500, resp.text
++        assert "boom" in resp.json()["detail"], resp.text
++
++    print("ALL OPEN-DOWNLOADS-FOLDER TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
+diff --git a/testing/test_social_cookies.py b/testing/test_social_cookies.py
+new file mode 100644
+index 0000000..8523af1
+--- /dev/null
++++ b/testing/test_social_cookies.py
+@@ -0,0 +1,112 @@
++"""Sanity test for Instagram/social cookie support.
++
++Run from the repo root:
++    python testing/test_social_cookies.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_social_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    from routes import download as download_routes
++    from services import yt_dlp_options as opts
++
++    # Point cookie file paths at the temp dir so we never touch the real one.
++    tmp_cookies = tmp_dir / "instagram_cookies.txt"
++    opts.DEFAULT_SOCIAL_COOKIES_FILE = tmp_cookies
++    opts.BACKEND_DIR = tmp_dir
++
++    app = FastAPI()
++    app.include_router(download_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- 1. status when nothing configured ---
++    resp = client.get("/api/social-cookies")
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    assert data["exists"] is False, data
++    assert data["browsers_configured"] == [], data
++    print("[PASS] status endpoint: no cookies, no browsers configured")
++
++    # --- 2. upload a valid Netscape cookies.txt ---
++    NETSCAPE = (
++        "# Netscape HTTP Cookie File\n"
++        "instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tABC123\n"
++        "instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tXYZ\n"
++    )
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("instagram_cookies.txt", NETSCAPE.encode(), "text/plain")},
++    )
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["exists"] is True, resp.text
++    assert resp.json()["cookie_count"] == 2, resp.json()
++    assert tmp_cookies.exists()
++    print("[PASS] upload valid Netscape cookies.txt -> saved, 2 rows")
++
++    # --- 3. upload JSON format -> rejected ---
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("cookies.json", b'{"cookies":[]}', "application/json")},
++    )
++    assert resp.status_code == 400, resp.text
++    print("[PASS] JSON cookie file rejected with clear message")
++
++    # --- 4. upload garbage with no Netscape rows -> rejected ---
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("cookies.txt", b"hello world no tabs here", "text/plain")},
++    )
++    assert resp.status_code == 400, resp.text
++    print("[PASS] non-Netscape garbage rejected")
++
++    # --- 5. delete removes file ---
++    resp = client.delete("/api/social-cookies")
++    assert resp.status_code == 200, resp.text
++    assert not tmp_cookies.exists()
++    print("[PASS] delete removes cookie file")
++
++    # --- 6. cookiefile is applied for instagram URLs ---
++    opts.DEFAULT_SOCIAL_COOKIES_FILE = tmp_cookies
++    tmp_cookies.write_text(NETSCAPE)
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.instagram.com/reel/ABC/")
++    assert "cookiefile" in ydl and "cookiesfrombrowser" not in ydl, ydl
++    print("[PASS] instagram URL gets cookiefile, not cookiesfrombrowser (file wins)")
++
++    # --- 7. cookiesfrombrowser applied when no file + env set ---
++    tmp_cookies.unlink(missing_ok=True)
++    import os
++    os.environ["SOCIAL_COOKIES_BROWSER"] = "chrome,edge"
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.instagram.com/p/XYZ/")
++    assert ydl.get("cookiesfrombrowser") == ("chrome", None, None, None), ydl
++    assert opts.social_cookies_browsers() == ["chrome", "edge"]
++    print("[PASS] cookiesfrombrowser used when no file + SOCIAL_COOKIES_BROWSER set")
++
++    # --- 8. YouTube URL never gets social browser cookies ---
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
++    assert "cookiesfrombrowser" not in ydl, ydl
++    print("[PASS] youtube URL unaffected by social browser cookies")
++
++    # --- 9. instagram error help ---
++    help_text = opts.instagram_error_help("ERROR: [Instagram] abc: Instagram sent an empty media response.")
++    assert "SOCIAL_COOKIES_BROWSER" in help_text and "instagram_cookies.txt" in help_text, help_text
++    print("[PASS] instagram error help contains actionable steps")
++
++    print("\nALL SOCIAL COOKIES TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
+diff --git a/testing/test_whisper_library.py b/testing/test_whisper_library.py
+new file mode 100644
+index 0000000..8f10c3a
+--- /dev/null
++++ b/testing/test_whisper_library.py
+@@ -0,0 +1,67 @@
++"""Sanity test for POST /api/whisper-library (transcribe a saved file).
++
++Run from the repo root:
++    python testing/test_whisper_library.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_whisper_lib_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Fake media file (tiny, won't actually be transcribed — we only check the endpoint wiring)
++    (tmp_dir / "My Lecture (dQw4w9WgXcQ).mp4").write_bytes(b"\x00" * 4096)
++
++    from routes import download as download_routes
++
++    app = FastAPI()
++    app.include_router(download_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # 1. Valid file -> starts a queued job (or cached result if available)
++    resp = client.post("/api/whisper-library", json={
++        "filename": "My Lecture (dQw4w9WgXcQ).mp4",
++        "force": False,
++    })
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    assert data.get("filename") == "My Lecture (dQw4w9WgXcQ).mp4", data
++    assert data.get("size_bytes") == 4096, data
++    assert data.get("job_id") or data.get("already_done"), data
++    print("[PASS] valid library file accepted:", data.get("job_id") and "queued job" or "cached result")
++
++    # 2. Missing file -> 404
++    resp = client.post("/api/whisper-library", json={"filename": "nope.mp3", "force": False})
++    assert resp.status_code == 404, resp.text
++    print("[PASS] missing file -> 404")
++
++    # 3. Invalid filename (path traversal) -> 400
++    resp = client.post("/api/whisper-library", json={"filename": "../etc/passwd", "force": False})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] traversal filename -> 400")
++
++    # 4. Unsupported extension -> 400
++    (tmp_dir / "data.json").write_text("{}")
++    resp = client.post("/api/whisper-library", json={"filename": "data.json", "force": False})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] unsupported extension -> 400")
++
++    # 5. Missing body field -> 422
++    resp = client.post("/api/whisper-library", json={"force": False})
++    assert resp.status_code == 422, resp.text
++    print("[PASS] missing filename -> 422")
++
++    print("\nALL WHISPER LIBRARY TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)

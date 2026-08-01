@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Download, Pause, Play, Shuffle, Trash2 } from 'lucide-react';
+import { Download, Edit3, Loader2, Pause, Play, Plus, RefreshCw, Search, Shuffle, Trash2, X } from 'lucide-react';
 import { API_BASE, api } from '../lib/api';
 
 const cleanTitle = (filename = '') => (
@@ -127,8 +127,24 @@ function PlaylistThumb({ file }) {
 }
 
 export default function PlaylistPage({ files = [], onNotify }) {
-  const [playlist, setPlaylist] = useState([]);
-  const [selectedFilename, setSelectedFilename] = useState('');
+  // Multi-playlist state
+  const [playlists, setPlaylists] = useState([]);                 // [{ id, name, created_at, item_count }]
+  const [activePlaylistId, setActivePlaylistId] = useState(null);
+  const [playlist, setPlaylist] = useState([]);                   // filenames of the active playlist
+  const [isCreating, setIsCreating] = useState(false);            // inline "create playlist" form
+  const [newPlaylistName, setNewPlaylistName] = useState('');
+  const [isRenaming, setIsRenaming] = useState(false);            // inline "rename playlist" form
+  const [renameValue, setRenameValue] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);   // two-step delete guard
+
+  // Add-from-library state (multi-select)
+  const [selectedFilenames, setSelectedFilenames] = useState([]);
+  const [libraryQuery, setLibraryQuery] = useState('');
+  const [addTarget, setAddTarget] = useState('current');          // 'current' | playlist-id | 'new'
+  const [addNewName, setAddNewName] = useState('');
+  const [isAdding, setIsAdding] = useState(false);
+
+  // Player state
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
@@ -137,6 +153,8 @@ export default function PlaylistPage({ files = [], onNotify }) {
   const [transcriptStatus, setTranscriptStatus] = useState('Get Transcript');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const playerRef = useRef(null);
+
+  const activePlaylist = playlists.find((item) => item.id === activePlaylistId) || null;
 
   const fileMap = useMemo(() => new Map(files.map((file) => [file.filename, file])), [files]);
   const playlistFiles = useMemo(
@@ -147,6 +165,15 @@ export default function PlaylistPage({ files = [], onNotify }) {
     () => files.filter((file) => !playlist.includes(file.filename)),
     [files, playlist],
   );
+  const filteredAvailable = useMemo(() => {
+    const needle = libraryQuery.trim().toLowerCase();
+    if (!needle) return availableFiles;
+    return availableFiles.filter((file) => {
+      const title = (file.title || cleanTitle(file.filename || '')).toLowerCase();
+      const filename = (file.filename || '').toLowerCase();
+      return title.includes(needle) || filename.includes(needle);
+    });
+  }, [availableFiles, libraryQuery]);
   const currentFile = playlistFiles[currentIndex] || null;
   const currentUrl = currentFile?.filename
     ? `${API_BASE}/${isAudio(currentFile.filename) || !useCompatiblePlayback ? 'stream' : 'stream-compatible'}/${encodeURIComponent(currentFile.filename)}`
@@ -156,27 +183,59 @@ export default function PlaylistPage({ files = [], onNotify }) {
     if (onNotify) onNotify(message, type);
   }, [onNotify]);
 
-  const refreshPlaylist = useCallback(async () => {
+  const loadPlaylists = useCallback(async () => {
+    try {
+      const response = await api.get('/playlists');
+      const list = Array.isArray(response.data?.playlists) ? response.data.playlists : [];
+      setPlaylists(list);
+      setActivePlaylistId((current) => (
+        current !== null && list.some((playlist) => playlist.id === current)
+          ? current
+          : (list[0]?.id ?? null)
+      ));
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to load playlists', 'error');
+    }
+  }, [notify]);
+
+  const loadItems = useCallback(async (playlistId) => {
     setIsLoading(true);
     try {
-      const response = await api.get('/playlist');
+      const response = await api.get(`/playlists/${playlistId}/items`);
       setPlaylist(Array.isArray(response.data) ? response.data : []);
     } catch (error) {
-      notify(error?.response?.data?.detail || 'Unable to load playlist', 'error');
+      notify(error?.response?.data?.detail || 'Unable to load playlist items', 'error');
     } finally {
       setIsLoading(false);
     }
   }, [notify]);
 
   useEffect(() => {
-    refreshPlaylist();
-  }, [refreshPlaylist]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
+    loadPlaylists();
+  }, [loadPlaylists]);
 
   useEffect(() => {
+    if (activePlaylistId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- load items for the newly active playlist
+      loadItems(activePlaylistId);
+    } else {
+      setPlaylist([]);
+    }
+  }, [activePlaylistId, loadItems]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- when no playlists remain, force the "new" target
+    if (playlists.length === 0) setAddTarget('new');
+  }, [playlists.length]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset player on file change
     setUseCompatiblePlayback(false);
   }, [currentFile?.filename]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset transcript state on file change
     setTranscriptStatus('Get Transcript');
     setTranscriptLoading(false);
   }, [currentFile?.filename]);
@@ -189,18 +248,172 @@ export default function PlaylistPage({ files = [], onNotify }) {
 
   useEffect(() => {
     if (currentIndex >= playlistFiles.length) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clamp index when list shrinks
       setCurrentIndex(Math.max(0, playlistFiles.length - 1));
     }
   }, [currentIndex, playlistFiles.length]);
 
+  // --- Playlist management ------------------------------------------------
+  const createPlaylist = async (name) => {
+    const clean = name.trim();
+    if (!clean) {
+      notify('Enter a playlist name', 'error');
+      return;
+    }
+    try {
+      const response = await api.post('/playlists', { name: clean });
+      const created = response.data?.playlist;
+      await loadPlaylists();
+      if (created?.id) setActivePlaylistId(created.id);
+      setIsCreating(false);
+      setNewPlaylistName('');
+      notify(`Playlist "${clean}" created`, 'success');
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
+    }
+  };
+
+  const renamePlaylist = async (playlistId, name) => {
+    const clean = name.trim();
+    if (!clean) {
+      notify('Enter a playlist name', 'error');
+      return;
+    }
+    try {
+      await api.patch(`/playlists/${playlistId}`, { name: clean });
+      await loadPlaylists();
+      setIsRenaming(false);
+      setRenameValue('');
+      notify('Playlist renamed', 'success');
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to rename playlist', 'error');
+    }
+  };
+
+  const deletePlaylist = async (playlistId) => {
+    try {
+      await api.delete(`/playlists/${playlistId}`);
+      setConfirmDeleteId(null);
+      if (activePlaylistId === playlistId) {
+        setPlaylist([]);
+        setCurrentIndex(0);
+      }
+      await loadPlaylists();
+      notify('Playlist deleted', 'info');
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to delete playlist', 'error');
+    }
+  };
+
+  const handleDeleteClick = (playlist) => {
+    if (confirmDeleteId === playlist.id) {
+      deletePlaylist(playlist.id);
+    } else {
+      setConfirmDeleteId(playlist.id);
+      notify(`Click delete again to confirm removing "${playlist.name}"`, 'info');
+    }
+  };
+
+  const refreshAll = useCallback(async () => {
+    await loadPlaylists();
+    if (activePlaylistId) await loadItems(activePlaylistId);
+  }, [loadPlaylists, loadItems, activePlaylistId]);
+
+  // --- Adding items (multi-select, one click) -----------------------------
+  const toggleSelectFile = (filename) => {
+    setSelectedFilenames((current) => (
+      current.includes(filename)
+        ? current.filter((item) => item !== filename)
+        : [...current, filename]
+    ));
+  };
+
+  const selectAllFiltered = () => {
+    setSelectedFilenames(filteredAvailable.map((file) => file.filename));
+  };
+
+  const clearSelection = () => setSelectedFilenames([]);
+
+  const addSelected = async () => {
+    const count = selectedFilenames.length;
+    if (count === 0 || isAdding) return;
+    setIsAdding(true);
+
+    let targetId;
+    let targetName;
+
+    if (addTarget === 'current') {
+      targetId = activePlaylistId;
+      targetName = activePlaylist?.name || '';
+    } else if (addTarget === 'new') {
+      const clean = addNewName.trim();
+      if (!clean) {
+        notify('Enter a name for the new playlist', 'error');
+        setIsAdding(false);
+        return;
+      }
+      try {
+        const created = await api.post('/playlists', { name: clean });
+        targetId = created.data?.playlist?.id;
+        targetName = created.data?.playlist?.name || clean;
+      } catch (error) {
+        notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
+        setIsAdding(false);
+        return;
+      }
+    } else {
+      targetId = Number(addTarget);
+      targetName = playlists.find((playlist) => playlist.id === targetId)?.name || 'playlist';
+    }
+
+    if (!targetId) {
+      notify('Choose a playlist to add to', 'error');
+      setIsAdding(false);
+      return;
+    }
+
+    try {
+      await api.post(`/playlists/${targetId}/items/batch`, { filenames: selectedFilenames });
+      clearSelection();
+      if (addTarget === 'new') {
+        setAddTarget('current');
+        setAddNewName('');
+        setActivePlaylistId(targetId);
+      }
+      await loadPlaylists();
+      // Only refresh the visible queue when the target is the active playlist.
+      // (A brand-new playlist is activated above, which triggers its own load.)
+      if (activePlaylistId === targetId) await loadItems(activePlaylistId);
+      notify(`Added ${count} item${count === 1 ? '' : 's'} to "${targetName}"`, 'success');
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to add items', 'error');
+    } finally {
+      setIsAdding(false);
+    }
+  };
+
+  const removeItem = async (filename) => {
+    if (!activePlaylistId) return;
+    try {
+      const response = await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
+      setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
+      await loadPlaylists();
+      notify('Removed from playlist', 'info');
+    } catch (error) {
+      notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
+    }
+  };
+
+  // --- Ordering -----------------------------------------------------------
   const saveOrder = async (nextOrder) => {
+    if (!activePlaylistId) return;
     setPlaylist(nextOrder);
     try {
-      const response = await api.post('/playlist/reorder', nextOrder);
+      const response = await api.post(`/playlists/${activePlaylistId}/reorder`, nextOrder);
       setPlaylist(Array.isArray(response.data) ? response.data : nextOrder);
     } catch (error) {
       notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
-      refreshPlaylist();
+      loadItems(activePlaylistId);
     }
   };
 
@@ -218,28 +431,6 @@ export default function PlaylistPage({ files = [], onNotify }) {
 
     setCurrentIndex(0);
     saveOrder(next);
-  };
-
-  const addSelected = async () => {
-    if (!selectedFilename) return;
-    try {
-      const response = await api.post(`/playlist/add/${encodeURIComponent(selectedFilename)}`);
-      setPlaylist(Array.isArray(response.data) ? response.data : [...playlist, selectedFilename]);
-      setSelectedFilename('');
-      notify('Added to playlist', 'success');
-    } catch (error) {
-      notify(error?.response?.data?.detail || 'Unable to add item', 'error');
-    }
-  };
-
-  const removeItem = async (filename) => {
-    try {
-      const response = await api.delete(`/playlist/remove/${encodeURIComponent(filename)}`);
-      setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
-      notify('Removed from playlist', 'info');
-    } catch (error) {
-      notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
-    }
   };
 
   const moveItem = (index, direction) => {
@@ -260,6 +451,7 @@ export default function PlaylistPage({ files = [], onNotify }) {
     saveOrder(next);
   };
 
+  // --- Playback -----------------------------------------------------------
   const playIndex = (index) => {
     setCurrentIndex(index);
     setIsPlaying(true);
@@ -310,45 +502,260 @@ export default function PlaylistPage({ files = [], onNotify }) {
     }
   };
 
+  const otherPlaylists = playlists.filter((playlist) => playlist.id !== activePlaylistId);
+
   return (
     <div className="page-shell">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Playlist</h1>
-          <p className="page-subtitle">Build a private queue from your saved library, reorder it, and play continuously.</p>
+          <h1 className="page-title">Playlists</h1>
+          <p className="page-subtitle">Create as many playlists as you like, add your saved library items to any of them, and play continuously.</p>
         </div>
         <div className="page-header__actions">
+          <button className="ghost-button" type="button" onClick={refreshAll} title="Refresh playlists">
+            <RefreshCw size={16} /> Refresh
+          </button>
           <button className="ghost-button" type="button" onClick={() => sortPlaylist('asc')} disabled={playlist.length < 2}>
             Sort 1-9
           </button>
           <button className="ghost-button" type="button" onClick={() => sortPlaylist('desc')} disabled={playlist.length < 2}>
             Sort 9-1
           </button>
-          <button className="ghost-button" type="button" onClick={refreshPlaylist}>Refresh</button>
           <button className="ghost-button" type="button" onClick={shufflePlaylist} disabled={playlist.length < 2}>
             <Shuffle size={16} /> Shuffle
           </button>
         </div>
       </div>
 
+      {/* Playlist switcher + management */}
+      <section className="panel panel--playlists">
+        <div className="playlist-bar">
+          {playlists.map((playlist) => {
+            const isActive = playlist.id === activePlaylistId;
+            const isConfirming = confirmDeleteId === playlist.id;
+            return (
+              <div key={playlist.id} className={`playlist-chip-wrap ${isActive ? 'playlist-chip-wrap--active' : ''}`}>
+                <button
+                  className="playlist-chip"
+                  type="button"
+                  onClick={() => {
+                    setConfirmDeleteId(null);
+                    setActivePlaylistId(playlist.id);
+                  }}
+                >
+                  <span className="playlist-chip__name">{playlist.name}</span>
+                  <span className="playlist-chip__count">{playlist.item_count}</span>
+                </button>
+                {isActive ? (
+                  <span className="playlist-chip__tools">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="Rename playlist"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setIsRenaming(true);
+                        setRenameValue(playlist.name);
+                      }}
+                    >
+                      <Edit3 size={13} />
+                    </button>
+                    <button
+                      className={`icon-button ${isConfirming ? 'icon-button--danger playlist-chip__confirm' : 'icon-button--danger'}`}
+                      type="button"
+                      title={isConfirming ? 'Click again to confirm deletion' : 'Delete playlist'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleDeleteClick(playlist);
+                      }}
+                    >
+                      {isConfirming ? <X size={13} /> : <Trash2 size={13} />}
+                    </button>
+                  </span>
+                ) : null}
+              </div>
+            );
+          })}
+          <button className="playlist-chip playlist-chip--new" type="button" onClick={() => setIsCreating(true)}>
+            <Plus size={14} /> New playlist
+          </button>
+        </div>
+
+        {isCreating ? (
+          <div className="inline-form">
+            <input
+              className="input inline-form__input"
+              type="text"
+              value={newPlaylistName}
+              onChange={(event) => setNewPlaylistName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') createPlaylist(newPlaylistName);
+                if (event.key === 'Escape') {
+                  setIsCreating(false);
+                  setNewPlaylistName('');
+                }
+              }}
+              placeholder="Playlist name"
+              maxLength={120}
+              autoFocus
+            />
+            <button className="primary-button" type="button" onClick={() => createPlaylist(newPlaylistName)}>
+              Create
+            </button>
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => {
+                setIsCreating(false);
+                setNewPlaylistName('');
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : null}
+
+        {isRenaming && activePlaylist ? (
+          <div className="inline-form">
+            <input
+              className="input inline-form__input"
+              type="text"
+              value={renameValue}
+              onChange={(event) => setRenameValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') renamePlaylist(activePlaylist.id, renameValue);
+                if (event.key === 'Escape') setIsRenaming(false);
+              }}
+              placeholder="New playlist name"
+              maxLength={120}
+              autoFocus
+            />
+            <button className="primary-button" type="button" onClick={() => renamePlaylist(activePlaylist.id, renameValue)}>
+              Rename
+            </button>
+            <button className="ghost-button" type="button" onClick={() => setIsRenaming(false)}>
+              Cancel
+            </button>
+          </div>
+        ) : null}
+      </section>
+
+      {/* Add from library — asks which playlist (existing or brand new) */}
       <section className="panel panel--form">
         <div className="form-grid">
-          <div className="field field--full">
-            <label className="field__label" htmlFor="playlist-add">ADD FROM LIBRARY</label>
-            <select
-              id="playlist-add"
-              className="select"
-              value={selectedFilename}
-              onChange={(event) => setSelectedFilename(event.target.value)}
-            >
-              <option value="">Choose a saved file...</option>
-              {availableFiles.map((file) => (
-                <option key={file.filename} value={file.filename}>{file.title || cleanTitle(file.filename)}</option>
-              ))}
-            </select>
-          </div>
+          <div className="field">
+            <label className="field__label" htmlFor="playlist-target">ADD TO WHICH PLAYLIST?</label>
+              <select
+                id="playlist-target"
+                className="select"
+                value={addTarget}
+                onChange={(event) => {
+                  setAddTarget(event.target.value);
+                  setConfirmDeleteId(null);
+                }}
+              >
+                {activePlaylist ? (
+                  <option value="current">Current playlist: {activePlaylist.name}</option>
+                ) : null}
+                {otherPlaylists.map((playlist) => (
+                  <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
+                ))}
+                <option value="new">＋ Create new playlist…</option>
+              </select>
+            </div>
+            {addTarget === 'new' ? (
+              <div className="field">
+                <label className="field__label" htmlFor="playlist-target-name">NEW PLAYLIST NAME</label>
+                <input
+                  id="playlist-target-name"
+                  className="input"
+                  type="text"
+                  value={addNewName}
+                  onChange={(event) => setAddNewName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') addSelected();
+                  }}
+                  placeholder="e.g. Workout Mix, Study, Road Trip…"
+                  maxLength={120}
+                  autoFocus
+                />
+              </div>
+            ) : null}
+            <div className="field field--full">
+              <div className="multiselect-header">
+                <label className="field__label" style={{ margin: 0 }}>
+                  SELECT VIDEOS — {selectedFilenames.length} selected
+                </label>
+                <div className="multiselect-header__actions">
+                  <button
+                    className="ghost-button ghost-button--small"
+                    type="button"
+                    onClick={selectAllFiltered}
+                    disabled={filteredAvailable.length === 0}
+                  >
+                    Select all
+                  </button>
+                  <button
+                    className="ghost-button ghost-button--small"
+                    type="button"
+                    onClick={clearSelection}
+                    disabled={selectedFilenames.length === 0}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div className="multiselect-search">
+                <Search size={15} className="multiselect-search__icon" />
+                <input
+                  className="input input--search"
+                  value={libraryQuery}
+                  onChange={(event) => setLibraryQuery(event.target.value)}
+                  placeholder="Search library..."
+                />
+              </div>
+              <div className="multiselect-list">
+                {filteredAvailable.length === 0 ? (
+                  <div className="empty-state empty-state--compact">
+                    <p>
+                      {libraryQuery.trim()
+                        ? 'No files match your search.'
+                        : 'No files left to add — everything in your library is already in this playlist.'}
+                    </p>
+                  </div>
+                ) : (
+                  filteredAvailable.map((file) => {
+                    const checked = selectedFilenames.includes(file.filename);
+                    return (
+                      <label
+                        key={file.filename}
+                        className={`multiselect-row ${checked ? 'multiselect-row--checked' : ''}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleSelectFile(file.filename)}
+                        />
+                        <PlaylistThumb file={file} />
+                        <span className="multiselect-row__title" title={file.title || cleanTitle(file.filename)}>
+                          {file.title || cleanTitle(file.filename)}
+                        </span>
+                        <span className="multiselect-row__ext">{mediaExt(file.filename).toUpperCase()}</span>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+            </div>
         </div>
-        <button className="primary-button" type="button" onClick={addSelected} disabled={!selectedFilename}>Add to Playlist</button>
+        <button className="primary-button" type="button" onClick={addSelected} disabled={selectedFilenames.length === 0 || isAdding}>
+          {isAdding ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
+          {isAdding
+            ? 'Adding…'
+            : selectedFilenames.length > 0
+              ? `Add ${selectedFilenames.length} item${selectedFilenames.length === 1 ? '' : 's'} to playlist`
+              : 'Select videos to add'}
+        </button>
       </section>
 
       {currentFile ? (
@@ -422,16 +829,24 @@ export default function PlaylistPage({ files = [], onNotify }) {
       <section className="panel panel--list">
         <div className="panel__header">
           <div>
-            <h2 className="panel__title">Queue</h2>
-            <p className="panel__subtitle">{playlist.length} item{playlist.length === 1 ? '' : 's'} in your playlist.</p>
+            <h2 className="panel__title">{activePlaylist ? activePlaylist.name : 'Queue'}</h2>
+            <p className="panel__subtitle">
+              {activePlaylist
+                ? `${playlist.length} item${playlist.length === 1 ? '' : 's'} in this playlist.`
+                : 'Create a playlist to get started.'}
+            </p>
           </div>
           <span className="panel__badge">{playlist.length}</span>
         </div>
 
         {isLoading ? (
           <div className="empty-state"><p>Loading playlist...</p></div>
+        ) : playlists.length === 0 ? (
+          <div className="empty-state">
+            <p>You have no playlists yet. Click “New playlist” above to create your first one.</p>
+          </div>
         ) : playlistFiles.length === 0 ? (
-          <div className="empty-state"><p>Your playlist is empty. Add files from the library above.</p></div>
+          <div className="empty-state"><p>This playlist is empty. Add files from the library above.</p></div>
         ) : (
           <div className="stack-list">
             {playlistFiles.map((file, index) => (

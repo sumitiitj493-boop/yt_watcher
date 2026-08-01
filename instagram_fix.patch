@@ -1,0 +1,645 @@
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index 895fac7..20972f4 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -14,6 +14,12 @@ from services.transcripts import (
+     start_uploaded_whisper_transcription,
+     start_url_whisper_transcription,
+ )
++from services.yt_dlp_options import (
++    cookiefile_report,
++    safe_cookie_report_for_response,
++    social_cookies_browsers,
++    social_cookies_file,
++)
+ from services.youtube_access import check_youtube_access
+ from services.url_guard import validate_public_url
+ from services.downloader import (
+@@ -129,6 +135,77 @@ async def whisper_library_transcription(request: WhisperLibraryRequest):
+     return response
+ 
+ 
++# --- Instagram / social cookies -------------------------------------------
++# Instagram blocks downloads without login. Users can upload a Netscape-format
++# cookies.txt exported from their logged-in browser, or rely on
++# SOCIAL_COOKIES_BROWSER (cookiesfrombrowser) configured in the backend env.
++SOCIAL_COOKIES_PROBE_URL = "https://www.instagram.com/"
++
++
++@router.get("/social-cookies")
++async def social_cookies_status():
++    report = safe_cookie_report_for_response(cookiefile_report(SOCIAL_COOKIES_PROBE_URL))
++    report["browsers_configured"] = social_cookies_browsers()
++    return report
++
++
++@router.post("/social-cookies")
++async def social_cookies_upload(file: UploadFile = File(...)):
++    filename = Path(getattr(file, "filename", "") or "").name
++    if filename and not filename.lower().endswith(".txt"):
++        raise HTTPException(status_code=400, detail="Cookie file must be a .txt file (Netscape format).")
++
++    target = social_cookies_file()
++    target.parent.mkdir(parents=True, exist_ok=True)
++    try:
++        raw = await file.read(2_000_000)
++    finally:
++        try:
++            await file.close()
++        except Exception:
++            pass
++
++    if not raw.strip():
++        raise HTTPException(status_code=400, detail="Cookie file is empty.")
++
++    try:
++        text = raw.decode("utf-8")
++    except UnicodeDecodeError:
++        raise HTTPException(status_code=400, detail="Cookie file must be UTF-8 text (Netscape format).")
++
++    first_content = next((line.strip() for line in text.splitlines() if line.strip()), "")
++    if first_content.startswith("{") or first_content.startswith("["):
++        raise HTTPException(
++            status_code=400,
++            detail="This looks like a JSON cookie file. yt-dlp needs Netscape/Mozilla cookies.txt format. "
++            "Export cookies as Netscape format (e.g. with the 'Get cookies.txt LOCALLY' extension).",
++        )
++
++    # Only keep Netscape rows; require at least one real cookie row.
++    rows = [line for line in text.splitlines() if line.strip() and (line.lstrip().startswith("#") or "\t" in line)]
++    valid_rows = [line for line in rows if "\t" in line and not line.lstrip().startswith("#")]
++    if not valid_rows:
++        raise HTTPException(
++            status_code=400,
++            detail="No Netscape cookie rows found. Export cookies in Netscape/Mozilla cookies.txt format.",
++        )
++
++    target.write_bytes(raw)
++    report = safe_cookie_report_for_response(cookiefile_report(SOCIAL_COOKIES_PROBE_URL))
++    return {"message": "Instagram cookies saved", **report}
++
++
++@router.delete("/social-cookies")
++async def social_cookies_delete():
++    target = social_cookies_file()
++    if target.exists():
++        try:
++            target.unlink()
++        except OSError as exc:
++            raise HTTPException(status_code=500, detail=f"Unable to remove cookie file: {exc}")
++    return {"message": "Instagram cookies removed"}
++
++
+ @router.get("/whisper-transcriptions/{job_id}")
+ async def whisper_transcription_status(job_id: str):
+     job = get_url_transcription_job(job_id)
+diff --git a/backend/services/downloader.py b/backend/services/downloader.py
+index feb96fb..812a02a 100644
+--- a/backend/services/downloader.py
++++ b/backend/services/downloader.py
+@@ -23,7 +23,10 @@ from services.yt_dlp_options import (
+     add_generic_impersonation,
+     apply_reliable_ytdlp_options,
+     cookiefile_report,
++    is_instagram_url,
++    instagram_error_help,
+     pretty_cookie_summary,
++    social_cookies_browsers,
+     validate_cookiefile_for_ytdlp,
+ )
+ 
+@@ -105,6 +108,7 @@ def _categorize_error(message: str) -> str:
+     auth_markers = [
+         "sign in", "login", "cookies", "private video", "members-only", "members only",
+         "join this channel", "permission", "not authorized", "account", "subscriber-only",
++        "empty media response", "not logged", "logged-in", "login required",
+     ]
+     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
+     geo_markers = ["not available in your country", "geo", "region"]
+@@ -632,6 +636,35 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+         clean_error = _clean(str(e))
+         print(f"[download] error - {clean_error}", flush=True)
+ 
++        # Instagram blocks media without login. If we haven't used any cookies
++        # yet (no cookie file, no browser cookies), retry once pulling cookies
++        # from the user's configured browser profile (SOCIAL_COOKIES_BROWSER).
++        insta_retried = False
++        if (
++            is_instagram_url(url)
++            and "cookiefile" not in ydl_opts
++            and "cookiesfrombrowser" not in ydl_opts
++            and social_cookies_browsers()
++            and any(marker in clean_error.lower() for marker in ("empty media response", "login", "sign in", "authentication", "not logged"))
++        ):
++            insta_retried = True
++            print(f"[download] Instagram needs login - retrying with browser cookies ({social_cookies_browsers()[0]})", flush=True)
++            _set_task_message(task_id, "Instagram requires login — retrying with browser cookies...")
++            try:
++                insta_opts = dict(ydl_opts)
++                insta_opts["cookiesfrombrowser"] = (social_cookies_browsers()[0], None, None, None)
++                add_generic_impersonation(insta_opts)
++                with yt_dlp.YoutubeDL(insta_opts) as ydl_insta:
++                    info = ydl_insta.extract_info(url, download=True)
++                    download_tasks[task_id]["title"] = info.get("title", "Unknown")
++                    download_tasks[task_id]["video_id"] = info.get("id")
++                    if download_tasks[task_id].get("status") == "cancelled":
++                        return
++                    _mark_completed(task_id, ydl_insta, info, format_ext)
++                    return
++            except Exception as insta_error:
++                clean_error = _clean(str(insta_error))
++
+         # Some public sites are not recognized by platform extractors.
+         # Retry with yt-dlp generic extractor before failing.
+         if "Unsupported URL" in clean_error:
+@@ -656,6 +689,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+             except Exception as generic_error:
+                 clean_error = _clean(str(generic_error))
+ 
++        if is_instagram_url(url):
++            help_text = instagram_error_help(clean_error)
++            if help_text:
++                clean_error = f"{clean_error}\n\n{help_text}"
++
+         _mark_error_or_retry(task_id, clean_error)
+     finally:
+         if download_tasks.get(task_id, {}).get("status") == "cancelled":
+diff --git a/backend/services/yt_dlp_options.py b/backend/services/yt_dlp_options.py
+index 453ae37..9582719 100644
+--- a/backend/services/yt_dlp_options.py
++++ b/backend/services/yt_dlp_options.py
+@@ -78,6 +78,16 @@ def social_cookies_file() -> Path:
+     return _env_path("SOCIAL_COOKIES_FILE", DEFAULT_SOCIAL_COOKIES_FILE)
+ 
+ 
++def social_cookies_browsers() -> list[str]:
++    """Browsers to pull Instagram/social cookies from, via yt-dlp
++    ``cookiesfrombrowser``. Configure with SOCIAL_COOKIES_BROWSER
++    (comma-separated, e.g. ``chrome,edge,firefox``)."""
++    raw = os.environ.get("SOCIAL_COOKIES_BROWSER", "").strip()
++    if not raw:
++        return []
++    return [part.strip().lower() for part in raw.split(",") if part.strip()]
++
++
+ def is_youtube_url(url: str) -> bool:
+     host = (urlparse(str(url or "")).hostname or "").lower()
+     return (
+@@ -94,6 +104,36 @@ def is_youtube_url(url: str) -> bool:
+     )
+ 
+ 
++def is_instagram_url(url: str) -> bool:
++    host = (urlparse(str(url or "")).hostname or "").lower()
++    return host == "instagram.com" or host.endswith(".instagram.com")
++
++
++def instagram_error_help(error: str) -> str:
++    """Turn a raw yt-dlp Instagram error into actionable guidance."""
++    text = (error or "").lower()
++    if "empty media response" in text:
++        return (
++            "Instagram now blocks downloads unless you're logged in. Fix: 1) Make sure you're logged "
++            "into Instagram in Chrome/Edge/Firefox on this PC, then set the environment variable "
++            "SOCIAL_COOKIES_BROWSER=chrome (or edge/firefox) and restart the backend — the app will "
++            "pull cookies straight from that browser. OR 2) Upload an instagram_cookies.txt file "
++            "below (Netscape format) exported from your logged-in browser."
++        )
++    if any(marker in text for marker in ("login", "sign in", "log in", "authentication", "not logged")):
++        return (
++            "Instagram requires login for this post. Log in on this PC and either set "
++            "SOCIAL_COOKIES_BROWSER=chrome (or edge/firefox) and restart the backend, or upload a "
++            "Netscape-format instagram_cookies.txt below."
++        )
++    if "unsupported url" in text:
++        return (
++            "yt-dlp does not support this link. Make sure you pasted a direct post/reel/story URL "
++            "from instagram.com."
++        )
++    return ""
++
++
+ def _candidate_cookie_paths(url: str) -> list[Path]:
+     if is_youtube_url(url):
+         candidates = [youtube_cookies_file(), LEGACY_COOKIES_FILE]
+@@ -255,6 +295,28 @@ def apply_cookiefile(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+     return ydl_opts
+ 
+ 
++def apply_cookiesfrombrowser(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
++    """Pass cookies straight from a local browser profile (e.g. Chrome/Edge
++    where the user is logged into Instagram). This is the easiest fix for
++    Instagram's "empty media response" auth wall: no file to export."""
++    if "cookiefile" in ydl_opts:
++        return ydl_opts
++    browsers = social_cookies_browsers()
++    if not browsers:
++        return ydl_opts
++    ydl_opts["cookiesfrombrowser"] = (browsers[0], None, None, None)
++    return ydl_opts
++
++
++def apply_social_auth_options(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
++    """Authentication helpers for non-YouTube (Instagram / social) URLs."""
++    if is_youtube_url(url):
++        return ydl_opts
++    apply_cookiefile(ydl_opts, url)
++    apply_cookiesfrombrowser(ydl_opts, url)
++    return ydl_opts
++
++
+ def _merge_extractor_args(ydl_opts: dict[str, Any], ie_key: str, values: dict[str, list[str]]) -> None:
+     extractor_args = dict(ydl_opts.get("extractor_args") or {})
+     existing = dict(extractor_args.get(ie_key) or {})
+@@ -345,7 +407,10 @@ def apply_reliable_ytdlp_options(ydl_opts: dict[str, Any], url: str) -> dict[str
+ 
+     add_generic_impersonation(ydl_opts)
+     apply_youtube_runtime_options(ydl_opts, url)
+-    apply_cookiefile(ydl_opts, url)
++    if is_youtube_url(url):
++        apply_cookiefile(ydl_opts, url)
++    else:
++        apply_social_auth_options(ydl_opts, url)
+     return ydl_opts
+ 
+ 
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 2a53779..a3111df 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3390,3 +3390,73 @@ body[data-theme='dark'] .main-stage {
+ 		align-items: flex-start;
+ 	}
+ }
++
++/* ===== Instagram / social cookies card ===== */
++.social-cookies-card {
++	display: grid;
++	gap: 12px;
++	padding: 16px;
++	border-radius: 18px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++}
++
++.social-cookies-card__header {
++	display: flex;
++	align-items: flex-start;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.social-cookies-card__actions {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	flex-wrap: wrap;
++}
++
++.social-cookies-card__upload {
++	position: relative;
++	cursor: pointer;
++}
++
++.social-cookies-card__upload input[type='file'] {
++	position: absolute;
++	inset: 0;
++	opacity: 0;
++	cursor: pointer;
++}
++
++.field__help--warn {
++	color: #d97706;
++}
++
++.social-cookies-help {
++	border: 1px dashed var(--border);
++	border-radius: 14px;
++	padding: 10px 14px;
++	color: var(--text-muted);
++	font-size: 13px;
++}
++
++.social-cookies-help summary {
++	cursor: pointer;
++	font-weight: 600;
++	color: var(--text);
++}
++
++.social-cookies-help ol {
++	margin: 10px 0 4px;
++	padding-left: 20px;
++	display: grid;
++	gap: 8px;
++}
++
++.social-cookies-help code {
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	border-radius: 6px;
++	padding: 1px 6px;
++	font-size: 12px;
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 9afa647..f443df7 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -24,6 +24,7 @@ import {
+   ShieldCheck,
+   Sparkles,
+   Trash2,
++  Upload,
+   X,
+   Music2,
+   Plus,
+@@ -677,7 +678,10 @@ function AboutPage() {
+   );
+ }
+ 
+-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload }) {
++function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
++  const notify = useCallback((message, type = 'info') => {
++    if (onNotify) onNotify(message, type);
++  }, [onNotify]);
+   const [url, setUrl] = useState('');
+   const [quality, setQuality] = useState('1080');
+   const [format, setFormat] = useState('mp4');
+@@ -691,6 +695,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [socialFormat, setSocialFormat] = useState('mp4');
+   const [submitting, setSubmitting] = useState(false);
+   const [socialSubmitting, setSocialSubmitting] = useState(false);
++  const [socialCookies, setSocialCookies] = useState(null);
++  const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
++  const [socialCookiesError, setSocialCookiesError] = useState('');
++  const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
+   const [transcriptUrl, setTranscriptUrl] = useState('');
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const [transcriptResult, setTranscriptResult] = useState(null);
+@@ -796,6 +804,56 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     }
+   };
+ 
++  const loadSocialCookies = useCallback(async () => {
++    setSocialCookiesLoading(true);
++    setSocialCookiesError('');
++    try {
++      const response = await api.get('/social-cookies');
++      setSocialCookies(response.data || null);
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to check Instagram cookie status.'));
++    } finally {
++      setSocialCookiesLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch cookie status on mount
++    loadSocialCookies();
++  }, [loadSocialCookies]);
++
++  const handleSocialCookiesUpload = async (event) => {
++    const file = event.target.files?.[0];
++    event.target.value = '';
++    if (!file) return;
++    setSocialCookiesUploading(true);
++    setSocialCookiesError('');
++    try {
++      const formData = new FormData();
++      formData.append('file', file);
++      const response = await api.post('/social-cookies', formData, {
++        headers: { 'Content-Type': 'multipart/form-data' },
++      });
++      setSocialCookies(response.data || null);
++      notify('Instagram cookies saved', 'success');
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to save Instagram cookies.'));
++    } finally {
++      setSocialCookiesUploading(false);
++    }
++  };
++
++  const handleSocialCookiesRemove = async () => {
++    setSocialCookiesError('');
++    try {
++      await api.delete('/social-cookies');
++      setSocialCookies(null);
++      notify('Instagram cookies removed', 'info');
++    } catch (err) {
++      setSocialCookiesError(safeFetchError(err, 'Unable to remove Instagram cookies.'));
++    }
++  };
++
+   const handleFetchTranscript = async (event) => {
+     event.preventDefault();
+     const trimmed = transcriptUrl.trim();
+@@ -1095,6 +1153,82 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
+             </button>
+           </form>
++
++          <div className="whisper-upload-divider"><span>Instagram note</span></div>
++
++          <div className="social-cookies-card">
++            <div className="social-cookies-card__header">
++              <div>
++                <h3 className="panel__title panel__title--tight">Instagram login cookies</h3>
++                <p className="panel__subtitle">
++                  Instagram blocks downloads unless you're logged in. Give the app cookies from your
++                  logged-in browser so downloads work.
++                </p>
++              </div>
++              <span
++                className={`status-pill ${socialCookies?.exists ? 'status-pill--completed' : 'status-pill--error'}`}
++              >
++                {socialCookiesLoading
++                  ? 'Checking…'
++                  : socialCookies?.exists
++                    ? 'Cookies configured'
++                    : 'No cookies'}
++              </span>
++            </div>
++
++            {socialCookies?.cookie_count > 0 ? (
++              <p className="field__help">
++                {socialCookies.cookie_count} cookie rows loaded from{' '}
++                <code>{socialCookies.selected_path || 'instagram_cookies.txt'}</code>.
++              </p>
++            ) : null}
++            {socialCookies?.browsers_configured?.length > 0 ? (
++              <p className="field__help">
++                Browser cookie mode active:{' '}
++                <code>SOCIAL_COOKIES_BROWSER={socialCookies.browsers_configured.join(',')}</code>
++              </p>
++            ) : null}
++            {socialCookies?.warning ? (
++              <p className="field__help field__help--warn">{socialCookies.warning}</p>
++            ) : null}
++            {socialCookiesError ? <p className="download-card__error">{socialCookiesError}</p> : null}
++
++            <div className="social-cookies-card__actions">
++              <label className="primary-button social-cookies-card__upload">
++                {socialCookiesUploading ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
++                {socialCookiesUploading ? 'Saving…' : 'Upload instagram_cookies.txt'}
++                <input
++                  type="file"
++                  accept=".txt,text/plain"
++                  onChange={handleSocialCookiesUpload}
++                  disabled={socialCookiesUploading}
++                  hidden
++                />
++              </label>
++              {socialCookies?.exists ? (
++                <button className="ghost-button ghost-button--danger" type="button" onClick={handleSocialCookiesRemove}>
++                  <Trash2 size={16} />
++                  Remove
++                </button>
++              ) : null}
++            </div>
++
++            <details className="social-cookies-help">
++              <summary>How do I get Instagram cookies?</summary>
++              <ol>
++                <li>Open Instagram in Chrome/Edge/Firefox on this PC and log in.</li>
++                <li>
++                  Easiest: set the environment variable <code>SOCIAL_COOKIES_BROWSER=chrome</code>{' '}
++                  (or <code>edge</code>/<code>firefox</code>) in the backend's environment, then
++                  restart. The app pulls cookies straight from that browser — no file needed.
++                </li>
++                <li>
++                  Or export cookies as Netscape format (e.g. with the “Get cookies.txt LOCALLY”
++                  browser extension) and upload the <code>.txt</code> file above.
++                </li>
++              </ol>
++            </details>
++          </div>
+         </section>
+       )}
+ 
+@@ -2464,7 +2598,7 @@ export default function App() {
+         <Routes>
+           <Route path="/" element={<Navigate to="/about" replace />} />
+           <Route path="/about" element={<AboutPage />} />
+-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
++          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+diff --git a/testing/test_social_cookies.py b/testing/test_social_cookies.py
+new file mode 100644
+index 0000000..8523af1
+--- /dev/null
++++ b/testing/test_social_cookies.py
+@@ -0,0 +1,112 @@
++"""Sanity test for Instagram/social cookie support.
++
++Run from the repo root:
++    python testing/test_social_cookies.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_social_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    from routes import download as download_routes
++    from services import yt_dlp_options as opts
++
++    # Point cookie file paths at the temp dir so we never touch the real one.
++    tmp_cookies = tmp_dir / "instagram_cookies.txt"
++    opts.DEFAULT_SOCIAL_COOKIES_FILE = tmp_cookies
++    opts.BACKEND_DIR = tmp_dir
++
++    app = FastAPI()
++    app.include_router(download_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- 1. status when nothing configured ---
++    resp = client.get("/api/social-cookies")
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    assert data["exists"] is False, data
++    assert data["browsers_configured"] == [], data
++    print("[PASS] status endpoint: no cookies, no browsers configured")
++
++    # --- 2. upload a valid Netscape cookies.txt ---
++    NETSCAPE = (
++        "# Netscape HTTP Cookie File\n"
++        "instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tABC123\n"
++        "instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tXYZ\n"
++    )
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("instagram_cookies.txt", NETSCAPE.encode(), "text/plain")},
++    )
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["exists"] is True, resp.text
++    assert resp.json()["cookie_count"] == 2, resp.json()
++    assert tmp_cookies.exists()
++    print("[PASS] upload valid Netscape cookies.txt -> saved, 2 rows")
++
++    # --- 3. upload JSON format -> rejected ---
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("cookies.json", b'{"cookies":[]}', "application/json")},
++    )
++    assert resp.status_code == 400, resp.text
++    print("[PASS] JSON cookie file rejected with clear message")
++
++    # --- 4. upload garbage with no Netscape rows -> rejected ---
++    resp = client.post(
++        "/api/social-cookies",
++        files={"file": ("cookies.txt", b"hello world no tabs here", "text/plain")},
++    )
++    assert resp.status_code == 400, resp.text
++    print("[PASS] non-Netscape garbage rejected")
++
++    # --- 5. delete removes file ---
++    resp = client.delete("/api/social-cookies")
++    assert resp.status_code == 200, resp.text
++    assert not tmp_cookies.exists()
++    print("[PASS] delete removes cookie file")
++
++    # --- 6. cookiefile is applied for instagram URLs ---
++    opts.DEFAULT_SOCIAL_COOKIES_FILE = tmp_cookies
++    tmp_cookies.write_text(NETSCAPE)
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.instagram.com/reel/ABC/")
++    assert "cookiefile" in ydl and "cookiesfrombrowser" not in ydl, ydl
++    print("[PASS] instagram URL gets cookiefile, not cookiesfrombrowser (file wins)")
++
++    # --- 7. cookiesfrombrowser applied when no file + env set ---
++    tmp_cookies.unlink(missing_ok=True)
++    import os
++    os.environ["SOCIAL_COOKIES_BROWSER"] = "chrome,edge"
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.instagram.com/p/XYZ/")
++    assert ydl.get("cookiesfrombrowser") == ("chrome", None, None, None), ydl
++    assert opts.social_cookies_browsers() == ["chrome", "edge"]
++    print("[PASS] cookiesfrombrowser used when no file + SOCIAL_COOKIES_BROWSER set")
++
++    # --- 8. YouTube URL never gets social browser cookies ---
++    ydl = {}
++    ydl = opts.apply_social_auth_options(ydl, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
++    assert "cookiesfrombrowser" not in ydl, ydl
++    print("[PASS] youtube URL unaffected by social browser cookies")
++
++    # --- 9. instagram error help ---
++    help_text = opts.instagram_error_help("ERROR: [Instagram] abc: Instagram sent an empty media response.")
++    assert "SOCIAL_COOKIES_BROWSER" in help_text and "instagram_cookies.txt" in help_text, help_text
++    print("[PASS] instagram error help contains actionable steps")
++
++    print("\nALL SOCIAL COOKIES TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)

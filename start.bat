@@ -85,6 +85,10 @@ if not exist "%FRONTEND_DIR%\node_modules" (
     popd >nul
 )
 
+echo [2.5/3] Freeing ports 8000 and 8080 from stale processes ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "foreach ($port in @(8000,8080)) { Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }"
+timeout /t 2 /nobreak >nul
+
 if "%CHECK_ONLY%"=="1" (
     echo.
     echo Launcher check passed.
@@ -118,5 +122,9 @@ echo ^|  Open http://localhost:8080 in browser  ^|
 echo ^|  Close the PowerShell windows to stop   ^|
 echo +------------------------------------------+
 echo.
+
+REM Give services a moment to start, then open the frontend in the default browser
+timeout /t 2 /nobreak >nul
+start "" "http://localhost:8080"
 
 pause

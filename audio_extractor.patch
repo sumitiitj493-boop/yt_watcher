@@ -1,0 +1,775 @@
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index 503fa60..e8ea96a 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -29,6 +29,10 @@ import sys
+ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id, resolve_download_path
+ from services.stream_state import active_streams
+ from services.transcripts import fetch_online_transcript
++from services.audio_extractor import (
++    get_audio_extraction_job,
++    start_audio_extraction,
++)
+ 
+ router = APIRouter()
+ 
+@@ -66,6 +70,12 @@ class PlaylistAddItemsRequest(BaseModel):
+     filenames: list[str] = Field(default_factory=list, max_length=1000)
+ 
+ 
++class AudioExtractRequest(BaseModel):
++    filename: str = Field(min_length=1, max_length=500)
++    format: str = Field(default="mp3", max_length=10)
++    bitrate: str = Field(default="192k", max_length=10)
++
++
+ def _get_cached_files() -> list[dict]:
+     now = time.time()
+     if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
+@@ -156,6 +166,41 @@ async def open_downloads_folder():
+     return {"message": "Opened"}
+ 
+ 
++# --- Video -> audio extraction -------------------------------------------
++@router.post("/extract-audio")
++async def extract_audio(payload: AudioExtractRequest):
++    try:
++        safe_path = resolve_download_path(payload.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++
++    if safe_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
++        raise HTTPException(status_code=400, detail="Not a media file")
++
++    try:
++        job_id = start_audio_extraction(safe_path, payload.format, payload.bitrate)
++    except (ValueError, FileNotFoundError) as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++
++    return {
++        "job_id": job_id,
++        "status": "queued",
++        "source": safe_path.name,
++        "output_format": payload.format,
++    }
++
++
++@router.get("/extract-audio/{job_id}")
++async def extract_audio_status(job_id: str):
++    job = get_audio_extraction_job(job_id)
++    if not job:
++        raise HTTPException(status_code=404, detail="Extraction job not found")
++    return job
++
++
+ @router.delete("/delete/{filename}")
+ async def delete_file(filename: str):
+     try:
+diff --git a/backend/services/audio_extractor.py b/backend/services/audio_extractor.py
+new file mode 100644
+index 0000000..8147c0b
+--- /dev/null
++++ b/backend/services/audio_extractor.py
+@@ -0,0 +1,205 @@
++"""Video -> audio extraction for files already saved in the library.
++
++Runs ffmpeg in a background thread and reports progress via an in-memory
++job dict (mirrors the Whisper job pattern). The resulting audio file is
++written to DOWNLOAD_DIR, so it automatically appears in the Library.
++"""
++import shutil
++import subprocess
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Optional
++
++from services.files import DOWNLOAD_DIR
++
++FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
++FFPROBE = shutil.which("ffprobe") or "ffprobe"
++
++EXTRACT_AUDIO_JOBS: dict[str, dict] = {}
++_JOBS_LOCK = threading.RLock()
++
++# format -> (extension, ffmpeg audio codec, lossy)
++AUDIO_FORMATS = {
++    "mp3": ("mp3", "libmp3lame", True),
++    "m4a": ("m4a", "aac", True),
++    "aac": ("aac", "aac", True),
++    "ogg": ("ogg", "libvorbis", True),
++    "opus": ("opus", "libopus", True),
++    "wav": ("wav", "pcm_s16le", False),
++    "flac": ("flac", "flac", False),
++    "aiff": ("aiff", "pcm_s16be", False),
++}
++
++SUPPORTED_BITRATES = ("96k", "128k", "192k", "256k", "320k")
++DEFAULT_BITRATE = "192k"
++
++
++def ffmpeg_available() -> bool:
++    return shutil.which("ffmpeg") is not None
++
++
++def _probe_duration(path: Path) -> Optional[float]:
++    try:
++        result = subprocess.run(
++            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
++             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        return float(result.stdout.strip())
++    except Exception:
++        return None
++
++
++def _unique_output_path(source: Path, ext: str) -> Path:
++    stem = source.stem or source.name
++    candidate = DOWNLOAD_DIR / f"{stem} (audio).{ext}"
++    index = 1
++    while candidate.exists():
++        candidate = DOWNLOAD_DIR / f"{stem} (audio) ({index}).{ext}"
++        index += 1
++    return candidate
++
++
++def start_audio_extraction(source: Path, output_format: str, bitrate: str = DEFAULT_BITRATE) -> str:
++    """Queue an ffmpeg audio extraction. Returns a job_id."""
++    if not ffmpeg_available():
++        raise ValueError("ffmpeg was not found on this system. Install ffmpeg and restart the backend.")
++
++    fmt = (output_format or "").strip().lower().lstrip(".")
++    if fmt not in AUDIO_FORMATS:
++        raise ValueError(f"Unsupported audio format '{fmt}'. Supported: {', '.join(sorted(AUDIO_FORMATS))}")
++
++    ext, codec, lossy = AUDIO_FORMATS[fmt]
++    bitrate = (bitrate or "").strip().lower()
++    if lossy and bitrate not in SUPPORTED_BITRATES:
++        raise ValueError(f"Unsupported bitrate '{bitrate}'. Supported: {', '.join(SUPPORTED_BITRATES)}")
++
++    if not source.exists():
++        raise FileNotFoundError("Source file not found")
++
++    out_path = _unique_output_path(source, ext)
++    job_id = str(uuid.uuid4())
++    now = time.time()
++    job = {
++        "job_id": job_id,
++        "source": source.name,
++        "output": out_path.name,
++        "format": fmt,
++        "bitrate": bitrate,
++        "status": "queued",
++        "progress": 0,
++        "message": "Audio extraction queued",
++        "created_at": now,
++        "started_at": None,
++        "completed_at": None,
++        "source_duration": None,
++        "elapsed_seconds": 0,
++        "filename": None,
++        "size_bytes": None,
++        "error": None,
++    }
++    with _JOBS_LOCK:
++        EXTRACT_AUDIO_JOBS[job_id] = job
++
++    threading.Thread(
++        target=_run_extraction,
++        args=(job_id, source, out_path, codec, lossy, bitrate),
++        daemon=True,
++    ).start()
++    return job_id
++
++
++def _run_extraction(job_id: str, source: Path, out_path: Path, codec: str, lossy: bool, bitrate: str) -> None:
++    job = EXTRACT_AUDIO_JOBS[job_id]
++    started = time.time()
++    job["started_at"] = started
++    try:
++        duration = _probe_duration(source)
++        job["source_duration"] = duration
++        job["status"] = "extracting"
++        job["message"] = "Extracting audio..."
++
++        cmd = [
++            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
++            "-i", str(source), "-vn",
++        ]
++        if lossy:
++            cmd += ["-acodec", codec, "-b:a", bitrate]
++        else:
++            cmd += ["-acodec", codec]
++        cmd += ["-progress", "pipe:1", "-nostats", str(out_path)]
++
++        proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            encoding="utf-8",
++            errors="replace",
++        )
++
++        error_lines: list[str] = []
++
++        def _read_stderr() -> None:
++            assert proc.stderr is not None
++            for line in proc.stderr:
++                error_lines.append(line)
++
++        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
++        stderr_thread.start()
++
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            stripped = line.strip()
++            if stripped.startswith("out_time_ms="):
++                try:
++                    ms = int(stripped.split("=", 1)[1])
++                except ValueError:
++                    continue
++                seconds = ms / 1_000_000
++                if duration and duration > 0:
++                    job["progress"] = min(99, round(seconds / duration * 100))
++                    job["message"] = f"Extracting audio... {job['progress']}%"
++                job["elapsed_seconds"] = round(time.time() - started)
++
++        proc.wait()
++        stderr_thread.join(timeout=5)
++
++        if proc.returncode != 0 or not out_path.exists():
++            err_text = "".join(error_lines[-8:]).strip() or "ffmpeg exited with an error"
++            raise RuntimeError(err_text)
++
++        job.update({
++            "status": "completed",
++            "progress": 100,
++            "message": "Audio extracted",
++            "filename": out_path.name,
++            "size_bytes": out_path.stat().st_size,
++            "elapsed_seconds": round(time.time() - started),
++            "completed_at": time.time(),
++        })
++    except Exception as exc:
++        job.update({
++            "status": "error",
++            "message": str(exc),
++            "error": str(exc),
++            "elapsed_seconds": round(time.time() - started),
++        })
++        try:
++            out_path.unlink(missing_ok=True)
++        except Exception:
++            pass
++
++
++def get_audio_extraction_job(job_id: str) -> Optional[dict]:
++    job = EXTRACT_AUDIO_JOBS.get(job_id)
++    if job is None:
++        return None
++    result = dict(job)
++    if result.get("status") in ("queued", "extracting"):
++        result["elapsed_seconds"] = round(time.time() - (result.get("started_at") or result.get("created_at") or time.time()))
++    return result
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index a3111df..322af35 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3460,3 +3460,32 @@ body[data-theme='dark'] .main-stage {
+ 	padding: 1px 6px;
+ 	font-size: 12px;
+ }
++
++/* ===== Audio Extractor page ===== */
++.audio-extractor-job {
++	display: grid;
++	gap: 14px;
++}
++
++.audio-extractor-result {
++	display: flex;
++	align-items: center;
++	gap: 14px;
++	flex-wrap: wrap;
++	padding: 16px;
++	border-radius: 18px;
++	border: 1px solid rgba(22, 163, 74, 0.35);
++	background: rgba(22, 163, 74, 0.08);
++	color: #16a34a;
++}
++
++.audio-extractor-result > div {
++	flex: 1 1 220px;
++	min-width: 0;
++}
++
++.audio-extractor-result .panel__title {
++	margin: 0;
++	font-size: 16px;
++	word-break: break-word;
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index f443df7..c6523ce 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,6 +1,7 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { Link, Navigate, NavLink, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
+ import {
++  AudioLines,
+   BadgeCheck,
+   Check,
+   CheckSquare,
+@@ -36,6 +37,7 @@ import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredA
+ import PlaylistPage from './pages/Playlist';
+ import PlaylistPicker from './components/PlaylistPicker';
+ import LibraryPicker from './components/LibraryPicker';
++import AudioExtractorPage from './pages/AudioExtractor';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -2177,6 +2179,11 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
+           <span>Whisper</span>
+         </NavLink>
+ 
++        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/extract-audio" end>
++          <AudioLines size={18} />
++          <span>Audio Extractor</span>
++        </NavLink>
++
+         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/library" end>
+           <LibraryBig size={18} />
+           <span>Library</span>
+@@ -2601,6 +2608,7 @@ export default function App() {
+           <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
++          <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+           <Route path="*" element={<Navigate to="/download" replace />} />
+diff --git a/frontend/src/pages/AudioExtractor.jsx b/frontend/src/pages/AudioExtractor.jsx
+new file mode 100644
+index 0000000..b6abe5c
+--- /dev/null
++++ b/frontend/src/pages/AudioExtractor.jsx
+@@ -0,0 +1,293 @@
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { AudioLines, CheckCircle2, Download, Loader2, Music, RefreshCw } from 'lucide-react';
++import { API_BASE, api } from '../lib/api';
++import LibraryPicker from '../components/LibraryPicker';
++
++const VIDEO_EXTS = new Set(['mp4', 'webm', 'mkv', 'mov', 'avi', 'm4v']);
++const LOSSLESS_FORMATS = new Set(['wav', 'flac', 'aiff']);
++
++const FORMATS = [
++  { value: 'mp3', label: 'MP3' },
++  { value: 'm4a', label: 'M4A (AAC)' },
++  { value: 'aac', label: 'AAC' },
++  { value: 'ogg', label: 'OGG (Vorbis)' },
++  { value: 'opus', label: 'OPUS' },
++  { value: 'wav', label: 'WAV (lossless)' },
++  { value: 'flac', label: 'FLAC (lossless)' },
++  { value: 'aiff', label: 'AIFF (lossless)' },
++];
++
++const BITRATES = [
++  { value: '96k', label: '96 kbps' },
++  { value: '128k', label: '128 kbps' },
++  { value: '192k', label: '192 kbps' },
++  { value: '256k', label: '256 kbps' },
++  { value: '320k', label: '320 kbps' },
++];
++
++const formatDuration = (seconds = 0) => {
++  const safe = Math.max(0, Math.floor(Number(seconds) || 0));
++  const m = Math.floor(safe / 60);
++  const s = safe % 60;
++  return m > 0 ? `${m}m ${s}s` : `${s}s`;
++};
++
++const formatBytes = (bytes = 0) => {
++  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
++  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
++};
++
++export default function AudioExtractorPage({ files = [], onNotify }) {
++  const videos = useMemo(
++    () => (files || []).filter((file) => VIDEO_EXTS.has((file.ext || '').toLowerCase() || String(file.filename).split('.').pop()?.toLowerCase())),
++    [files],
++  );
++  const [selectedFilename, setSelectedFilename] = useState('');
++  const [format, setFormat] = useState('mp3');
++  const [bitrate, setBitrate] = useState('192k');
++  const [job, setJob] = useState(null);
++  const [isStarting, setIsStarting] = useState(false);
++  const [error, setError] = useState('');
++  const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
++  const timerRef = useRef(null);
++
++  const isActive = job && ['queued', 'extracting'].includes(job.status);
++  const elapsed = job
++    ? Math.max(0, Math.floor(nowSeconds - (job.started_at || job.created_at || nowSeconds)))
++    : 0;
++  const lossless = LOSSLESS_FORMATS.has(format);
++
++  const notify = useCallback((message, type = 'info') => {
++    if (onNotify) onNotify(message, type);
++  }, [onNotify]);
++
++  // Refresh the picker list when the job completes (new file appears in library).
++  useEffect(() => {
++    if (job?.status === 'completed') notify('Audio extracted and saved to your Library', 'success');
++  }, [job?.status, notify]);
++
++  useEffect(() => {
++    if (!isActive) {
++      window.clearInterval(timerRef.current);
++      return undefined;
++    }
++    timerRef.current = window.setInterval(() => setNowSeconds(Date.now() / 1000), 1000);
++    return () => window.clearInterval(timerRef.current);
++  }, [isActive]);
++
++  useEffect(() => {
++    if (!job?.job_id || !isActive) return undefined;
++    let cancelled = false;
++    const poll = async () => {
++      try {
++        const response = await api.get(`/extract-audio/${encodeURIComponent(job.job_id)}`);
++        if (cancelled) return;
++        setJob(response.data || null);
++      } catch (pollError) {
++        if (!cancelled) setError(pollError?.response?.data?.detail || 'Unable to check extraction status');
++      }
++    };
++    poll();
++    const timer = window.setInterval(poll, 800);
++    return () => {
++      cancelled = true;
++      window.clearInterval(timer);
++    };
++  }, [job?.job_id, isActive]);
++
++  const startExtraction = async (event) => {
++    event.preventDefault();
++    if (!selectedFilename || isStarting || isActive) return;
++    setIsStarting(true);
++    setError('');
++    setJob(null);
++    setNowSeconds(Date.now() / 1000);
++    try {
++      const response = await api.post('/extract-audio', {
++        filename: selectedFilename,
++        format,
++        bitrate: lossless ? '192k' : bitrate,
++      });
++      const data = response.data || {};
++      setJob({ ...data, created_at: Date.now() / 1000 });
++      notify('Audio extraction started', 'success');
++    } catch (startError) {
++      setError(startError?.response?.data?.detail || 'Unable to start audio extraction');
++    } finally {
++      setIsStarting(false);
++    }
++  };
++
++  return (
++    <div className="page-shell">
++      <div className="page-header">
++        <div>
++          <h1 className="page-title">Audio Extractor</h1>
++          <p className="page-subtitle">
++            Pick any saved video and convert it to audio (MP3, M4A, FLAC, WAV and more).
++            The result is saved straight to your Library.
++          </p>
++        </div>
++      </div>
++
++      <section className="panel panel--form">
++        <div className="form-grid">
++          <div className="field field--full">
++            <label className="field__label" htmlFor="extract-video">SELECT A VIDEO FROM LIBRARY</label>
++            {videos.length > 0 ? (
++              <>
++                <LibraryPicker
++                  files={videos}
++                  value={selectedFilename}
++                  onSelect={(filename) => {
++                    setSelectedFilename(filename);
++                    setError('');
++                  }}
++                  searchPlaceholder="Search videos..."
++                />
++                <p className="field__help field__help--inline">
++                  Click a video to select it. {videos.length} video{videos.length === 1 ? '' : 's'} in your library.
++                </p>
++              </>
++            ) : (
++              <p className="field__help field__help--inline">
++                No videos in your library yet. Download some first, then come back to convert them to audio.
++              </p>
++            )}
++          </div>
++
++          <div className="field">
++            <label className="field__label" htmlFor="extract-format">AUDIO FORMAT</label>
++            <select
++              id="extract-format"
++              className="select"
++              value={format}
++              onChange={(event) => setFormat(event.target.value)}
++              disabled={isStarting || isActive}
++            >
++              {FORMATS.map((option) => (
++                <option key={option.value} value={option.value}>{option.label}</option>
++              ))}
++            </select>
++          </div>
++
++          <div className="field">
++            <label className="field__label" htmlFor="extract-bitrate">BITRATE {lossless ? '(lossless — ignored)' : ''}</label>
++            <select
++              id="extract-bitrate"
++              className="select"
++              value={bitrate}
++              onChange={(event) => setBitrate(event.target.value)}
++              disabled={isStarting || isActive || lossless}
++            >
++              {BITRATES.map((option) => (
++                <option key={option.value} value={option.value}>{option.label}</option>
++              ))}
++            </select>
++          </div>
++        </div>
++
++        {error ? <p className="download-card__error">{error}</p> : null}
++
++        <button
++          className="primary-button"
++          type="button"
++          onClick={startExtraction}
++          disabled={!selectedFilename || isStarting || isActive}
++        >
++          {isStarting || isActive ? <Loader2 size={16} className="spin" /> : <AudioLines size={16} />}
++          {isStarting ? 'Starting...'
++            : isActive ? `Extracting... ${Math.round(job?.progress || 0)}%`
++              : selectedFilename ? 'Extract Audio' : 'Select a video first'}
++        </button>
++      </section>
++
++      {job ? (
++        <section className="panel panel--list audio-extractor-job">
++          <div className="panel__header">
++            <div>
++              <h2 className="panel__title">
++                {job.status === 'completed' ? 'Extraction complete' : job.status === 'error' ? 'Extraction failed' : 'Extracting audio'}
++              </h2>
++              <p className="panel__subtitle">
++                {job.source ? cleanSourceName(job.source) : ''} → <strong>{job.format?.toUpperCase()}</strong>
++              </p>
++            </div>
++            <span className={`status-pill ${
++              job.status === 'completed' ? 'status-pill--completed'
++                : job.status === 'error' ? 'status-pill--error'
++                  : 'status-pill--processing'
++            }`}>
++              {job.status}
++            </span>
++          </div>
++
++          {job.status === 'error' ? (
++            <p className="download-card__error">{job.error || job.message}</p>
++          ) : null}
++
++          {isActive ? (
++            <div className="whisper-job-card">
++              <div className="download-card__title-row">
++                <div>
++                  <h3 className="download-card__title">{job.message || 'Extracting audio...'}</h3>
++                  <p className="download-card__meta">
++                    {job.source_duration ? `Source ${formatDuration(job.source_duration)} · ` : ''}Elapsed {formatDuration(elapsed)}
++                  </p>
++                </div>
++              </div>
++              <div className="progress-track">
++                <div className="progress-fill" style={{ width: `${Math.min(100, Math.max(0, job.progress || 0))}%` }} />
++              </div>
++              <div className="whisper-job-stats">
++                <span>{Math.min(100, Math.max(0, job.progress || 0)).toFixed(0)}%</span>
++                <span>ffmpeg is running — this usually takes a few seconds to a minute</span>
++              </div>
++            </div>
++          ) : null}
++
++          {job.status === 'completed' && job.filename ? (
++            <div className="audio-extractor-result">
++              <CheckCircle2 size={22} />
++              <div>
++                <h3 className="panel__title panel__title--tight">{job.filename}</h3>
++                <p className="panel__subtitle">
++                  {formatBytes(job.size_bytes)} · saved to your Library · done in {formatDuration(job.elapsed_seconds)}
++                </p>
++              </div>
++              <a className="primary-button" href={`${API_BASE}/files/download/${encodeURIComponent(job.filename)}`} download>
++                <Download size={16} /> Download
++              </a>
++              <button
++                className="ghost-button"
++                type="button"
++                onClick={() => { setJob(null); setSelectedFilename(''); }}
++              >
++                <RefreshCw size={16} /> Extract another
++              </button>
++            </div>
++          ) : null}
++        </section>
++      ) : null}
++
++      {!job && videos.length === 0 ? (
++        <section className="panel panel--list">
++          <div className="empty-state">
++            <Music size={28} />
++            <p>Download videos first, then convert them to audio here.</p>
++          </div>
++        </section>
++      ) : null}
++    </div>
++  );
++}
++
++function cleanSourceName(filename = '') {
++  return String(filename)
++    .replace(/\.[^.]+$/, '')
++    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
++    .trim() || filename;
++}
+diff --git a/testing/test_audio_extractor.py b/testing/test_audio_extractor.py
+new file mode 100644
+index 0000000..98bf42f
+--- /dev/null
++++ b/testing/test_audio_extractor.py
+@@ -0,0 +1,112 @@
++"""End-to-end test for video -> audio extraction (uses real ffmpeg).
++
++Run from the repo root:
++    python testing/test_audio_extractor.py
++"""
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++if shutil.which("ffmpeg") is None:
++    print("SKIP: ffmpeg not installed")
++    sys.exit(0)
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_audio_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Generate a tiny real video (12 seconds, with audio track) with ffmpeg.
++    # Long enough that the extracted mp3 exceeds the library's 100KB filter.
++    src = tmp_dir / "Sample Clip (dQw4w9WgXcQ).mp4"
++    subprocess.run(
++        [
++            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
++            "-f", "lavfi", "-i", "testsrc=duration=12:size=320x240:rate=10",
++            "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
++            "-c:v", "libx264", "-c:a", "aac", "-shortest", str(src),
++        ],
++        check=True,
++        capture_output=True,
++    )
++    assert src.exists() and src.stat().st_size > 0
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- 1. start extraction (mp3) ---
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "mp3", "bitrate": "128k"})
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    job_id = data["job_id"]
++    assert data["status"] == "queued", data
++    assert data["source"] == src.name, data
++    print("[PASS] extraction job started:", job_id)
++
++    # --- 2. poll until done ---
++    status = None
++    for _ in range(120):
++        resp = client.get(f"/api/extract-audio/{job_id}")
++        assert resp.status_code == 200, resp.text
++        status = resp.json()
++        if status["status"] in ("completed", "error"):
++            break
++        time.sleep(0.25)
++
++    assert status["status"] == "completed", status
++    assert status["progress"] == 100, status
++    assert status["filename"] and status["size_bytes"] > 0, status
++    output_path = tmp_dir / status["filename"]
++    assert output_path.exists(), status
++    assert output_path.suffix.lower() == ".mp3", status
++    print(f"[PASS] completed -> {status['filename']} ({status['size_bytes']} bytes)")
++
++    # --- 3. output appears in /api/files (library listing) ---
++    resp = client.get("/api/files")
++    names = [f["filename"] for f in resp.json()["files"]]
++    assert status["filename"] in names, names
++    print("[PASS] extracted audio shows up in the library listing")
++
++    # --- 4. unknown job -> 404 ---
++    resp = client.get("/api/extract-audio/nope")
++    assert resp.status_code == 404, resp.text
++    print("[PASS] unknown job -> 404")
++
++    # --- 5. missing file -> 404, invalid format -> 400 ---
++    resp = client.post("/api/extract-audio", json={"filename": "missing.mp4", "format": "mp3"})
++    assert resp.status_code == 404, resp.text
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "wma"})
++    assert resp.status_code == 400, resp.text
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "mp3", "bitrate": "999k"})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] validation: missing->404, bad format->400, bad bitrate->400")
++
++    # --- 6. lossless format (flac) ignores bitrate ---
++    resp = client.post("/api/extract-audio", json={"filename": src.name, "format": "flac", "bitrate": "128k"})
++    assert resp.status_code == 200, resp.text
++    job_id2 = resp.json()["job_id"]
++    for _ in range(120):
++        status = client.get(f"/api/extract-audio/{job_id2}").json()
++        if status["status"] in ("completed", "error"):
++            break
++        time.sleep(0.25)
++    assert status["status"] == "completed", status
++    assert status["filename"].endswith(".flac"), status
++    print(f"[PASS] flac extraction -> {status['filename']}")
++
++    print("\nALL AUDIO EXTRACTOR TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)

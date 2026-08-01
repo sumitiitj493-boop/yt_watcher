@@ -23,7 +23,10 @@ from services.yt_dlp_options import (
     add_generic_impersonation,
     apply_reliable_ytdlp_options,
     cookiefile_report,
+    is_instagram_url,
+    instagram_error_help,
     pretty_cookie_summary,
+    social_cookies_browsers,
     validate_cookiefile_for_ytdlp,
 )
 
@@ -105,6 +108,7 @@ def _categorize_error(message: str) -> str:
     auth_markers = [
         "sign in", "login", "cookies", "private video", "members-only", "members only",
         "join this channel", "permission", "not authorized", "account", "subscriber-only",
+        "empty media response", "not logged", "logged-in", "login required",
     ]
     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
     geo_markers = ["not available in your country", "geo", "region"]
@@ -632,6 +636,37 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
         clean_error = _clean(str(e))
         print(f"[download] error - {clean_error}", flush=True)
 
+        # Instagram blocks media without login. If we haven't used any cookies
+        # yet (no cookie file, no browser cookies), retry once pulling cookies
+        # from the user's configured browser profile (SOCIAL_COOKIES_BROWSER).
+        insta_retried = False
+        if (
+            is_instagram_url(url)
+            and "cookiefile" not in ydl_opts
+            and "cookiesfrombrowser" not in ydl_opts
+            and social_cookies_browsers()
+            and any(marker in clean_error.lower() for marker in ("empty media response", "login", "sign in", "authentication", "not logged"))
+        ):
+            insta_retried = True
+            print(f"[download] Instagram needs login - retrying with browser cookies ({', '.join(social_cookies_browsers())})", flush=True)
+            _set_task_message(task_id, "Instagram requires login — retrying with browser cookies...")
+            for browser in social_cookies_browsers():
+                try:
+                    insta_opts = dict(ydl_opts)
+                    insta_opts["cookiesfrombrowser"] = (browser, None, None, None)
+                    add_generic_impersonation(insta_opts)
+                    with yt_dlp.YoutubeDL(insta_opts) as ydl_insta:
+                        info = ydl_insta.extract_info(url, download=True)
+                        download_tasks[task_id]["title"] = info.get("title", "Unknown")
+                        download_tasks[task_id]["video_id"] = info.get("id")
+                        if download_tasks[task_id].get("status") == "cancelled":
+                            return
+                        _mark_completed(task_id, ydl_insta, info, format_ext)
+                        return
+                except Exception as insta_error:
+                    clean_error = _clean(str(insta_error))
+                    print(f"[download] Instagram retry with {browser} failed: {clean_error}", flush=True)
+
         # Some public sites are not recognized by platform extractors.
         # Retry with yt-dlp generic extractor before failing.
         if "Unsupported URL" in clean_error:
@@ -655,6 +690,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
                     return
             except Exception as generic_error:
                 clean_error = _clean(str(generic_error))
+
+        if is_instagram_url(url):
+            help_text = instagram_error_help(clean_error)
+            if help_text:
+                clean_error = f"{clean_error}\n\n{help_text}"
 
         _mark_error_or_retry(task_id, clean_error)
     finally:

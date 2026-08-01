@@ -4,15 +4,16 @@ import time
 from threading import RLock
 from typing import Dict, List, Optional
 
-from services.files import DOWNLOAD_DIR
+import services.files as files_mod
 
-DB_PATH = DOWNLOAD_DIR / "yt_private_suite.db"
+
 _SCHEMA_LOCK = RLock()
 
 
 def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    db_path = files_mod.DOWNLOAD_DIR / "yt_private_suite.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -20,9 +21,93 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _migrate_legacy_playlist_schema(conn: sqlite3.Connection) -> None:
+    """
+    The very first release had a single unnamed playlist stored in a flat
+    `playlist_items` table (filename UNIQUE, position, created_at). This
+    migration renames that table, creates the new multi-playlist tables and
+    moves the old items into a default playlist named "My Playlist".
+    """
+    columns = _table_columns(conn, "playlist_items")
+    if not columns:
+        return
+    # New schema already applied (has playlist_id) -> nothing to do.
+    if "playlist_id" in columns:
+        return
+
+    conn.execute("ALTER TABLE playlist_items RENAME TO playlist_items_legacy")
+    conn.execute("DROP INDEX IF EXISTS idx_playlist_items_position")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS playlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS playlist_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(playlist_id, filename)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
+            ON playlist_items(playlist_id, position);
+        """
+    )
+
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO playlists (name, created_at) VALUES ('My Playlist', ?)",
+        (now,),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at)
+        SELECT p.id, legacy.filename, legacy.position, legacy.created_at
+        FROM playlist_items_legacy legacy
+        JOIN playlists p ON p.name = 'My Playlist'
+        """
+    )
+    conn.execute("DROP TABLE playlist_items_legacy")
+    conn.commit()
+
+
+def _ensure_default_playlist(conn: sqlite3.Connection) -> None:
+    """
+    Create the starter "My Playlist" once per install (first boot, or when a
+    legacy install is migrated). After that the user is free to delete every
+    playlist and have none.
+    """
+    meta = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'default_playlist_created'"
+    ).fetchone()
+    if meta is not None:
+        return
+    count = conn.execute("SELECT COUNT(*) AS c FROM playlists").fetchone()["c"]
+    if count == 0:
+        conn.execute(
+            "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
+            ("My Playlist", time.time()),
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('default_playlist_created', '1')"
+    )
+    conn.commit()
+
+
 def ensure_db_initialized() -> None:
     with _SCHEMA_LOCK:
         with _connect() as conn:
+            _migrate_legacy_playlist_schema(conn)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS download_jobs (
@@ -57,16 +142,31 @@ def ensure_db_initialized() -> None:
 
                 CREATE INDEX IF NOT EXISTS idx_notes_filename_time ON notes(filename, time_seconds);
 
-                CREATE TABLE IF NOT EXISTS playlist_items (
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS playlists (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    filename TEXT NOT NULL UNIQUE,
-                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
                     created_at REAL NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_playlist_items_position ON playlist_items(position);
+                CREATE TABLE IF NOT EXISTS playlist_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(playlist_id, filename)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
+                    ON playlist_items(playlist_id, position);
                 """
             )
+            _ensure_default_playlist(conn)
             conn.commit()
 
 
@@ -218,55 +318,181 @@ def delete_note(note_id: int) -> bool:
         return cursor.rowcount > 0
 
 
-def get_playlist() -> List[str]:
+# --- Playlists (multiple, named) ------------------------------------------
+def _playlist_row(conn: sqlite3.Connection, playlist_id: int) -> Optional[dict]:
+    row = conn.execute(
+        """
+        SELECT p.id, p.name, p.created_at,
+               (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
+        FROM playlists p
+        WHERE p.id = ?
+        """,
+        (playlist_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_playlists() -> List[dict]:
     ensure_db_initialized()
     with _connect() as conn:
-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name, p.created_at,
+                   (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
+            FROM playlists p
+            ORDER BY p.created_at ASC, p.id ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_default_playlist_id() -> Optional[int]:
+    """The default playlist is simply the oldest one (used by legacy endpoints)."""
+    ensure_db_initialized()
+    with _connect() as conn:
+        row = conn.execute("SELECT id FROM playlists ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
+    return row["id"] if row else None
+
+
+def create_playlist(name: str) -> dict:
+    ensure_db_initialized()
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Playlist name cannot be empty")
+    with _connect() as conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
+                (cleaned, time.time()),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"A playlist named '{cleaned}' already exists")
+        row = _playlist_row(conn, cursor.lastrowid)
+    return row
+
+
+def rename_playlist(playlist_id: int, name: str) -> Optional[dict]:
+    ensure_db_initialized()
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Playlist name cannot be empty")
+    with _connect() as conn:
+        try:
+            conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (cleaned, playlist_id))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"A playlist named '{cleaned}' already exists")
+        row = _playlist_row(conn, playlist_id)
+    return row
+
+
+def delete_playlist(playlist_id: int) -> bool:
+    ensure_db_initialized()
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_playlist_items(playlist_id: int) -> List[str]:
+    ensure_db_initialized()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
+            (playlist_id,),
+        ).fetchall()
     return [row["filename"] for row in rows]
 
 
-def add_playlist_item(filename: str) -> List[str]:
+def add_playlist_item(playlist_id: int, filename: str) -> List[str]:
     ensure_db_initialized()
     now = time.time()
     with _connect() as conn:
-        max_position = conn.execute("SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items").fetchone()["pos"]
+        max_position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()["pos"]
         conn.execute(
-            "INSERT OR IGNORE INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
-            (filename, int(max_position) + 1, now),
+            "INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
+            (playlist_id, filename, int(max_position) + 1, now),
         )
         conn.commit()
-    return get_playlist()
+    return get_playlist_items(playlist_id)
 
 
-def remove_playlist_item(filename: str) -> List[str]:
+def add_playlist_items(playlist_id: int, filenames: List[str]) -> List[str]:
+    """Add many files to a playlist in one transaction (skips duplicates)."""
+    ensure_db_initialized()
+    now = time.time()
+    with _connect() as conn:
+        existing = {
+            row["filename"]
+            for row in conn.execute(
+                "SELECT filename FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            ).fetchall()
+        }
+        max_position = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()["pos"]
+        position = int(max_position) + 1
+        seen = set()
+        for filename in filenames or []:
+            if not filename or filename in seen:
+                continue
+            seen.add(filename)
+            if filename in existing:
+                continue
+            conn.execute(
+                "INSERT INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
+                (playlist_id, filename, position, now),
+            )
+            existing.add(filename)
+            position += 1
+        conn.commit()
+    return get_playlist_items(playlist_id)
+
+
+def remove_playlist_item(playlist_id: int, filename: str) -> List[str]:
     ensure_db_initialized()
     with _connect() as conn:
-        conn.execute("DELETE FROM playlist_items WHERE filename = ?", (filename,))
-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
+        conn.execute(
+            "DELETE FROM playlist_items WHERE playlist_id = ? AND filename = ?",
+            (playlist_id, filename),
+        )
+        rows = conn.execute(
+            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
+            (playlist_id,),
+        ).fetchall()
         for index, row in enumerate(rows):
-            conn.execute("UPDATE playlist_items SET position = ? WHERE filename = ?", (index, row["filename"]))
+            conn.execute(
+                "UPDATE playlist_items SET position = ? WHERE playlist_id = ? AND filename = ?",
+                (index, playlist_id, row["filename"]),
+            )
         conn.commit()
-    return get_playlist()
+    return get_playlist_items(playlist_id)
 
 
-def reorder_playlist(filenames: List[str]) -> List[str]:
+def reorder_playlist(playlist_id: int, filenames: List[str]) -> List[str]:
     ensure_db_initialized()
-    unique = []
+    unique: List[str] = []
     seen = set()
     for filename in filenames or []:
         if filename and filename not in seen:
             unique.append(filename)
             seen.add(filename)
+    now = time.time()
     with _connect() as conn:
-        conn.execute("DELETE FROM playlist_items")
-        now = time.time()
+        conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
         for index, filename in enumerate(unique):
             conn.execute(
-                "INSERT INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
-                (filename, index, now),
+                "INSERT INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
+                (playlist_id, filename, index, now),
             )
         conn.commit()
-    return get_playlist()
+    return get_playlist_items(playlist_id)
 
 
 async def init_db():

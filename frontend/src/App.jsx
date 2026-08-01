@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Route, Routes, useNavigate, useLocation } from 'react-router-dom';
 import {
+  AudioLines,
   BadgeCheck,
+  Check,
+  CheckSquare,
   ChevronRight,
+  FolderOpen,
   Clipboard,
   Download,
   FileText,
@@ -21,6 +25,7 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  Upload,
   X,
   Music2,
   Plus,
@@ -30,6 +35,9 @@ import {
 import './App.css';
 import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
 import PlaylistPage from './pages/Playlist';
+import PlaylistPicker from './components/PlaylistPicker';
+import LibraryPicker from './components/LibraryPicker';
+import AudioExtractorPage from './pages/AudioExtractor';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
@@ -447,15 +455,30 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
   );
 }
 
-function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist }) {
+function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMode = false, selected = false, onToggleSelect }) {
   const title = file.title || cleanTitle(file.filename || 'Unknown file');
   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
+  const handlePrimary = () => {
+    if (selectMode) onToggleSelect?.(file.filename);
+    else onSelect(file);
+  };
 
   return (
-    <article className={`file-card ${active ? 'file-card--active' : ''}`} role="button" tabIndex={0} onClick={() => onSelect(file)} onKeyDown={(event) => {
-      if (event.key === 'Enter') onSelect(file);
-    }}>
+    <article
+      className={`file-card ${active ? 'file-card--active' : ''} ${selectMode && selected ? 'file-card--selected' : ''} ${selectMode ? 'file-card--select-mode' : ''}`}
+      role="button"
+      tabIndex={0}
+      onClick={handlePrimary}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') handlePrimary();
+      }}
+    >
+      {selectMode ? (
+        <span className={`file-card__check ${selected ? 'file-card__check--on' : ''}`} aria-hidden="true">
+          {selected ? <Check size={14} /> : null}
+        </span>
+      ) : null}
       <div className="file-card__thumb">
         <MediaThumb videoId={file.video_id} title={title} filename={file.filename} />
       </div>
@@ -657,7 +680,10 @@ function AboutPage() {
   );
 }
 
-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload }) {
+function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
+  const notify = useCallback((message, type = 'info') => {
+    if (onNotify) onNotify(message, type);
+  }, [onNotify]);
   const [url, setUrl] = useState('');
   const [quality, setQuality] = useState('1080');
   const [format, setFormat] = useState('mp4');
@@ -671,6 +697,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [socialFormat, setSocialFormat] = useState('mp4');
   const [submitting, setSubmitting] = useState(false);
   const [socialSubmitting, setSocialSubmitting] = useState(false);
+  const [socialCookies, setSocialCookies] = useState(null);
+  const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
+  const [socialCookiesError, setSocialCookiesError] = useState('');
+  const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
   const [transcriptUrl, setTranscriptUrl] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const [transcriptResult, setTranscriptResult] = useState(null);
@@ -773,6 +803,56 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       setSocialUrl('');
     } finally {
       setSocialSubmitting(false);
+    }
+  };
+
+  const loadSocialCookies = useCallback(async () => {
+    setSocialCookiesLoading(true);
+    setSocialCookiesError('');
+    try {
+      const response = await api.get('/social-cookies');
+      setSocialCookies(response.data || null);
+    } catch (err) {
+      setSocialCookiesError(safeFetchError(err, 'Unable to check Instagram cookie status.'));
+    } finally {
+      setSocialCookiesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch cookie status on mount
+    loadSocialCookies();
+  }, [loadSocialCookies]);
+
+  const handleSocialCookiesUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setSocialCookiesUploading(true);
+    setSocialCookiesError('');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await api.post('/social-cookies', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setSocialCookies(response.data || null);
+      notify('Instagram cookies saved', 'success');
+    } catch (err) {
+      setSocialCookiesError(safeFetchError(err, 'Unable to save Instagram cookies.'));
+    } finally {
+      setSocialCookiesUploading(false);
+    }
+  };
+
+  const handleSocialCookiesRemove = async () => {
+    setSocialCookiesError('');
+    try {
+      await api.delete('/social-cookies');
+      setSocialCookies(null);
+      notify('Instagram cookies removed', 'info');
+    } catch (err) {
+      setSocialCookiesError(safeFetchError(err, 'Unable to remove Instagram cookies.'));
     }
   };
 
@@ -1075,6 +1155,82 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
             </button>
           </form>
+
+          <div className="whisper-upload-divider"><span>Instagram note</span></div>
+
+          <div className="social-cookies-card">
+            <div className="social-cookies-card__header">
+              <div>
+                <h3 className="panel__title panel__title--tight">Instagram login cookies</h3>
+                <p className="panel__subtitle">
+                  Instagram blocks downloads unless you're logged in. Give the app cookies from your
+                  logged-in browser so downloads work.
+                </p>
+              </div>
+              <span
+                className={`status-pill ${socialCookies?.exists ? 'status-pill--completed' : 'status-pill--error'}`}
+              >
+                {socialCookiesLoading
+                  ? 'Checking…'
+                  : socialCookies?.exists
+                    ? 'Cookies configured'
+                    : 'No cookies'}
+              </span>
+            </div>
+
+            {socialCookies?.cookie_count > 0 ? (
+              <p className="field__help">
+                {socialCookies.cookie_count} cookie rows loaded from{' '}
+                <code>{socialCookies.selected_path || 'instagram_cookies.txt'}</code>.
+              </p>
+            ) : null}
+            {socialCookies?.browsers_configured?.length > 0 ? (
+              <p className="field__help">
+                Browser cookie mode active:{' '}
+                <code>SOCIAL_COOKIES_BROWSER={socialCookies.browsers_configured.join(',')}</code>
+              </p>
+            ) : null}
+            {socialCookies?.warning ? (
+              <p className="field__help field__help--warn">{socialCookies.warning}</p>
+            ) : null}
+            {socialCookiesError ? <p className="download-card__error">{socialCookiesError}</p> : null}
+
+            <div className="social-cookies-card__actions">
+              <label className="primary-button social-cookies-card__upload">
+                {socialCookiesUploading ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
+                {socialCookiesUploading ? 'Saving…' : 'Upload instagram_cookies.txt'}
+                <input
+                  type="file"
+                  accept=".txt,text/plain"
+                  onChange={handleSocialCookiesUpload}
+                  disabled={socialCookiesUploading}
+                  hidden
+                />
+              </label>
+              {socialCookies?.exists ? (
+                <button className="ghost-button ghost-button--danger" type="button" onClick={handleSocialCookiesRemove}>
+                  <Trash2 size={16} />
+                  Remove
+                </button>
+              ) : null}
+            </div>
+
+            <details className="social-cookies-help">
+              <summary>How do I get Instagram cookies?</summary>
+              <ol>
+                <li>Open Instagram in Chrome/Edge/Firefox on this PC and log in.</li>
+                <li>
+                  Easiest: set the environment variable <code>SOCIAL_COOKIES_BROWSER=chrome</code>{' '}
+                  (or <code>edge</code>/<code>firefox</code>) in the backend's environment, then
+                  restart. The app pulls cookies straight from that browser — no file needed.
+                </li>
+                <li>
+                  Or export cookies as Netscape format (e.g. with the “Get cookies.txt LOCALLY”
+                  browser extension) and upload the <code>.txt</code> file above.
+                </li>
+              </ol>
+            </details>
+          </div>
         </section>
       )}
 
@@ -1125,7 +1281,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   );
 }
 
-function WhisperTranscriptionPage({ onNotify }) {
+function WhisperTranscriptionPage({ onNotify, files = [] }) {
   const [url, setUrl] = useState('');
   const [force, setForce] = useState(false);
   const [job, setJob] = useState(null);
@@ -1133,7 +1289,13 @@ function WhisperTranscriptionPage({ onNotify }) {
   const [error, setError] = useState('');
   const [isStarting, setIsStarting] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isLibraryStarting, setIsLibraryStarting] = useState(false);
+  const [selectedLibraryFilename, setSelectedLibraryFilename] = useState('');
   const [selectedAudioFile, setSelectedAudioFile] = useState(null);
+  const libraryFiles = useMemo(
+    () => (files || []).filter((file) => isMediaFile(file.filename || '')),
+    [files],
+  );
   const [copyStatus, setCopyStatus] = useState('Copy Transcript');
   const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
   const transcriptText = transcriptSegmentsToText(result?.segments || []);
@@ -1255,6 +1417,44 @@ function WhisperTranscriptionPage({ onNotify }) {
     }
   };
 
+  const handleLibrarySubmit = async (event) => {
+    event.preventDefault();
+    if (!selectedLibraryFilename || isLibraryStarting || isActive) return;
+
+    setIsLibraryStarting(true);
+    setError('');
+    setResult(null);
+    setCopyStatus('Copy Transcript');
+    try {
+      const response = await api.post('/whisper-library', {
+        filename: selectedLibraryFilename,
+        force,
+      });
+      const data = response.data || {};
+      if (data.already_done && data.result) {
+        setResult(data.result);
+        setJob(null);
+        notify('Loaded cached transcript for saved file', 'success');
+      } else {
+        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
+        notify('Whisper transcription of saved file started', 'success');
+      }
+    } catch (libraryError) {
+      setError(safeFetchError(libraryError, 'Unable to start Whisper transcription for this file.'));
+    } finally {
+      setIsLibraryStarting(false);
+    }
+  };
+
+  const handleOpenDownloadsFolder = async () => {
+    try {
+      await api.post('/open-downloads-folder');
+      notify('Downloads folder opened in File Explorer', 'info');
+    } catch (folderError) {
+      setError(safeFetchError(folderError, 'Unable to open downloads folder.'));
+    }
+  };
+
   const handleCopy = async () => {
     if (!transcriptText) return;
     try {
@@ -1352,6 +1552,65 @@ function WhisperTranscriptionPage({ onNotify }) {
             <button className="ghost-button" type="button" onClick={() => setSelectedAudioFile(null)} disabled={!selectedAudioFile || isUploading || isActive}>
               <X size={16} />
               Clear File
+            </button>
+          </div>
+        </form>
+
+        <div className="whisper-upload-divider"><span>or</span></div>
+
+        <form onSubmit={handleLibrarySubmit} className="download-form whisper-upload-form">
+          <div className="field field--full">
+            <div className="whisper-picker-header">
+              <label className="field__label" htmlFor="whisper-library-file">TRANSCRIBE SAVED FILE (FROM PLAYLIST / LIBRARY)</label>
+              <button
+                className="ghost-button ghost-button--small"
+                type="button"
+                onClick={handleOpenDownloadsFolder}
+                title="Open the downloads folder in File Explorer"
+              >
+                <FolderOpen size={14} />
+                Open downloads folder
+              </button>
+            </div>
+            {libraryFiles.length > 0 ? (
+              <>
+                <LibraryPicker
+                  files={libraryFiles}
+                  value={selectedLibraryFilename}
+                  onSelect={(filename) => {
+                    setSelectedLibraryFilename(filename);
+                    setError('');
+                  }}
+                />
+                <p className="field__help field__help--inline">
+                  Click a file to select it — same files as in your Library/Playlists (stored in the backend downloads folder).
+                  Whisper transcribes it directly from disk, no upload needed.
+                </p>
+              </>
+            ) : (
+              <p className="field__help field__help--inline">
+                Your library is empty — download or save some videos first, then you can transcribe them right here.
+              </p>
+            )}
+          </div>
+
+          <div className="transcript-actions">
+            <button
+              className="primary-button"
+              type="submit"
+              disabled={isLibraryStarting || isActive || !selectedLibraryFilename}
+            >
+              {isLibraryStarting || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
+              {isLibraryStarting ? 'Starting...' : isActive ? 'Transcribing...' : selectedLibraryFilename ? 'Transcribe Selected File' : 'Select a File Above'}
+            </button>
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => setSelectedLibraryFilename('')}
+              disabled={!selectedLibraryFilename || isLibraryStarting || isActive}
+            >
+              <X size={16} />
+              Clear Selection
             </button>
           </div>
         </form>
@@ -1481,7 +1740,33 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const [previewPlaybackRate, setPreviewPlaybackRate] = useState(1);
   const [transcriptButtonLabel, setTranscriptButtonLabel] = useState('Get Transcript');
   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState(() => new Set());
   const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
+
+  const toggleSelectionMode = useCallback(() => {
+    setSelectionMode((current) => {
+      if (current) setSelectedFiles(new Set());
+      return !current;
+    });
+  }, []);
+
+  const toggleSelectFile = useCallback((filename) => {
+    setSelectedFiles((current) => {
+      const next = new Set(current);
+      if (next.has(filename)) next.delete(filename);
+      else next.add(filename);
+      return next;
+    });
+  }, []);
+
+  const addSelectedToPlaylist = useCallback(() => {
+    if (selectedFiles.size === 0) return;
+    const list = [...selectedFiles];
+    setSelectedFiles(new Set());
+    setSelectionMode(false);
+    onAddToPlaylist?.(list);
+  }, [selectedFiles, onAddToPlaylist]);
   const videoRef = useRef(null);
 
   const releasePreviewPlayers = useCallback(async () => {
@@ -1710,6 +1995,35 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
             placeholder="Search files..."
           />
         </div>
+        <div className="toolbar-actions">
+          {selectionMode ? (
+            <>
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={() => setSelectedFiles(new Set(mediaFiles.map((file) => file.filename)))}
+                disabled={mediaFiles.length === 0}
+              >
+                Select all
+              </button>
+              <button className="ghost-button" type="button" onClick={() => setSelectedFiles(new Set())} disabled={selectedFiles.size === 0}>
+                Clear
+              </button>
+            </>
+          ) : null}
+          {mediaFiles.length > 0 ? (
+            <button className={`ghost-button ${selectionMode ? 'ghost-button--active' : ''}`} type="button" onClick={toggleSelectionMode}>
+              {selectionMode ? <X size={16} /> : <CheckSquare size={16} />}
+              {selectionMode ? 'Cancel select' : 'Select'}
+            </button>
+          ) : null}
+          {selectionMode && selectedFiles.size > 0 ? (
+            <button className="primary-button" type="button" onClick={addSelectedToPlaylist}>
+              <Plus size={16} />
+              Add {selectedFiles.size} to playlist
+            </button>
+          ) : null}
+        </div>
       </section>
 
       {previewFile ? (
@@ -1814,6 +2128,9 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
                 onSelect={setSelectedFile}
                 onDelete={handleDeleteFile}
                 onAddToPlaylist={onAddToPlaylist}
+                selectMode={selectionMode}
+                selected={selectedFiles.has(file.filename)}
+                onToggleSelect={toggleSelectFile}
                 compact
               />
             ))}
@@ -1860,6 +2177,11 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/whisper" end>
           <Mic2 size={18} />
           <span>Whisper</span>
+        </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/extract-audio" end>
+          <AudioLines size={18} />
+          <span>Audio Extractor</span>
         </NavLink>
 
         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/library" end>
@@ -2201,16 +2523,27 @@ export default function App() {
     }
   }, [isUnlocked, pushToast, refreshFiles]);
 
-  const addToPlaylist = useCallback(async (filename) => {
+  const [playlistPickerRequest, setPlaylistPickerRequest] = useState(null);
+
+  // Open the "which playlist?" dialog for one or many files.
+  const openPlaylistPicker = useCallback((filenameOrList) => {
     if (!isUnlocked) return;
-    if (!filename) return;
-    try {
-      await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
-      pushToast('Added to playlist', 'success', 2000);
-    } catch (error) {
-      pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
-    }
-  }, [isUnlocked, pushToast]);
+    const list = Array.isArray(filenameOrList) ? filenameOrList : [filenameOrList];
+    const items = list
+      .filter(Boolean)
+      .map((filename) => {
+        const file = files.find((item) => item.filename === filename);
+        return { filename, title: file?.title || cleanTitle(filename) };
+      });
+    if (items.length === 0) return;
+    setPlaylistPickerRequest({ items });
+  }, [isUnlocked, files]);
+
+  // Add one or more files to a playlist (opens picker)
+  const addToPlaylist = useCallback((filenameOrList) => {
+    if (!isUnlocked) return;
+    openPlaylistPicker(filenameOrList);
+  }, [isUnlocked, openPlaylistPicker]);
 
   const navigate = useNavigate();
 
@@ -2278,9 +2611,10 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/about" replace />} />
           <Route path="/about" element={<AboutPage />} />
-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
+          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
-          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} />} />
+          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+          <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
@@ -2312,6 +2646,14 @@ export default function App() {
         </>
       ) : null}
       <ToastStack toasts={toasts} />
+
+      {playlistPickerRequest ? (
+        <PlaylistPicker
+          items={playlistPickerRequest.items}
+          onClose={() => setPlaylistPickerRequest(null)}
+          onAdded={(playlistName) => pushToast(`Added to ${playlistName}`, 'success', 2000)}
+        />
+      ) : null}
 
       {!authReady || !isUnlocked ? (
         <AccessGate

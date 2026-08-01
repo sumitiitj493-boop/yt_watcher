@@ -33,6 +33,12 @@ class TranscriptUrlRequest(BaseModel):
     force: bool = Field(default=False)
 
 
+class WhisperLibraryRequest(BaseModel):
+    """Transcribe a file that is already saved in the library (e.g. from a playlist)."""
+    filename: str = Field(min_length=1, max_length=500)
+    force: bool = Field(default=False)
+
+
 class SocialDownloadRequest(BaseModel):
     url: HttpUrl
     quality: str = Field(default="best")

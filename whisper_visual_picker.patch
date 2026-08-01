@@ -1,0 +1,464 @@
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index 43d6b57..503fa60 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -25,6 +25,7 @@ from services.database import (
+ import os
+ import gc
+ import stat
++import sys
+ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id, resolve_download_path
+ from services.stream_state import active_streams
+ from services.transcripts import fetch_online_transcript
+@@ -133,6 +134,28 @@ async def get_storage():
+     return {"total_bytes": total, "file_count": count}
+ 
+ 
++def _open_downloads_folder() -> None:
++    """Open the downloads folder in the OS file explorer (server-side, so it
++    works because this app is self-hosted on the user's machine)."""
++    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
++    if sys.platform == "win32":
++        os.startfile(str(DOWNLOAD_DIR))  # type: ignore[attr-defined]
++        return
++    import subprocess
++
++    opener = "open" if sys.platform == "darwin" else "xdg-open"
++    subprocess.Popen([opener, str(DOWNLOAD_DIR)])
++
++
++@router.post("/open-downloads-folder")
++async def open_downloads_folder():
++    try:
++        _open_downloads_folder()
++    except Exception as exc:
++        raise HTTPException(status_code=500, detail=f"Unable to open downloads folder: {exc}")
++    return {"message": "Opened"}
++
++
+ @router.delete("/delete/{filename}")
+ async def delete_file(filename: str):
+     try:
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 6c32e80..2a53779 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3252,3 +3252,141 @@ body[data-theme='dark'] .main-stage {
+ .panel--toolbar .search-box {
+ 	flex: 1 1 240px;
+ }
++
++/* ===== Visual library picker (Whisper "from playlist/library") ===== */
++.whisper-picker-header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++	margin-bottom: 10px;
++}
++
++.library-picker {
++	display: grid;
++	gap: 10px;
++}
++
++.library-picker__search {
++	position: relative;
++}
++
++.library-picker__search-icon {
++	position: absolute;
++	left: 14px;
++	top: 50%;
++	transform: translateY(-50%);
++	color: var(--text-muted);
++	pointer-events: none;
++}
++
++.library-picker__search .input--search {
++	padding-left: 40px;
++}
++
++.library-picker__grid {
++	display: grid;
++	grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
++	gap: 10px;
++	max-height: 380px;
++	overflow-y: auto;
++	padding: 2px;
++}
++
++.library-picker__card {
++	position: relative;
++	display: flex;
++	flex-direction: column;
++	gap: 8px;
++	padding: 10px;
++	border-radius: 16px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	text-align: left;
++	font: inherit;
++	color: var(--text);
++	transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, box-shadow 140ms ease;
++}
++
++.library-picker__card:hover {
++	border-color: var(--accent);
++	transform: translateY(-1px);
++}
++
++.library-picker__card--selected {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.12);
++	box-shadow: 0 0 0 2px rgba(124, 58, 237, 0.18);
++}
++
++.library-picker__thumb {
++	width: 100%;
++	height: 84px;
++	object-fit: cover;
++	border-radius: 12px;
++	background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(124, 58, 237, 0.12));
++}
++
++.library-picker__thumb--fallback {
++	display: flex;
++	flex-direction: column;
++	align-items: center;
++	justify-content: center;
++	gap: 4px;
++	color: var(--text-muted);
++	font-size: 11px;
++	font-weight: 700;
++}
++
++.library-picker__card-check {
++	position: absolute;
++	top: 8px;
++	right: 8px;
++	width: 20px;
++	height: 20px;
++	border-radius: 50%;
++	display: grid;
++	place-items: center;
++	background: rgba(15, 23, 42, 0.55);
++	border: 2px solid rgba(148, 163, 184, 0.6);
++	color: #fff;
++	transition: background 140ms ease, border-color 140ms ease;
++}
++
++.library-picker__card--selected .library-picker__card-check {
++	background: var(--accent);
++	border-color: var(--accent);
++}
++
++.library-picker__card-title {
++	font-size: 13px;
++	font-weight: 600;
++	line-height: 1.25;
++	overflow: hidden;
++	display: -webkit-box;
++	-webkit-line-clamp: 2;
++	-webkit-box-orient: vertical;
++}
++
++.library-picker__card-meta {
++	font-size: 11px;
++	color: var(--text-muted);
++}
++
++.library-picker__empty {
++	padding: 24px;
++	text-align: center;
++	color: var(--text-muted);
++	border: 1px dashed var(--border);
++	border-radius: 16px;
++	font-size: 14px;
++}
++
++@media (max-width: 640px) {
++	.whisper-picker-header {
++		flex-direction: column;
++		align-items: flex-start;
++	}
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 68aa4a1..9afa647 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -5,6 +5,7 @@ import {
+   Check,
+   CheckSquare,
+   ChevronRight,
++  FolderOpen,
+   Clipboard,
+   Download,
+   FileText,
+@@ -33,6 +34,7 @@ import './App.css';
+ import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
+ import PlaylistPage from './pages/Playlist';
+ import PlaylistPicker from './components/PlaylistPicker';
++import LibraryPicker from './components/LibraryPicker';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -1308,6 +1310,15 @@ function WhisperTranscriptionPage({ onNotify, files = [] }) {
+     }
+   };
+ 
++  const handleOpenDownloadsFolder = async () => {
++    try {
++      await api.post('/open-downloads-folder');
++      notify('Downloads folder opened in File Explorer', 'info');
++    } catch (folderError) {
++      setError(safeFetchError(folderError, 'Unable to open downloads folder.'));
++    }
++  };
++
+   const handleCopy = async () => {
+     if (!transcriptText) return;
+     try {
+@@ -1413,28 +1424,31 @@ function WhisperTranscriptionPage({ onNotify, files = [] }) {
+ 
+         <form onSubmit={handleLibrarySubmit} className="download-form whisper-upload-form">
+           <div className="field field--full">
+-            <label className="field__label" htmlFor="whisper-library-file">TRANSCRIBE SAVED FILE (FROM PLAYLIST / LIBRARY)</label>
++            <div className="whisper-picker-header">
++              <label className="field__label" htmlFor="whisper-library-file">TRANSCRIBE SAVED FILE (FROM PLAYLIST / LIBRARY)</label>
++              <button
++                className="ghost-button ghost-button--small"
++                type="button"
++                onClick={handleOpenDownloadsFolder}
++                title="Open the downloads folder in File Explorer"
++              >
++                <FolderOpen size={14} />
++                Open downloads folder
++              </button>
++            </div>
+             {libraryFiles.length > 0 ? (
+               <>
+-                <select
+-                  id="whisper-library-file"
+-                  className="select"
++                <LibraryPicker
++                  files={libraryFiles}
+                   value={selectedLibraryFilename}
+-                  onChange={(event) => {
+-                    setSelectedLibraryFilename(event.target.value);
++                  onSelect={(filename) => {
++                    setSelectedLibraryFilename(filename);
+                     setError('');
+                   }}
+-                  disabled={isLibraryStarting || isActive}
+-                >
+-                  <option value="">Choose a saved video or audio...</option>
+-                  {libraryFiles.map((file) => (
+-                    <option key={file.filename} value={file.filename}>
+-                      {cleanTitle(file.filename)} ({mediaExt(file.filename).toUpperCase()}, {formatBytes(file.size)})
+-                    </option>
+-                  ))}
+-                </select>
++                />
+                 <p className="field__help field__help--inline">
+-                  Pick any file saved in your library — including playlist items — and Whisper will transcribe it directly, no upload needed.
++                  Click a file to select it — same files as in your Library/Playlists (stored in the backend downloads folder).
++                  Whisper transcribes it directly from disk, no upload needed.
+                 </p>
+               </>
+             ) : (
+@@ -1451,7 +1465,7 @@ function WhisperTranscriptionPage({ onNotify, files = [] }) {
+               disabled={isLibraryStarting || isActive || !selectedLibraryFilename}
+             >
+               {isLibraryStarting || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
+-              {isLibraryStarting ? 'Starting...' : isActive ? 'Transcribing...' : 'Transcribe Saved File'}
++              {isLibraryStarting ? 'Starting...' : isActive ? 'Transcribing...' : selectedLibraryFilename ? 'Transcribe Selected File' : 'Select a File Above'}
+             </button>
+             <button
+               className="ghost-button"
+diff --git a/frontend/src/components/LibraryPicker.jsx b/frontend/src/components/LibraryPicker.jsx
+new file mode 100644
+index 0000000..588773a
+--- /dev/null
++++ b/frontend/src/components/LibraryPicker.jsx
+@@ -0,0 +1,125 @@
++import { useMemo, useState } from 'react';
++import { Check, FileAudio, FileVideo, Search } from 'lucide-react';
++
++const mediaExt = (filename = '') => filename.split('.').pop()?.toLowerCase() || '';
++const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'ogg', 'flac', 'wav', 'opus', 'aiff', 'aif']);
++
++const cleanTitle = (filename = '') => (
++  filename
++    .replace(/\.[^.]+$/, '')
++    .replace(/\s*\([A-Za-z0-9_-]{11}\)\s*$/, '')
++    .trim()
++);
++
++const extractVideoId = (filename = '') => {
++  const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
++  return match ? match[1] : '';
++};
++
++const formatBytes = (bytes = 0) => {
++  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
++  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
++};
++
++function FileThumb({ file }) {
++  const title = file.title || cleanTitle(file.filename || '');
++  const videoId = file.video_id || extractVideoId(file.filename || '');
++
++  if (videoId) {
++    return (
++      <img
++        className="library-picker__thumb"
++        src={`https://img.youtube.com/vi/${videoId}/mqdefault.jpg`}
++        alt={title}
++        loading="lazy"
++        onError={(event) => {
++          event.currentTarget.style.display = 'none';
++        }}
++      />
++    );
++  }
++
++  const ext = mediaExt(file.filename || '');
++  const isAudio = AUDIO_EXTS.has(ext);
++  return (
++    <div className="library-picker__thumb library-picker__thumb--fallback" aria-hidden="true">
++      {isAudio ? <FileAudio size={22} /> : <FileVideo size={22} />}
++      <span>{ext.toUpperCase() || 'FILE'}</span>
++    </div>
++  );
++}
++
++/**
++ * Visual file browser for choosing a saved file (e.g. in Whisper).
++ * Shows thumbnails + titles from the backend downloads folder instead of
++ * a text-only dropdown.
++ */
++export default function LibraryPicker({
++  files = [],
++  value = '',
++  onSelect,
++  searchPlaceholder = 'Search saved files...',
++}) {
++  const [query, setQuery] = useState('');
++
++  const filtered = useMemo(() => {
++    const needle = query.trim().toLowerCase();
++    if (!needle) return files;
++    return files.filter((file) => {
++      const title = (file.title || cleanTitle(file.filename || '')).toLowerCase();
++      const filename = (file.filename || '').toLowerCase();
++      return title.includes(needle) || filename.includes(needle);
++    });
++  }, [files, query]);
++
++  return (
++    <div className="library-picker">
++      <div className="library-picker__search">
++        <Search size={15} className="library-picker__search-icon" />
++        <input
++          className="input input--search"
++          value={query}
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder={searchPlaceholder}
++        />
++      </div>
++
++      {filtered.length === 0 ? (
++        <div className="library-picker__empty">
++          {files.length === 0
++            ? 'No saved files yet. Download some videos first, then you can transcribe them here.'
++            : 'No files match your search.'}
++        </div>
++      ) : (
++        <div className="library-picker__grid">
++          {filtered.map((file) => {
++            const selected = file.filename === value;
++            return (
++              <button
++                key={file.filename}
++                type="button"
++                className={`library-picker__card ${selected ? 'library-picker__card--selected' : ''}`}
++                onClick={() => onSelect?.(file.filename)}
++                title={file.filename}
++              >
++                <FileThumb file={file} />
++                <span className="library-picker__card-check" aria-hidden="true">
++                  {selected ? <Check size={12} /> : null}
++                </span>
++                <span className="library-picker__card-title">
++                  {file.title || cleanTitle(file.filename)}
++                </span>
++                <span className="library-picker__card-meta">
++                  {mediaExt(file.filename).toUpperCase()} · {formatBytes(file.size)}
++                </span>
++              </button>
++            );
++          })}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/testing/test_open_downloads_folder.py b/testing/test_open_downloads_folder.py
+new file mode 100644
+index 0000000..115bc81
+--- /dev/null
++++ b/testing/test_open_downloads_folder.py
+@@ -0,0 +1,47 @@
++"""Sanity test for POST /api/open-downloads-folder.
++
++Run from the repo root:
++    python testing/test_open_downloads_folder.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++from unittest import mock
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_folder_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # The OS folder-open call is mocked; we just verify the endpoint wiring.
++    with mock.patch.object(library_routes, "_open_downloads_folder", return_value=None) as opener:
++        resp = client.post("/api/open-downloads-folder")
++        assert resp.status_code == 200, resp.text
++        assert resp.json() == {"message": "Opened"}, resp.text
++        opener.assert_called_once()
++
++    # If the OS call fails, we surface a 500 with a clear message.
++    with mock.patch.object(
++        library_routes, "_open_downloads_folder", side_effect=RuntimeError("boom")
++    ):
++        resp = client.post("/api/open-downloads-folder")
++        assert resp.status_code == 500, resp.text
++        assert "boom" in resp.json()["detail"], resp.text
++
++    print("ALL OPEN-DOWNLOADS-FOLDER TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -1,0 +1,310 @@
+diff --git a/backend/models.py b/backend/models.py
+index a422254..6ef0460 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -33,6 +33,12 @@ class TranscriptUrlRequest(BaseModel):
+     force: bool = Field(default=False)
+ 
+ 
++class WhisperLibraryRequest(BaseModel):
++    """Transcribe a file that is already saved in the library (e.g. from a playlist)."""
++    filename: str = Field(min_length=1, max_length=500)
++    force: bool = Field(default=False)
++
++
+ class SocialDownloadRequest(BaseModel):
+     url: HttpUrl
+     quality: str = Field(default="best")
+diff --git a/backend/routes/download.py b/backend/routes/download.py
+index e3c611c..895fac7 100644
+--- a/backend/routes/download.py
++++ b/backend/routes/download.py
+@@ -3,12 +3,14 @@ import asyncio
+ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket
+ from starlette.websockets import WebSocketDisconnect
+ 
+-from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest
++from models import DownloadRequest, MetadataRequest, SocialDownloadRequest, TranscriptUrlRequest, WhisperLibraryRequest
+ from services.metadata import fetch_metadata
+ from services.transcripts import (
++    UPLOAD_AUDIO_EXTENSIONS,
+     fetch_url_transcript,
+     get_url_transcription_job,
+     save_uploaded_audio_file,
++    start_library_whisper_transcription,
+     start_uploaded_whisper_transcription,
+     start_url_whisper_transcription,
+ )
+@@ -27,7 +29,7 @@ from services.downloader import (
+     TERMINAL_STATUSES,
+ )
+ from pathlib import Path
+-from services.files import DOWNLOAD_DIR
++from services.files import DOWNLOAD_DIR, resolve_download_path
+ 
+ router = APIRouter()
+ 
+@@ -99,6 +101,34 @@ async def whisper_transcription_upload(
+             pass
+ 
+ 
++@router.post("/whisper-library")
++async def whisper_library_transcription(request: WhisperLibraryRequest):
++    """Transcribe a file already saved in the library (e.g. a playlist item).
++
++    No upload is needed — the backend reads the local file directly and runs
++    the same Whisper pipeline used for uploads.
++    """
++    try:
++        safe_path = resolve_download_path(request.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++
++    if safe_path.suffix.lower().lstrip(".") not in UPLOAD_AUDIO_EXTENSIONS:
++        raise HTTPException(
++            status_code=400,
++            detail=f"Unsupported file type .{safe_path.suffix.lower().lstrip('.') or 'unknown'}",
++        )
++
++    size_bytes = safe_path.stat().st_size
++    response = await start_library_whisper_transcription(safe_path, safe_path.name, request.force)
++    response["filename"] = safe_path.name
++    response["size_bytes"] = size_bytes
++    return response
++
++
+ @router.get("/whisper-transcriptions/{job_id}")
+ async def whisper_transcription_status(job_id: str):
+     job = get_url_transcription_job(job_id)
+diff --git a/backend/services/transcripts.py b/backend/services/transcripts.py
+index 0e345e2..0495df2 100644
+--- a/backend/services/transcripts.py
++++ b/backend/services/transcripts.py
+@@ -1291,6 +1291,16 @@ def get_manual_transcription_job(job_id: str) -> dict | None:
+     return MANUAL_TRANSCRIPT_JOBS.get(job_id)
+ 
+ 
++async def start_library_whisper_transcription(path: Path, filename: str, force: bool = False) -> dict:
++    """Start Whisper on a file already saved in the library/playlist.
++
++    The cache key is derived from the filename (stable across restarts), so a
++    file transcribed once can be reused unless ``force`` is set.
++    """
++    key = f"library_{_safe_url_key(filename)}"
++    return await start_uploaded_whisper_transcription(path, filename, key, force)
++
++
+ async def start_url_whisper_transcription(url: str, force: bool = False) -> dict:
+     url = str(url or "").strip()
+     if not url:
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 1c60ab7..68aa4a1 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1143,7 +1143,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   );
+ }
+ 
+-function WhisperTranscriptionPage({ onNotify }) {
++function WhisperTranscriptionPage({ onNotify, files = [] }) {
+   const [url, setUrl] = useState('');
+   const [force, setForce] = useState(false);
+   const [job, setJob] = useState(null);
+@@ -1151,7 +1151,13 @@ function WhisperTranscriptionPage({ onNotify }) {
+   const [error, setError] = useState('');
+   const [isStarting, setIsStarting] = useState(false);
+   const [isUploading, setIsUploading] = useState(false);
++  const [isLibraryStarting, setIsLibraryStarting] = useState(false);
++  const [selectedLibraryFilename, setSelectedLibraryFilename] = useState('');
+   const [selectedAudioFile, setSelectedAudioFile] = useState(null);
++  const libraryFiles = useMemo(
++    () => (files || []).filter((file) => isMediaFile(file.filename || '')),
++    [files],
++  );
+   const [copyStatus, setCopyStatus] = useState('Copy Transcript');
+   const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000);
+   const transcriptText = transcriptSegmentsToText(result?.segments || []);
+@@ -1273,6 +1279,35 @@ function WhisperTranscriptionPage({ onNotify }) {
+     }
+   };
+ 
++  const handleLibrarySubmit = async (event) => {
++    event.preventDefault();
++    if (!selectedLibraryFilename || isLibraryStarting || isActive) return;
++
++    setIsLibraryStarting(true);
++    setError('');
++    setResult(null);
++    setCopyStatus('Copy Transcript');
++    try {
++      const response = await api.post('/whisper-library', {
++        filename: selectedLibraryFilename,
++        force,
++      });
++      const data = response.data || {};
++      if (data.already_done && data.result) {
++        setResult(data.result);
++        setJob(null);
++        notify('Loaded cached transcript for saved file', 'success');
++      } else {
++        setJob({ ...data, created_at: data.created_at || Date.now() / 1000 });
++        notify('Whisper transcription of saved file started', 'success');
++      }
++    } catch (libraryError) {
++      setError(safeFetchError(libraryError, 'Unable to start Whisper transcription for this file.'));
++    } finally {
++      setIsLibraryStarting(false);
++    }
++  };
++
+   const handleCopy = async () => {
+     if (!transcriptText) return;
+     try {
+@@ -1374,6 +1409,62 @@ function WhisperTranscriptionPage({ onNotify }) {
+           </div>
+         </form>
+ 
++        <div className="whisper-upload-divider"><span>or</span></div>
++
++        <form onSubmit={handleLibrarySubmit} className="download-form whisper-upload-form">
++          <div className="field field--full">
++            <label className="field__label" htmlFor="whisper-library-file">TRANSCRIBE SAVED FILE (FROM PLAYLIST / LIBRARY)</label>
++            {libraryFiles.length > 0 ? (
++              <>
++                <select
++                  id="whisper-library-file"
++                  className="select"
++                  value={selectedLibraryFilename}
++                  onChange={(event) => {
++                    setSelectedLibraryFilename(event.target.value);
++                    setError('');
++                  }}
++                  disabled={isLibraryStarting || isActive}
++                >
++                  <option value="">Choose a saved video or audio...</option>
++                  {libraryFiles.map((file) => (
++                    <option key={file.filename} value={file.filename}>
++                      {cleanTitle(file.filename)} ({mediaExt(file.filename).toUpperCase()}, {formatBytes(file.size)})
++                    </option>
++                  ))}
++                </select>
++                <p className="field__help field__help--inline">
++                  Pick any file saved in your library — including playlist items — and Whisper will transcribe it directly, no upload needed.
++                </p>
++              </>
++            ) : (
++              <p className="field__help field__help--inline">
++                Your library is empty — download or save some videos first, then you can transcribe them right here.
++              </p>
++            )}
++          </div>
++
++          <div className="transcript-actions">
++            <button
++              className="primary-button"
++              type="submit"
++              disabled={isLibraryStarting || isActive || !selectedLibraryFilename}
++            >
++              {isLibraryStarting || isActive ? <Loader2 className="spin" size={16} /> : <Mic2 size={16} />}
++              {isLibraryStarting ? 'Starting...' : isActive ? 'Transcribing...' : 'Transcribe Saved File'}
++            </button>
++            <button
++              className="ghost-button"
++              type="button"
++              onClick={() => setSelectedLibraryFilename('')}
++              disabled={!selectedLibraryFilename || isLibraryStarting || isActive}
++            >
++              <X size={16} />
++              Clear Selection
++            </button>
++          </div>
++        </form>
++
+         {job ? (
+           <div className="whisper-job-card">
+             <div className="download-card__title-row">
+@@ -2361,7 +2452,7 @@ export default function App() {
+           <Route path="/about" element={<AboutPage />} />
+           <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+-          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} />} />
++          <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+           <Route path="*" element={<Navigate to="/download" replace />} />
+diff --git a/testing/test_whisper_library.py b/testing/test_whisper_library.py
+new file mode 100644
+index 0000000..8f10c3a
+--- /dev/null
++++ b/testing/test_whisper_library.py
+@@ -0,0 +1,67 @@
++"""Sanity test for POST /api/whisper-library (transcribe a saved file).
++
++Run from the repo root:
++    python testing/test_whisper_library.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_whisper_lib_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Fake media file (tiny, won't actually be transcribed — we only check the endpoint wiring)
++    (tmp_dir / "My Lecture (dQw4w9WgXcQ).mp4").write_bytes(b"\x00" * 4096)
++
++    from routes import download as download_routes
++
++    app = FastAPI()
++    app.include_router(download_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # 1. Valid file -> starts a queued job (or cached result if available)
++    resp = client.post("/api/whisper-library", json={
++        "filename": "My Lecture (dQw4w9WgXcQ).mp4",
++        "force": False,
++    })
++    assert resp.status_code == 200, resp.text
++    data = resp.json()
++    assert data.get("filename") == "My Lecture (dQw4w9WgXcQ).mp4", data
++    assert data.get("size_bytes") == 4096, data
++    assert data.get("job_id") or data.get("already_done"), data
++    print("[PASS] valid library file accepted:", data.get("job_id") and "queued job" or "cached result")
++
++    # 2. Missing file -> 404
++    resp = client.post("/api/whisper-library", json={"filename": "nope.mp3", "force": False})
++    assert resp.status_code == 404, resp.text
++    print("[PASS] missing file -> 404")
++
++    # 3. Invalid filename (path traversal) -> 400
++    resp = client.post("/api/whisper-library", json={"filename": "../etc/passwd", "force": False})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] traversal filename -> 400")
++
++    # 4. Unsupported extension -> 400
++    (tmp_dir / "data.json").write_text("{}")
++    resp = client.post("/api/whisper-library", json={"filename": "data.json", "force": False})
++    assert resp.status_code == 400, resp.text
++    print("[PASS] unsupported extension -> 400")
++
++    # 5. Missing body field -> 422
++    resp = client.post("/api/whisper-library", json={"force": False})
++    assert resp.status_code == 422, resp.text
++    print("[PASS] missing filename -> 422")
++
++    print("\nALL WHISPER LIBRARY TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)

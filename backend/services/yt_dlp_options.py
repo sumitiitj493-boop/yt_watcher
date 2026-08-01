@@ -75,7 +75,40 @@ def youtube_cookies_file() -> Path:
 
 
 def social_cookies_file() -> Path:
-    return _env_path("SOCIAL_COOKIES_FILE", DEFAULT_SOCIAL_COOKIES_FILE)
+    # Respect explicit env override first
+    value = os.environ.get("SOCIAL_COOKIES_FILE")
+    if value:
+        return _env_path("SOCIAL_COOKIES_FILE", DEFAULT_SOCIAL_COOKIES_FILE)
+
+    # Accept a small set of common filenames (including a misspelling) so users
+    # who drop a file in the backend folder still get picked up without env vars.
+    candidates = [
+        BACKEND_DIR / "instagram_cookies.txt",
+        BACKEND_DIR / "instagram_cookes.txt",
+        BACKEND_DIR / "social_cookies.txt",
+        BACKEND_DIR / "cookies.txt",
+    ]
+    for candidate in candidates:
+        # Prefer an existing file in the repo/backend or cwd/project locations
+        cwd_candidate = Path.cwd() / candidate.name
+        project_candidate = PROJECT_DIR / candidate.name
+        backend_candidate = candidate
+        for path in (cwd_candidate, backend_candidate, project_candidate):
+            if path.exists() and path.is_file():
+                return path
+
+    # Fallback to the default path when nothing else exists
+    return DEFAULT_SOCIAL_COOKIES_FILE
+
+
+def social_cookies_browsers() -> list[str]:
+    """Browsers to pull Instagram/social cookies from, via yt-dlp
+    ``cookiesfrombrowser``. Configure with SOCIAL_COOKIES_BROWSER
+    (comma-separated, e.g. ``chrome,edge,firefox``)."""
+    raw = os.environ.get("SOCIAL_COOKIES_BROWSER", "").strip()
+    if not raw:
+        return []
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
 
 
 def is_youtube_url(url: str) -> bool:
@@ -94,11 +127,52 @@ def is_youtube_url(url: str) -> bool:
     )
 
 
+def is_instagram_url(url: str) -> bool:
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
+def instagram_error_help(error: str) -> str:
+    """Turn a raw yt-dlp Instagram error into actionable guidance."""
+    text = (error or "").lower()
+    if any(marker in text for marker in ("app-bound", "appbound", "failed to decrypt", "dpapi", "decrypt", "keyring", "keychain")):
+        return (
+            "The browser cookie file could not be decrypted. Recent Chrome/Edge encrypt cookies "
+            "(app-bound encryption) so yt-dlp cannot read them. Fix: 1) Use Firefox and set "
+            "SOCIAL_COOKIES_BROWSER=firefox, OR 2) upload an instagram_cookies.txt file exported "
+            "from your logged-in browser (see the 'Instagram login cookies' card on this page)."
+        )
+    if "empty media response" in text:
+        return (
+            "Instagram now blocks downloads unless you're logged in. Fix, easiest first: "
+            "1) On this page, use the 'Instagram login cookies' card to upload an "
+            "instagram_cookies.txt file exported from your logged-in browser (install the "
+            "'Get cookies.txt LOCALLY' browser extension, log into Instagram, export cookies). "
+            "2) Or set the backend environment variable SOCIAL_COOKIES_BROWSER=firefox "
+            "(Firefox cookies work best — recent Chrome/Edge encrypt cookies and yt-dlp may not "
+            "read them), then restart the backend. 3) Or save the cookies file directly to "
+            "backend/instagram_cookies.txt."
+        )
+    if any(marker in text for marker in ("login", "sign in", "log in", "authentication", "not logged")):
+        return (
+            "Instagram requires login for this post. Log in on this PC and either set "
+            "SOCIAL_COOKIES_BROWSER=firefox (or chrome/edge) and restart the backend, or upload "
+            "a Netscape-format instagram_cookies.txt via the 'Instagram login cookies' card."
+        )
+    if "unsupported url" in text:
+        return (
+            "yt-dlp does not support this link. Make sure you pasted a direct post/reel/story URL "
+            "from instagram.com."
+        )
+    return ""
+
+
 def _candidate_cookie_paths(url: str) -> list[Path]:
     if is_youtube_url(url):
         candidates = [youtube_cookies_file(), LEGACY_COOKIES_FILE]
     else:
-        candidates = [social_cookies_file()]
+        # Allow a general legacy cookies.txt as a fallback for social platforms
+        candidates = [social_cookies_file(), LEGACY_COOKIES_FILE]
 
     deduped: list[Path] = []
     seen: set[str] = set()
@@ -255,6 +329,28 @@ def apply_cookiefile(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
     return ydl_opts
 
 
+def apply_cookiesfrombrowser(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+    """Pass cookies straight from a local browser profile (e.g. Chrome/Edge
+    where the user is logged into Instagram). This is the easiest fix for
+    Instagram's "empty media response" auth wall: no file to export."""
+    if "cookiefile" in ydl_opts:
+        return ydl_opts
+    browsers = social_cookies_browsers()
+    if not browsers:
+        return ydl_opts
+    ydl_opts["cookiesfrombrowser"] = (browsers[0], None, None, None)
+    return ydl_opts
+
+
+def apply_social_auth_options(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+    """Authentication helpers for non-YouTube (Instagram / social) URLs."""
+    if is_youtube_url(url):
+        return ydl_opts
+    apply_cookiefile(ydl_opts, url)
+    apply_cookiesfrombrowser(ydl_opts, url)
+    return ydl_opts
+
+
 def _merge_extractor_args(ydl_opts: dict[str, Any], ie_key: str, values: dict[str, list[str]]) -> None:
     extractor_args = dict(ydl_opts.get("extractor_args") or {})
     existing = dict(extractor_args.get(ie_key) or {})
@@ -345,7 +441,10 @@ def apply_reliable_ytdlp_options(ydl_opts: dict[str, Any], url: str) -> dict[str
 
     add_generic_impersonation(ydl_opts)
     apply_youtube_runtime_options(ydl_opts, url)
-    apply_cookiefile(ydl_opts, url)
+    if is_youtube_url(url):
+        apply_cookiefile(ydl_opts, url)
+    else:
+        apply_social_auth_options(ydl_opts, url)
     return ydl_opts
 
 

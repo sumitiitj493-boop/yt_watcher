@@ -1,0 +1,1849 @@
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index 7151d8f..8360148 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -8,10 +8,15 @@ from pydantic import BaseModel, Field
+ from services.database import (
+     add_playlist_item,
+     create_note,
++    create_playlist,
+     delete_note,
+-    get_playlist,
++    delete_playlist,
++    get_default_playlist_id,
++    get_playlist_items,
+     list_notes,
++    list_playlists,
+     remove_playlist_item,
++    rename_playlist,
+     reorder_playlist,
+     update_note,
+ )
+@@ -47,6 +52,14 @@ class NoteUpdateRequest(BaseModel):
+     color: str | None = Field(default=None, max_length=40)
+ 
+ 
++class PlaylistNameRequest(BaseModel):
++    name: str = Field(min_length=1, max_length=120)
++
++
++class PlaylistAddItemRequest(BaseModel):
++    filename: str = Field(min_length=1, max_length=500)
++
++
+ def _get_cached_files() -> list[dict]:
+     now = time.time()
+     if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
+@@ -278,38 +291,138 @@ async def remove_note(note_id: int):
+     return {"message": "Deleted"}
+ 
+ 
+-# --- Playlist endpoints -------------------------------------------------
++# --- Playlist endpoints (multiple, named) ---------------------------------
++def _playlist_exists(playlist_id: int) -> bool:
++    return any(item["id"] == playlist_id for item in list_playlists())
++
++
++def _default_playlist_id_or_create() -> int:
++    """Return the default (oldest) playlist, creating one if none remain."""
++    playlist_id = get_default_playlist_id()
++    if playlist_id is None:
++        try:
++            create_playlist("My Playlist")
++            playlist_id = get_default_playlist_id()
++        except ValueError:
++            playlist_id = get_default_playlist_id()
++    if playlist_id is None:
++        raise HTTPException(status_code=404, detail="No playlist available")
++    return playlist_id
++
++
++@router.get('/playlists')
++async def playlists_list():
++    return {"playlists": list_playlists()}
++
++
++@router.post('/playlists')
++async def playlists_create(payload: PlaylistNameRequest):
++    try:
++        playlist = create_playlist(payload.name)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc))
++    return {"playlist": playlist}
++
++
++@router.patch('/playlists/{playlist_id}')
++async def playlists_rename(playlist_id: int, payload: PlaylistNameRequest):
++    try:
++        playlist = rename_playlist(playlist_id, payload.name)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc))
++    if not playlist:
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return {"playlist": playlist}
++
++
++@router.delete('/playlists/{playlist_id}')
++async def playlists_delete(playlist_id: int):
++    if not delete_playlist(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return {"message": "Deleted"}
++
++
++@router.get('/playlists/{playlist_id}/items')
++async def playlists_items(playlist_id: int):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    return get_playlist_items(playlist_id)
++
++
++@router.post('/playlists/{playlist_id}/items')
++async def playlists_add_item(playlist_id: int, payload: PlaylistAddItemRequest):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    try:
++        safe_path = resolve_download_path(payload.filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++    if not safe_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++    return add_playlist_item(playlist_id, safe_path.name)
++
++
++@router.delete('/playlists/{playlist_id}/items/{filename}')
++async def playlists_remove_item(playlist_id: int, filename: str):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    try:
++        safe_path = resolve_download_path(filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++    return remove_playlist_item(playlist_id, safe_path.name)
++
++
++@router.post('/playlists/{playlist_id}/reorder')
++async def playlists_reorder(playlist_id: int, order: list[str]):
++    if not _playlist_exists(playlist_id):
++        raise HTTPException(status_code=404, detail="Playlist not found")
++    safe_order: list[str] = []
++    for filename in order or []:
++        try:
++            safe_order.append(resolve_download_path(filename).name)
++        except ValueError:
++            continue
++    return reorder_playlist(playlist_id, safe_order)
++
++
++# --- Legacy single-playlist endpoints (kept for compatibility) ------------
++# These operate on the default (oldest) playlist.
+ @router.get('/playlist')
+-async def playlist_get():
+-    return get_playlist()
++async def playlist_get_legacy():
++    playlist_id = _default_playlist_id_or_create()
++    return get_playlist_items(playlist_id)
+ 
+ 
+ @router.post('/playlist/add/{filename}')
+-async def add_to_playlist(filename: str):
++async def add_to_playlist_legacy(filename: str):
+     try:
+         safe_path = resolve_download_path(filename)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="Invalid filename")
+     if not safe_path.exists():
+         raise HTTPException(status_code=404, detail="File not found")
+-    return add_playlist_item(safe_path.name)
++    playlist_id = _default_playlist_id_or_create()
++    return add_playlist_item(playlist_id, safe_path.name)
+ 
+ 
+ @router.delete('/playlist/remove/{filename}')
+-async def remove_from_playlist(filename: str):
++async def remove_from_playlist_legacy(filename: str):
+     try:
+         safe_path = resolve_download_path(filename)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="Invalid filename")
+-    return remove_playlist_item(safe_path.name)
++    playlist_id = _default_playlist_id_or_create()
++    return remove_playlist_item(playlist_id, safe_path.name)
+ 
+ 
+ @router.post('/playlist/reorder')
+-async def playlist_reorder(order: list[str]):
++async def playlist_reorder_legacy(order: list[str]):
++    playlist_id = _default_playlist_id_or_create()
+     safe_order: list[str] = []
+     for filename in order or []:
+         try:
+             safe_order.append(resolve_download_path(filename).name)
+         except ValueError:
+             continue
+-    return reorder_playlist(safe_order)
++    return reorder_playlist(playlist_id, safe_order)
+diff --git a/backend/services/database.py b/backend/services/database.py
+index 258b21c..ab80b8a 100644
+--- a/backend/services/database.py
++++ b/backend/services/database.py
+@@ -20,9 +20,93 @@ def _connect() -> sqlite3.Connection:
+     return conn
+ 
+ 
++def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
++    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
++
++
++def _migrate_legacy_playlist_schema(conn: sqlite3.Connection) -> None:
++    """
++    The very first release had a single unnamed playlist stored in a flat
++    `playlist_items` table (filename UNIQUE, position, created_at). This
++    migration renames that table, creates the new multi-playlist tables and
++    moves the old items into a default playlist named "My Playlist".
++    """
++    columns = _table_columns(conn, "playlist_items")
++    if not columns:
++        return
++    # New schema already applied (has playlist_id) -> nothing to do.
++    if "playlist_id" in columns:
++        return
++
++    conn.execute("ALTER TABLE playlist_items RENAME TO playlist_items_legacy")
++    conn.execute("DROP INDEX IF EXISTS idx_playlist_items_position")
++
++    conn.executescript(
++        """
++        CREATE TABLE IF NOT EXISTS playlists (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            name TEXT NOT NULL UNIQUE,
++            created_at REAL NOT NULL
++        );
++
++        CREATE TABLE IF NOT EXISTS playlist_items (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
++            filename TEXT NOT NULL,
++            position INTEGER NOT NULL,
++            created_at REAL NOT NULL,
++            UNIQUE(playlist_id, filename)
++        );
++
++        CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
++            ON playlist_items(playlist_id, position);
++        """
++    )
++
++    now = time.time()
++    conn.execute(
++        "INSERT OR IGNORE INTO playlists (name, created_at) VALUES ('My Playlist', ?)",
++        (now,),
++    )
++    conn.execute(
++        """
++        INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at)
++        SELECT p.id, legacy.filename, legacy.position, legacy.created_at
++        FROM playlist_items_legacy legacy
++        JOIN playlists p ON p.name = 'My Playlist'
++        """
++    )
++    conn.execute("DROP TABLE playlist_items_legacy")
++    conn.commit()
++
++
++def _ensure_default_playlist(conn: sqlite3.Connection) -> None:
++    """
++    Create the starter "My Playlist" once per install (first boot, or when a
++    legacy install is migrated). After that the user is free to delete every
++    playlist and have none.
++    """
++    meta = conn.execute(
++        "SELECT value FROM app_meta WHERE key = 'default_playlist_created'"
++    ).fetchone()
++    if meta is not None:
++        return
++    count = conn.execute("SELECT COUNT(*) AS c FROM playlists").fetchone()["c"]
++    if count == 0:
++        conn.execute(
++            "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
++            ("My Playlist", time.time()),
++        )
++    conn.execute(
++        "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('default_playlist_created', '1')"
++    )
++    conn.commit()
++
++
+ def ensure_db_initialized() -> None:
+     with _SCHEMA_LOCK:
+         with _connect() as conn:
++            _migrate_legacy_playlist_schema(conn)
+             conn.executescript(
+                 """
+                 CREATE TABLE IF NOT EXISTS download_jobs (
+@@ -57,16 +141,31 @@ def ensure_db_initialized() -> None:
+ 
+                 CREATE INDEX IF NOT EXISTS idx_notes_filename_time ON notes(filename, time_seconds);
+ 
++                CREATE TABLE IF NOT EXISTS app_meta (
++                    key TEXT PRIMARY KEY,
++                    value TEXT NOT NULL DEFAULT ''
++                );
++
++                CREATE TABLE IF NOT EXISTS playlists (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    name TEXT NOT NULL UNIQUE,
++                    created_at REAL NOT NULL
++                );
++
+                 CREATE TABLE IF NOT EXISTS playlist_items (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+-                    filename TEXT NOT NULL UNIQUE,
++                    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
++                    filename TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+-                    created_at REAL NOT NULL
++                    created_at REAL NOT NULL,
++                    UNIQUE(playlist_id, filename)
+                 );
+ 
+-                CREATE INDEX IF NOT EXISTS idx_playlist_items_position ON playlist_items(position);
++                CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
++                    ON playlist_items(playlist_id, position);
+                 """
+             )
++            _ensure_default_playlist(conn)
+             conn.commit()
+ 
+ 
+@@ -218,55 +317,147 @@ def delete_note(note_id: int) -> bool:
+         return cursor.rowcount > 0
+ 
+ 
+-def get_playlist() -> List[str]:
++# --- Playlists (multiple, named) ------------------------------------------
++def _playlist_row(conn: sqlite3.Connection, playlist_id: int) -> Optional[dict]:
++    row = conn.execute(
++        """
++        SELECT p.id, p.name, p.created_at,
++               (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
++        FROM playlists p
++        WHERE p.id = ?
++        """,
++        (playlist_id,),
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def list_playlists() -> List[dict]:
++    ensure_db_initialized()
++    with _connect() as conn:
++        rows = conn.execute(
++            """
++            SELECT p.id, p.name, p.created_at,
++                   (SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id = p.id) AS item_count
++            FROM playlists p
++            ORDER BY p.created_at ASC, p.id ASC
++            """
++        ).fetchall()
++    return [dict(row) for row in rows]
++
++
++def get_default_playlist_id() -> Optional[int]:
++    """The default playlist is simply the oldest one (used by legacy endpoints)."""
++    ensure_db_initialized()
++    with _connect() as conn:
++        row = conn.execute("SELECT id FROM playlists ORDER BY created_at ASC, id ASC LIMIT 1").fetchone()
++    return row["id"] if row else None
++
++
++def create_playlist(name: str) -> dict:
++    ensure_db_initialized()
++    cleaned = name.strip()
++    if not cleaned:
++        raise ValueError("Playlist name cannot be empty")
++    with _connect() as conn:
++        try:
++            cursor = conn.execute(
++                "INSERT INTO playlists (name, created_at) VALUES (?, ?)",
++                (cleaned, time.time()),
++            )
++            conn.commit()
++        except sqlite3.IntegrityError:
++            raise ValueError(f"A playlist named '{cleaned}' already exists")
++        row = _playlist_row(conn, cursor.lastrowid)
++    return row
++
++
++def rename_playlist(playlist_id: int, name: str) -> Optional[dict]:
++    ensure_db_initialized()
++    cleaned = name.strip()
++    if not cleaned:
++        raise ValueError("Playlist name cannot be empty")
++    with _connect() as conn:
++        try:
++            conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (cleaned, playlist_id))
++            conn.commit()
++        except sqlite3.IntegrityError:
++            raise ValueError(f"A playlist named '{cleaned}' already exists")
++        row = _playlist_row(conn, playlist_id)
++    return row
++
++
++def delete_playlist(playlist_id: int) -> bool:
++    ensure_db_initialized()
++    with _connect() as conn:
++        cursor = conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
++        conn.commit()
++        return cursor.rowcount > 0
++
++
++def get_playlist_items(playlist_id: int) -> List[str]:
+     ensure_db_initialized()
+     with _connect() as conn:
+-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
++        rows = conn.execute(
++            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
++            (playlist_id,),
++        ).fetchall()
+     return [row["filename"] for row in rows]
+ 
+ 
+-def add_playlist_item(filename: str) -> List[str]:
++def add_playlist_item(playlist_id: int, filename: str) -> List[str]:
+     ensure_db_initialized()
+     now = time.time()
+     with _connect() as conn:
+-        max_position = conn.execute("SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items").fetchone()["pos"]
++        max_position = conn.execute(
++            "SELECT COALESCE(MAX(position), -1) AS pos FROM playlist_items WHERE playlist_id = ?",
++            (playlist_id,),
++        ).fetchone()["pos"]
+         conn.execute(
+-            "INSERT OR IGNORE INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
+-            (filename, int(max_position) + 1, now),
++            "INSERT OR IGNORE INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
++            (playlist_id, filename, int(max_position) + 1, now),
+         )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+-def remove_playlist_item(filename: str) -> List[str]:
++def remove_playlist_item(playlist_id: int, filename: str) -> List[str]:
+     ensure_db_initialized()
+     with _connect() as conn:
+-        conn.execute("DELETE FROM playlist_items WHERE filename = ?", (filename,))
+-        rows = conn.execute("SELECT filename FROM playlist_items ORDER BY position ASC, id ASC").fetchall()
++        conn.execute(
++            "DELETE FROM playlist_items WHERE playlist_id = ? AND filename = ?",
++            (playlist_id, filename),
++        )
++        rows = conn.execute(
++            "SELECT filename FROM playlist_items WHERE playlist_id = ? ORDER BY position ASC, id ASC",
++            (playlist_id,),
++        ).fetchall()
+         for index, row in enumerate(rows):
+-            conn.execute("UPDATE playlist_items SET position = ? WHERE filename = ?", (index, row["filename"]))
++            conn.execute(
++                "UPDATE playlist_items SET position = ? WHERE playlist_id = ? AND filename = ?",
++                (index, playlist_id, row["filename"]),
++            )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+-def reorder_playlist(filenames: List[str]) -> List[str]:
++def reorder_playlist(playlist_id: int, filenames: List[str]) -> List[str]:
+     ensure_db_initialized()
+-    unique = []
++    unique: List[str] = []
+     seen = set()
+     for filename in filenames or []:
+         if filename and filename not in seen:
+             unique.append(filename)
+             seen.add(filename)
++    now = time.time()
+     with _connect() as conn:
+-        conn.execute("DELETE FROM playlist_items")
+-        now = time.time()
++        conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
+         for index, filename in enumerate(unique):
+             conn.execute(
+-                "INSERT INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
+-                (filename, index, now),
++                "INSERT INTO playlist_items (playlist_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
++                (playlist_id, filename, index, now),
+             )
+         conn.commit()
+-    return get_playlist()
++    return get_playlist_items(playlist_id)
+ 
+ 
+ async def init_db():
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index a821ab7..46ed20f 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -2778,3 +2778,306 @@ body[data-theme='dark'] .main-stage {
+ 		font-size: 14px;
+ 	}
+ }
++
++/* ===== Multi-playlist (chips, forms) ===== */
++.panel--playlists {
++	padding: 18px;
++	display: grid;
++	gap: 14px;
++}
++
++.playlist-bar {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 10px;
++	align-items: center;
++}
++
++.playlist-chip-wrap {
++	position: relative;
++	display: inline-flex;
++	align-items: center;
++}
++
++.playlist-chip {
++	display: inline-flex;
++	align-items: center;
++	gap: 10px;
++	padding: 10px 16px;
++	border-radius: 999px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text-muted);
++	font: inherit;
++	font-weight: 600;
++	cursor: pointer;
++	transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
++}
++
++.playlist-chip:hover {
++	border-color: var(--accent);
++	color: var(--text);
++	transform: translateY(-1px);
++}
++
++.playlist-chip-wrap--active .playlist-chip {
++	background: linear-gradient(135deg, var(--accent), var(--accent-strong));
++	border-color: transparent;
++	color: #fff;
++	box-shadow: 0 10px 24px rgba(124, 58, 237, 0.35);
++}
++
++.playlist-chip__count {
++	font-size: 12px;
++	font-weight: 700;
++	padding: 2px 9px;
++	border-radius: 999px;
++	background: rgba(255, 255, 255, 0.16);
++	color: inherit;
++}
++
++.playlist-chip-wrap--active .playlist-chip__count {
++	background: rgba(255, 255, 255, 0.24);
++}
++
++.playlist-chip--new {
++	border-style: dashed;
++	background: transparent;
++}
++
++.playlist-chip--new:hover {
++	border-color: var(--accent);
++	background: var(--surface-muted);
++}
++
++.playlist-chip__tools {
++	display: inline-flex;
++	align-items: center;
++	gap: 2px;
++	margin-left: 4px;
++}
++
++.playlist-chip__tools .icon-button {
++	width: 26px;
++	height: 26px;
++	border-radius: 50%;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++}
++
++.playlist-chip__confirm {
++	background: rgba(244, 63, 94, 0.18) !important;
++	border-color: rgba(244, 63, 94, 0.5) !important;
++	color: #f43f5e !important;
++	animation: confirm-pulse 900ms ease-in-out infinite;
++}
++
++@keyframes confirm-pulse {
++	0%, 100% { transform: scale(1); }
++	50% { transform: scale(1.14); }
++}
++
++.inline-form {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 10px;
++	align-items: center;
++	padding: 14px;
++	border-radius: 16px;
++	border: 1px dashed var(--border);
++	background: var(--surface-muted);
++}
++
++.inline-form__input {
++	flex: 1 1 220px;
++}
++
++/* ===== Add-to-playlist picker modal ===== */
++.modal-overlay {
++	position: fixed;
++	inset: 0;
++	z-index: 2000;
++	display: grid;
++	place-items: center;
++	padding: 24px;
++	background: rgba(5, 8, 22, 0.62);
++	backdrop-filter: blur(10px);
++	-webkit-backdrop-filter: blur(10px);
++	animation: modal-fade-in 160ms ease-out;
++}
++
++.modal-card {
++	width: min(460px, 100%);
++	max-height: min(640px, calc(100vh - 48px));
++	display: flex;
++	flex-direction: column;
++	background:
++		linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03)),
++		var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 24px;
++	box-shadow: 0 40px 90px rgba(0, 0, 0, 0.5);
++	overflow: hidden;
++	animation: modal-pop-in 200ms ease-out;
++}
++
++.modal-card__header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	padding: 20px 22px 0;
++}
++
++.modal-card__header h2 {
++	margin: 0;
++	font-family: var(--font-heading);
++	font-size: 20px;
++}
++
++.modal-card__subtitle {
++	margin: 4px 0 0;
++	padding: 0 22px;
++	color: var(--text-muted);
++	font-size: 13px;
++	white-space: nowrap;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.modal-card__body {
++	padding: 18px 22px;
++	overflow-y: auto;
++	display: grid;
++	gap: 14px;
++}
++
++.modal-card__body--center {
++	place-items: center;
++	justify-content: center;
++	min-height: 140px;
++	color: var(--text-muted);
++}
++
++.modal-card__footer {
++	display: flex;
++	justify-content: flex-end;
++	gap: 10px;
++	padding: 16px 22px 20px;
++	border-top: 1px solid var(--border);
++}
++
++@keyframes modal-fade-in {
++	from { opacity: 0; }
++	to { opacity: 1; }
++}
++
++@keyframes modal-pop-in {
++	from { opacity: 0; transform: translateY(12px) scale(0.98); }
++	to { opacity: 1; transform: translateY(0) scale(1); }
++}
++
++.playlist-pick-list {
++	display: grid;
++	gap: 8px;
++	max-height: 260px;
++	overflow-y: auto;
++}
++
++.playlist-pick-row {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	padding: 12px 14px;
++	border-radius: 14px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.playlist-pick-row:hover {
++	border-color: var(--accent);
++}
++
++.playlist-pick-row--selected {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.12);
++}
++
++.playlist-pick-row input[type='radio'] {
++	accent-color: var(--accent);
++	width: 16px;
++	height: 16px;
++	flex: none;
++}
++
++.playlist-pick-row__name {
++	flex: 1;
++	font-weight: 600;
++	white-space: nowrap;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.playlist-pick-row__count {
++	font-size: 12px;
++	color: var(--text-muted);
++	flex: none;
++}
++
++.playlist-pick-empty {
++	margin: 0;
++	color: var(--text-muted);
++	font-size: 14px;
++	text-align: center;
++	padding: 18px 0;
++}
++
++.playlist-pick-new {
++	display: grid;
++	gap: 10px;
++}
++
++.playlist-pick-new__toggle {
++	display: inline-flex;
++	align-items: center;
++	gap: 8px;
++	align-self: flex-start;
++	padding: 10px 14px;
++	border-radius: 12px;
++	border: 1px dashed var(--border);
++	background: transparent;
++	color: var(--text-muted);
++	font: inherit;
++	font-weight: 600;
++	cursor: pointer;
++	transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
++}
++
++.playlist-pick-new__toggle:hover,
++.playlist-pick-new__toggle--active {
++	border-color: var(--accent);
++	color: var(--text);
++	background: var(--surface-muted);
++}
++
++.form-error {
++	margin: 0;
++	padding: 10px 14px;
++	border-radius: 12px;
++	border: 1px solid rgba(244, 63, 94, 0.4);
++	background: rgba(244, 63, 94, 0.1);
++	color: #f43f5e;
++	font-size: 13px;
++}
++
++@media (max-width: 640px) {
++	.modal-overlay {
++		padding: 12px;
++	}
++
++	.modal-card {
++		max-height: calc(100vh - 24px);
++	}
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 085863c..70d39e2 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -30,6 +30,7 @@ import {
+ import './App.css';
+ import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
+ import PlaylistPage from './pages/Playlist';
++import PlaylistPicker from './components/PlaylistPicker';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -2201,16 +2202,15 @@ export default function App() {
+     }
+   }, [isUnlocked, pushToast, refreshFiles]);
+ 
+-  const addToPlaylist = useCallback(async (filename) => {
++  const [playlistPickerFile, setPlaylistPickerFile] = useState(null);
++
++  // Open the "which playlist?" dialog instead of blindly using the default one.
++  const addToPlaylist = useCallback((filename) => {
+     if (!isUnlocked) return;
+     if (!filename) return;
+-    try {
+-      await api.post(`/playlist/add/${encodeURIComponent(filename)}`);
+-      pushToast('Added to playlist', 'success', 2000);
+-    } catch (error) {
+-      pushToast(safeFetchError(error, 'Failed to add to playlist'), 'error');
+-    }
+-  }, [isUnlocked, pushToast]);
++    const file = files.find((item) => item.filename === filename);
++    setPlaylistPickerFile({ filename, title: file?.title || cleanTitle(filename) });
++  }, [isUnlocked, files]);
+ 
+   const navigate = useNavigate();
+ 
+@@ -2313,6 +2313,15 @@ export default function App() {
+       ) : null}
+       <ToastStack toasts={toasts} />
+ 
++      {playlistPickerFile ? (
++        <PlaylistPicker
++          filename={playlistPickerFile.filename}
++          title={playlistPickerFile.title}
++          onClose={() => setPlaylistPickerFile(null)}
++          onAdded={(playlistName) => pushToast(`Added to ${playlistName}`, 'success', 2000)}
++        />
++      ) : null}
++
+       {!authReady || !isUnlocked ? (
+         <AccessGate
+           password={accessPassword}
+diff --git a/frontend/src/components/PlaylistPicker.jsx b/frontend/src/components/PlaylistPicker.jsx
+new file mode 100644
+index 0000000..c18ed67
+--- /dev/null
++++ b/frontend/src/components/PlaylistPicker.jsx
+@@ -0,0 +1,185 @@
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { Loader2, Plus, X } from 'lucide-react';
++import { api } from '../lib/api';
++
++/**
++ * Modal shown when the user wants to add a file to a playlist.
++ * Lets them pick an existing playlist or type a name to create a new one,
++ * exactly like YouTube's "Save to playlist" dialog.
++ */
++export default function PlaylistPicker({ filename, title, onClose, onAdded }) {
++  const [playlists, setPlaylists] = useState([]);
++  const [loading, setLoading] = useState(true);
++  const [submitting, setSubmitting] = useState(false);
++  const [selectedId, setSelectedId] = useState(null);
++  const [mode, setMode] = useState('existing'); // 'existing' | 'new'
++  const [newName, setNewName] = useState('');
++  const [error, setError] = useState('');
++  const newNameRef = useRef(null);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError('');
++    try {
++      const response = await api.get('/playlists');
++      const list = Array.isArray(response.data?.playlists) ? response.data.playlists : [];
++      setPlaylists(list);
++      setSelectedId((current) => (
++        current !== null && list.some((playlist) => playlist.id === current)
++          ? current
++          : (list[0]?.id ?? null)
++      ));
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to load playlists');
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
++    load();
++  }, [load]);
++
++  useEffect(() => {
++    if (mode === 'new') newNameRef.current?.focus();
++  }, [mode]);
++
++  const submit = async () => {
++    if (submitting) return;
++    setError('');
++    let targetId;
++    let targetName;
++
++    if (mode === 'new') {
++      const name = newName.trim();
++      if (!name) {
++        setError('Enter a name for the new playlist');
++        newNameRef.current?.focus();
++        return;
++      }
++      setSubmitting(true);
++      try {
++        const created = await api.post('/playlists', { name });
++        targetId = created.data?.playlist?.id;
++        targetName = created.data?.playlist?.name || name;
++      } catch (err) {
++        setError(err?.response?.data?.detail || 'Unable to create playlist');
++        setSubmitting(false);
++        return;
++      }
++    } else {
++      targetId = selectedId;
++      targetName = playlists.find((playlist) => playlist.id === selectedId)?.name || '';
++    }
++
++    if (!targetId) {
++      setError('Choose a playlist first');
++      setSubmitting(false);
++      return;
++    }
++
++    try {
++      await api.post(`/playlists/${targetId}/items`, { filename });
++      onAdded?.(targetName);
++      onClose?.();
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to add item to playlist');
++      setSubmitting(false);
++    }
++  };
++
++  return (
++    <div
++      className="modal-overlay"
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="playlist-picker-title"
++      onClick={(event) => {
++        if (event.target === event.currentTarget) onClose?.();
++      }}
++    >
++      <div className="modal-card">
++        <div className="modal-card__header">
++          <h2 id="playlist-picker-title">Add to playlist</h2>
++          <button className="icon-button" type="button" onClick={onClose} title="Close" aria-label="Close">
++            <X size={16} />
++          </button>
++        </div>
++        <p className="modal-card__subtitle" title={title}>{title || filename || 'this item'}</p>
++
++        {loading ? (
++          <div className="modal-card__body modal-card__body--center">
++            <Loader2 size={18} className="spin" /> Loading playlists…
++          </div>
++        ) : (
++          <div className="modal-card__body">
++            <div className="playlist-pick-list">
++              {playlists.length === 0 ? (
++                <p className="playlist-pick-empty">No playlists yet — create the first one below.</p>
++              ) : (
++                playlists.map((playlist) => (
++                  <label
++                    key={playlist.id}
++                    className={`playlist-pick-row ${mode === 'existing' && selectedId === playlist.id ? 'playlist-pick-row--selected' : ''}`}
++                  >
++                    <input
++                      type="radio"
++                      name="playlist-target"
++                      checked={mode === 'existing' && selectedId === playlist.id}
++                      onChange={() => {
++                        setMode('existing');
++                        setSelectedId(playlist.id);
++                      }}
++                    />
++                    <span className="playlist-pick-row__name">{playlist.name}</span>
++                    <span className="playlist-pick-row__count">
++                      {playlist.item_count} item{playlist.item_count === 1 ? '' : 's'}
++                    </span>
++                  </label>
++                ))
++              )}
++            </div>
++
++            <div className="playlist-pick-new">
++              <button
++                type="button"
++                className={`playlist-pick-new__toggle ${mode === 'new' ? 'playlist-pick-new__toggle--active' : ''}`}
++                onClick={() => setMode(mode === 'new' ? 'existing' : 'new')}
++              >
++                <Plus size={14} />
++                {mode === 'new' ? 'Pick an existing playlist instead' : 'Create a new playlist…'}
++              </button>
++              {mode === 'new' ? (
++                <input
++                  ref={newNameRef}
++                  className="input"
++                  type="text"
++                  value={newName}
++                  onChange={(event) => setNewName(event.target.value)}
++                  onKeyDown={(event) => {
++                    if (event.key === 'Enter') submit();
++                  }}
++                  placeholder="New playlist name"
++                  maxLength={120}
++                />
++              ) : null}
++            </div>
++
++            {error ? <div className="form-error">{error}</div> : null}
++          </div>
++        )}
++
++        <div className="modal-card__footer">
++          <button className="ghost-button" type="button" onClick={onClose} disabled={submitting}>
++            Cancel
++          </button>
++          <button className="primary-button" type="button" onClick={submit} disabled={submitting || loading}>
++            {submitting ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
++            {submitting ? 'Adding…' : 'Add'}
++          </button>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index b1a56e7..18605b9 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -1,5 +1,5 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+-import { Download, Pause, Play, Shuffle, Trash2 } from 'lucide-react';
++import { Download, Edit3, Loader2, Pause, Play, Plus, RefreshCw, Shuffle, Trash2, X } from 'lucide-react';
+ import { API_BASE, api } from '../lib/api';
+ 
+ const cleanTitle = (filename = '') => (
+@@ -127,8 +127,23 @@ function PlaylistThumb({ file }) {
+ }
+ 
+ export default function PlaylistPage({ files = [], onNotify }) {
+-  const [playlist, setPlaylist] = useState([]);
++  // Multi-playlist state
++  const [playlists, setPlaylists] = useState([]);                 // [{ id, name, created_at, item_count }]
++  const [activePlaylistId, setActivePlaylistId] = useState(null);
++  const [playlist, setPlaylist] = useState([]);                   // filenames of the active playlist
++  const [isCreating, setIsCreating] = useState(false);            // inline "create playlist" form
++  const [newPlaylistName, setNewPlaylistName] = useState('');
++  const [isRenaming, setIsRenaming] = useState(false);            // inline "rename playlist" form
++  const [renameValue, setRenameValue] = useState('');
++  const [confirmDeleteId, setConfirmDeleteId] = useState(null);   // two-step delete guard
++
++  // Add-from-library state
+   const [selectedFilename, setSelectedFilename] = useState('');
++  const [addTarget, setAddTarget] = useState('current');          // 'current' | playlist-id | 'new'
++  const [addNewName, setAddNewName] = useState('');
++  const [isAdding, setIsAdding] = useState(false);
++
++  // Player state
+   const [currentIndex, setCurrentIndex] = useState(0);
+   const [isPlaying, setIsPlaying] = useState(false);
+   const [playbackRate, setPlaybackRate] = useState(1);
+@@ -138,6 +153,8 @@ export default function PlaylistPage({ files = [], onNotify }) {
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const playerRef = useRef(null);
+ 
++  const activePlaylist = playlists.find((item) => item.id === activePlaylistId) || null;
++
+   const fileMap = useMemo(() => new Map(files.map((file) => [file.filename, file])), [files]);
+   const playlistFiles = useMemo(
+     () => playlist.map((filename) => fileMap.get(filename) || { filename, title: cleanTitle(filename), missing: true }),
+@@ -156,27 +173,59 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     if (onNotify) onNotify(message, type);
+   }, [onNotify]);
+ 
+-  const refreshPlaylist = useCallback(async () => {
++  const loadPlaylists = useCallback(async () => {
++    try {
++      const response = await api.get('/playlists');
++      const list = Array.isArray(response.data?.playlists) ? response.data.playlists : [];
++      setPlaylists(list);
++      setActivePlaylistId((current) => (
++        current !== null && list.some((playlist) => playlist.id === current)
++          ? current
++          : (list[0]?.id ?? null)
++      ));
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to load playlists', 'error');
++    }
++  }, [notify]);
++
++  const loadItems = useCallback(async (playlistId) => {
+     setIsLoading(true);
+     try {
+-      const response = await api.get('/playlist');
++      const response = await api.get(`/playlists/${playlistId}/items`);
+       setPlaylist(Array.isArray(response.data) ? response.data : []);
+     } catch (error) {
+-      notify(error?.response?.data?.detail || 'Unable to load playlist', 'error');
++      notify(error?.response?.data?.detail || 'Unable to load playlist items', 'error');
+     } finally {
+       setIsLoading(false);
+     }
+   }, [notify]);
+ 
+   useEffect(() => {
+-    refreshPlaylist();
+-  }, [refreshPlaylist]);
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
++    loadPlaylists();
++  }, [loadPlaylists]);
++
++  useEffect(() => {
++    if (activePlaylistId) {
++      // eslint-disable-next-line react-hooks/set-state-in-effect -- load items for the newly active playlist
++      loadItems(activePlaylistId);
++    } else {
++      setPlaylist([]);
++    }
++  }, [activePlaylistId, loadItems]);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- when no playlists remain, force the "new" target
++    if (playlists.length === 0) setAddTarget('new');
++  }, [playlists.length]);
+ 
+   useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset player on file change
+     setUseCompatiblePlayback(false);
+   }, [currentFile?.filename]);
+ 
+   useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset transcript state on file change
+     setTranscriptStatus('Get Transcript');
+     setTranscriptLoading(false);
+   }, [currentFile?.filename]);
+@@ -189,59 +238,174 @@ export default function PlaylistPage({ files = [], onNotify }) {
+ 
+   useEffect(() => {
+     if (currentIndex >= playlistFiles.length) {
++      // eslint-disable-next-line react-hooks/set-state-in-effect -- clamp index when list shrinks
+       setCurrentIndex(Math.max(0, playlistFiles.length - 1));
+     }
+   }, [currentIndex, playlistFiles.length]);
+ 
+-  const saveOrder = async (nextOrder) => {
+-    setPlaylist(nextOrder);
++  // --- Playlist management ------------------------------------------------
++  const createPlaylist = async (name) => {
++    const clean = name.trim();
++    if (!clean) {
++      notify('Enter a playlist name', 'error');
++      return;
++    }
+     try {
+-      const response = await api.post('/playlist/reorder', nextOrder);
+-      setPlaylist(Array.isArray(response.data) ? response.data : nextOrder);
++      const response = await api.post('/playlists', { name: clean });
++      const created = response.data?.playlist;
++      await loadPlaylists();
++      if (created?.id) setActivePlaylistId(created.id);
++      setIsCreating(false);
++      setNewPlaylistName('');
++      notify(`Playlist "${clean}" created`, 'success');
+     } catch (error) {
+-      notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
+-      refreshPlaylist();
++      notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
+     }
+   };
+ 
+-  const sortPlaylist = (direction) => {
+-    if (playlist.length < 2) return;
+-    const next = [...playlist].sort((left, right) => {
+-      const leftTitle = fileMap.get(left)?.title || cleanTitle(left);
+-      const rightTitle = fileMap.get(right)?.title || cleanTitle(right);
+-      return naturalCompare(leftTitle, rightTitle);
+-    });
++  const renamePlaylist = async (playlistId, name) => {
++    const clean = name.trim();
++    if (!clean) {
++      notify('Enter a playlist name', 'error');
++      return;
++    }
++    try {
++      await api.patch(`/playlists/${playlistId}`, { name: clean });
++      await loadPlaylists();
++      setIsRenaming(false);
++      setRenameValue('');
++      notify('Playlist renamed', 'success');
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to rename playlist', 'error');
++    }
++  };
+ 
+-    if (direction === 'desc') {
+-      next.reverse();
++  const deletePlaylist = async (playlistId) => {
++    try {
++      await api.delete(`/playlists/${playlistId}`);
++      setConfirmDeleteId(null);
++      if (activePlaylistId === playlistId) {
++        setPlaylist([]);
++        setCurrentIndex(0);
++      }
++      await loadPlaylists();
++      notify('Playlist deleted', 'info');
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to delete playlist', 'error');
+     }
++  };
+ 
+-    setCurrentIndex(0);
+-    saveOrder(next);
++  const handleDeleteClick = (playlist) => {
++    if (confirmDeleteId === playlist.id) {
++      deletePlaylist(playlist.id);
++    } else {
++      setConfirmDeleteId(playlist.id);
++      notify(`Click delete again to confirm removing "${playlist.name}"`, 'info');
++    }
+   };
+ 
++  const refreshAll = useCallback(async () => {
++    await loadPlaylists();
++    if (activePlaylistId) await loadItems(activePlaylistId);
++  }, [loadPlaylists, loadItems, activePlaylistId]);
++
++  // --- Adding items -------------------------------------------------------
+   const addSelected = async () => {
+     if (!selectedFilename) return;
++    if (isAdding) return;
++    setIsAdding(true);
++
++    let targetId;
++    let targetName;
++
++    if (addTarget === 'current') {
++      targetId = activePlaylistId;
++      targetName = activePlaylist?.name || '';
++    } else if (addTarget === 'new') {
++      const clean = addNewName.trim();
++      if (!clean) {
++        notify('Enter a name for the new playlist', 'error');
++        setIsAdding(false);
++        return;
++      }
++      try {
++        const created = await api.post('/playlists', { name: clean });
++        targetId = created.data?.playlist?.id;
++        targetName = created.data?.playlist?.name || clean;
++      } catch (error) {
++        notify(error?.response?.data?.detail || 'Unable to create playlist', 'error');
++        setIsAdding(false);
++        return;
++      }
++    } else {
++      targetId = Number(addTarget);
++      targetName = playlists.find((playlist) => playlist.id === targetId)?.name || 'playlist';
++    }
++
++    if (!targetId) {
++      notify('Choose a playlist to add to', 'error');
++      setIsAdding(false);
++      return;
++    }
++
+     try {
+-      const response = await api.post(`/playlist/add/${encodeURIComponent(selectedFilename)}`);
+-      setPlaylist(Array.isArray(response.data) ? response.data : [...playlist, selectedFilename]);
++      await api.post(`/playlists/${targetId}/items`, { filename: selectedFilename });
+       setSelectedFilename('');
+-      notify('Added to playlist', 'success');
++      if (addTarget === 'new') {
++        setAddTarget('current');
++        setAddNewName('');
++        setActivePlaylistId(targetId);
++      }
++      await Promise.all([loadPlaylists(), loadItems(activePlaylistId === targetId ? activePlaylistId : targetId)]);
++      notify(`Added to "${targetName}"`, 'success');
+     } catch (error) {
+       notify(error?.response?.data?.detail || 'Unable to add item', 'error');
++    } finally {
++      setIsAdding(false);
+     }
+   };
+ 
+   const removeItem = async (filename) => {
++    if (!activePlaylistId) return;
+     try {
+-      const response = await api.delete(`/playlist/remove/${encodeURIComponent(filename)}`);
++      const response = await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
+       setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
++      await loadPlaylists();
+       notify('Removed from playlist', 'info');
+     } catch (error) {
+       notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
+     }
+   };
+ 
++  // --- Ordering -----------------------------------------------------------
++  const saveOrder = async (nextOrder) => {
++    if (!activePlaylistId) return;
++    setPlaylist(nextOrder);
++    try {
++      const response = await api.post(`/playlists/${activePlaylistId}/reorder`, nextOrder);
++      setPlaylist(Array.isArray(response.data) ? response.data : nextOrder);
++    } catch (error) {
++      notify(error?.response?.data?.detail || 'Unable to save playlist order', 'error');
++      loadItems(activePlaylistId);
++    }
++  };
++
++  const sortPlaylist = (direction) => {
++    if (playlist.length < 2) return;
++    const next = [...playlist].sort((left, right) => {
++      const leftTitle = fileMap.get(left)?.title || cleanTitle(left);
++      const rightTitle = fileMap.get(right)?.title || cleanTitle(right);
++      return naturalCompare(leftTitle, rightTitle);
++    });
++
++    if (direction === 'desc') {
++      next.reverse();
++    }
++
++    setCurrentIndex(0);
++    saveOrder(next);
++  };
++
+   const moveItem = (index, direction) => {
+     const target = index + direction;
+     if (target < 0 || target >= playlist.length) return;
+@@ -260,6 +424,7 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     saveOrder(next);
+   };
+ 
++  // --- Playback -----------------------------------------------------------
+   const playIndex = (index) => {
+     setCurrentIndex(index);
+     setIsPlaying(true);
+@@ -310,27 +475,145 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     }
+   };
+ 
++  const otherPlaylists = playlists.filter((playlist) => playlist.id !== activePlaylistId);
++
+   return (
+     <div className="page-shell">
+       <div className="page-header">
+         <div>
+-          <h1 className="page-title">Playlist</h1>
+-          <p className="page-subtitle">Build a private queue from your saved library, reorder it, and play continuously.</p>
++          <h1 className="page-title">Playlists</h1>
++          <p className="page-subtitle">Create as many playlists as you like, add your saved library items to any of them, and play continuously.</p>
+         </div>
+         <div className="page-header__actions">
++          <button className="ghost-button" type="button" onClick={refreshAll} title="Refresh playlists">
++            <RefreshCw size={16} /> Refresh
++          </button>
+           <button className="ghost-button" type="button" onClick={() => sortPlaylist('asc')} disabled={playlist.length < 2}>
+             Sort 1-9
+           </button>
+           <button className="ghost-button" type="button" onClick={() => sortPlaylist('desc')} disabled={playlist.length < 2}>
+             Sort 9-1
+           </button>
+-          <button className="ghost-button" type="button" onClick={refreshPlaylist}>Refresh</button>
+           <button className="ghost-button" type="button" onClick={shufflePlaylist} disabled={playlist.length < 2}>
+             <Shuffle size={16} /> Shuffle
+           </button>
+         </div>
+       </div>
+ 
++      {/* Playlist switcher + management */}
++      <section className="panel panel--playlists">
++        <div className="playlist-bar">
++          {playlists.map((playlist) => {
++            const isActive = playlist.id === activePlaylistId;
++            const isConfirming = confirmDeleteId === playlist.id;
++            return (
++              <div key={playlist.id} className={`playlist-chip-wrap ${isActive ? 'playlist-chip-wrap--active' : ''}`}>
++                <button
++                  className="playlist-chip"
++                  type="button"
++                  onClick={() => {
++                    setConfirmDeleteId(null);
++                    setActivePlaylistId(playlist.id);
++                  }}
++                >
++                  <span className="playlist-chip__name">{playlist.name}</span>
++                  <span className="playlist-chip__count">{playlist.item_count}</span>
++                </button>
++                {isActive ? (
++                  <span className="playlist-chip__tools">
++                    <button
++                      className="icon-button"
++                      type="button"
++                      title="Rename playlist"
++                      onClick={(event) => {
++                        event.stopPropagation();
++                        setIsRenaming(true);
++                        setRenameValue(playlist.name);
++                      }}
++                    >
++                      <Edit3 size={13} />
++                    </button>
++                    <button
++                      className={`icon-button ${isConfirming ? 'icon-button--danger playlist-chip__confirm' : 'icon-button--danger'}`}
++                      type="button"
++                      title={isConfirming ? 'Click again to confirm deletion' : 'Delete playlist'}
++                      onClick={(event) => {
++                        event.stopPropagation();
++                        handleDeleteClick(playlist);
++                      }}
++                    >
++                      {isConfirming ? <X size={13} /> : <Trash2 size={13} />}
++                    </button>
++                  </span>
++                ) : null}
++              </div>
++            );
++          })}
++          <button className="playlist-chip playlist-chip--new" type="button" onClick={() => setIsCreating(true)}>
++            <Plus size={14} /> New playlist
++          </button>
++        </div>
++
++        {isCreating ? (
++          <div className="inline-form">
++            <input
++              className="input inline-form__input"
++              type="text"
++              value={newPlaylistName}
++              onChange={(event) => setNewPlaylistName(event.target.value)}
++              onKeyDown={(event) => {
++                if (event.key === 'Enter') createPlaylist(newPlaylistName);
++                if (event.key === 'Escape') {
++                  setIsCreating(false);
++                  setNewPlaylistName('');
++                }
++              }}
++              placeholder="Playlist name"
++              maxLength={120}
++              autoFocus
++            />
++            <button className="primary-button" type="button" onClick={() => createPlaylist(newPlaylistName)}>
++              Create
++            </button>
++            <button
++              className="ghost-button"
++              type="button"
++              onClick={() => {
++                setIsCreating(false);
++                setNewPlaylistName('');
++              }}
++            >
++              Cancel
++            </button>
++          </div>
++        ) : null}
++
++        {isRenaming && activePlaylist ? (
++          <div className="inline-form">
++            <input
++              className="input inline-form__input"
++              type="text"
++              value={renameValue}
++              onChange={(event) => setRenameValue(event.target.value)}
++              onKeyDown={(event) => {
++                if (event.key === 'Enter') renamePlaylist(activePlaylist.id, renameValue);
++                if (event.key === 'Escape') setIsRenaming(false);
++              }}
++              placeholder="New playlist name"
++              maxLength={120}
++              autoFocus
++            />
++            <button className="primary-button" type="button" onClick={() => renamePlaylist(activePlaylist.id, renameValue)}>
++              Rename
++            </button>
++            <button className="ghost-button" type="button" onClick={() => setIsRenaming(false)}>
++              Cancel
++            </button>
++          </div>
++        ) : null}
++      </section>
++
++      {/* Add from library — asks which playlist (existing or brand new) */}
+       <section className="panel panel--form">
+         <div className="form-grid">
+           <div className="field field--full">
+@@ -347,8 +630,49 @@ export default function PlaylistPage({ files = [], onNotify }) {
+               ))}
+             </select>
+           </div>
++          <div className="field">
++            <label className="field__label" htmlFor="playlist-target">ADD TO WHICH PLAYLIST?</label>
++            <select
++              id="playlist-target"
++              className="select"
++              value={addTarget}
++              onChange={(event) => {
++                setAddTarget(event.target.value);
++                setConfirmDeleteId(null);
++              }}
++            >
++              {activePlaylist ? (
++                <option value="current">Current playlist: {activePlaylist.name}</option>
++              ) : null}
++              {otherPlaylists.map((playlist) => (
++                <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
++              ))}
++              <option value="new">＋ Create new playlist…</option>
++            </select>
++          </div>
++          {addTarget === 'new' ? (
++            <div className="field">
++              <label className="field__label" htmlFor="playlist-target-name">NEW PLAYLIST NAME</label>
++              <input
++                id="playlist-target-name"
++                className="input"
++                type="text"
++                value={addNewName}
++                onChange={(event) => setAddNewName(event.target.value)}
++                onKeyDown={(event) => {
++                  if (event.key === 'Enter') addSelected();
++                }}
++                placeholder="e.g. Workout Mix, Study, Road Trip…"
++                maxLength={120}
++                autoFocus
++              />
++            </div>
++          ) : null}
+         </div>
+-        <button className="primary-button" type="button" onClick={addSelected} disabled={!selectedFilename}>Add to Playlist</button>
++        <button className="primary-button" type="button" onClick={addSelected} disabled={!selectedFilename || isAdding}>
++          {isAdding ? <Loader2 size={16} className="spin" /> : <Plus size={16} />}
++          Add to Playlist
++        </button>
+       </section>
+ 
+       {currentFile ? (
+@@ -422,16 +746,24 @@ export default function PlaylistPage({ files = [], onNotify }) {
+       <section className="panel panel--list">
+         <div className="panel__header">
+           <div>
+-            <h2 className="panel__title">Queue</h2>
+-            <p className="panel__subtitle">{playlist.length} item{playlist.length === 1 ? '' : 's'} in your playlist.</p>
++            <h2 className="panel__title">{activePlaylist ? activePlaylist.name : 'Queue'}</h2>
++            <p className="panel__subtitle">
++              {activePlaylist
++                ? `${playlist.length} item${playlist.length === 1 ? '' : 's'} in this playlist.`
++                : 'Create a playlist to get started.'}
++            </p>
+           </div>
+           <span className="panel__badge">{playlist.length}</span>
+         </div>
+ 
+         {isLoading ? (
+           <div className="empty-state"><p>Loading playlist...</p></div>
++        ) : playlists.length === 0 ? (
++          <div className="empty-state">
++            <p>You have no playlists yet. Click “New playlist” above to create your first one.</p>
++          </div>
+         ) : playlistFiles.length === 0 ? (
+-          <div className="empty-state"><p>Your playlist is empty. Add files from the library above.</p></div>
++          <div className="empty-state"><p>This playlist is empty. Add files from the library above.</p></div>
+         ) : (
+           <div className="stack-list">
+             {playlistFiles.map((file, index) => (
+diff --git a/testing/test_multi_playlist.py b/testing/test_multi_playlist.py
+new file mode 100644
+index 0000000..75dc8bf
+--- /dev/null
++++ b/testing/test_multi_playlist.py
+@@ -0,0 +1,141 @@
++"""Quick sanity tests for the multi-playlist feature (DB layer + migration).
++
++Run from the repo root:
++    python testing/test_multi_playlist.py
++"""
++import shutil
++import sqlite3
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++# --------------------------------------------------------------------------
++# 1. Build a LEGACY database (old single-playlist schema) so we can verify
++#    the migration path that existing installs will hit.
++# --------------------------------------------------------------------------
++legacy_dir = Path(tempfile.mkdtemp(prefix="yt_legacy_"))
++try:
++    legacy_dir.mkdir(parents=True, exist_ok=True)
++    db_path = legacy_dir / "yt_private_suite.db"
++    conn = sqlite3.connect(db_path)
++    conn.executescript(
++        """
++        CREATE TABLE download_jobs (
++            task_id TEXT PRIMARY KEY, url TEXT NOT NULL,
++            quality TEXT NOT NULL DEFAULT 'best', format TEXT NOT NULL DEFAULT 'mp4',
++            status TEXT NOT NULL DEFAULT 'starting', title TEXT, filename TEXT, video_id TEXT,
++            payload TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL,
++            updated_at REAL NOT NULL, completed_at REAL
++        );
++        CREATE TABLE notes (
++            id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL,
++            time_seconds INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL,
++            tag TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '',
++            created_at REAL NOT NULL, updated_at REAL NOT NULL
++        );
++        CREATE TABLE playlist_items (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            filename TEXT NOT NULL UNIQUE,
++            position INTEGER NOT NULL,
++            created_at REAL NOT NULL
++        );
++        CREATE INDEX idx_playlist_items_position ON playlist_items(position);
++        """
++    )
++    now = time.time()
++    for index, name in enumerate(["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]):
++        conn.execute(
++            "INSERT INTO playlist_items (filename, position, created_at) VALUES (?, ?, ?)",
++            (name, index, now - index),
++        )
++    conn.commit()
++    conn.close()
++
++    # Point the app at this fake install directory, then import the DB module.
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = legacy_dir
++
++    import services.database as db
++
++    db.DOWNLOAD_DIR = legacy_dir  # module imported DOWNLOAD_DIR by value; sync it
++    db.DB_PATH = legacy_dir / "yt_private_suite.db"
++
++    db.ensure_db_initialized()
++
++    playlists = db.list_playlists()
++    assert len(playlists) == 1, f"expected 1 default playlist after migration, got {playlists}"
++    default_id = playlists[0]["id"]
++    assert playlists[0]["name"] == "My Playlist"
++    assert playlists[0]["item_count"] == 3, playlists
++    items = db.get_playlist_items(default_id)
++    assert items == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"], items
++    print("[PASS] legacy schema migrated into default playlist with 3 items")
++
++    # ----------------------------------------------------------------------
++    # 2. New multi-playlist behaviour.
++    # ----------------------------------------------------------------------
++    created = db.create_playlist("Workout")
++    workout_id = created["id"]
++    assert created["name"] == "Workout" and created["item_count"] == 0
++
++    # Duplicate name is rejected
++    try:
++        db.create_playlist("Workout")
++        raise AssertionError("duplicate playlist name should have raised")
++    except ValueError:
++        pass
++
++    # Add items to each playlist independently
++    db.add_playlist_item(workout_id, "Song One.mp3")
++    db.add_playlist_item(workout_id, "Clip Three.webm")
++    db.add_playlist_item(default_id, "Song One.mp3")  # same file, different playlist
++    assert db.get_playlist_items(workout_id) == ["Song One.mp3", "Clip Three.webm"]
++    assert db.get_playlist_items(default_id) == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]
++    print("[PASS] items are scoped per playlist; same file can live in two playlists")
++
++    # Adding the same file twice to one playlist is a no-op
++    db.add_playlist_item(workout_id, "Song One.mp3")
++    assert db.get_playlist_items(workout_id) == ["Song One.mp3", "Clip Three.webm"]
++    print("[PASS] duplicate item in the same playlist is ignored")
++
++    # Reorder only touches the target playlist
++    db.reorder_playlist(workout_id, ["Clip Three.webm", "Song One.mp3"])
++    assert db.get_playlist_items(workout_id) == ["Clip Three.webm", "Song One.mp3"]
++    assert db.get_playlist_items(default_id) == ["Song One.mp3", "Video Two.mp4", "Clip Three.webm"]
++    print("[PASS] reorder is scoped to one playlist")
++
++    # Rename
++    renamed = db.rename_playlist(workout_id, "Gym Mix")
++    assert renamed["name"] == "Gym Mix"
++    try:
++        db.rename_playlist(workout_id, "My Playlist")
++        raise AssertionError("rename to duplicate name should have raised")
++    except ValueError:
++        pass
++    print("[PASS] rename works and duplicate names are rejected")
++
++    # Counts stay correct after mutations
++    counts = {p["name"]: p["item_count"] for p in db.list_playlists()}
++    assert counts == {"My Playlist": 3, "Gym Mix": 2}, counts
++    print("[PASS] item counts are accurate")
++
++    # Delete playlist cascades to its items
++    assert db.delete_playlist(workout_id) is True
++    assert db.get_playlist_items(workout_id) == []
++    assert db.delete_playlist(99999) is False
++    remaining = db.list_playlists()
++    assert len(remaining) == 1 and remaining[0]["name"] == "My Playlist"
++    print("[PASS] deleting a playlist removes only its own items")
++
++    # Default playlist id picks the oldest remaining one
++    assert db.get_default_playlist_id() == default_id
++    print("[PASS] get_default_playlist_id returns oldest playlist")
++
++    print("\nALL BACKEND PLAYLIST TESTS PASSED")
++finally:
++    shutil.rmtree(legacy_dir, ignore_errors=True)
+diff --git a/testing/test_multi_playlist_api.py b/testing/test_multi_playlist_api.py
+new file mode 100644
+index 0000000..643d4c4
+--- /dev/null
++++ b/testing/test_multi_playlist_api.py
+@@ -0,0 +1,116 @@
++"""API-level sanity test for the new multi-playlist endpoints.
++
++Run from the repo root:
++    python testing/test_multi_playlist_api.py
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT / "backend"))
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++# Point the app at a throwaway downloads directory BEFORE importing the router.
++tmp_dir = Path(tempfile.mkdtemp(prefix="yt_api_"))
++try:
++    import services.files as files_mod
++
++    files_mod.DOWNLOAD_DIR = tmp_dir
++
++    # Fake saved media files
++    (tmp_dir / "Song One.mp3").write_bytes(b"0" * 2048)
++    (tmp_dir / "Video Two.mp4").write_bytes(b"0" * 2048)
++    (tmp_dir / "Clip Three.webm").write_bytes(b"0" * 2048)
++    (tmp_dir / "ignore.tmp").write_bytes(b"0" * 2048)
++
++    from routes import library as library_routes
++
++    app = FastAPI()
++    app.include_router(library_routes.router, prefix="/api")
++    client = TestClient(app)
++
++    # --- playlist CRUD ---
++    resp = client.get("/api/playlists")
++    assert resp.status_code == 200, resp.text
++    playlists = resp.json()["playlists"]
++    assert len(playlists) == 1 and playlists[0]["name"] == "My Playlist", playlists
++    default_id = playlists[0]["id"]
++
++    resp = client.post("/api/playlists", json={"name": "Workout"})
++    assert resp.status_code == 200, resp.text
++    workout = resp.json()["playlist"]
++    workout_id = workout["id"]
++
++    resp = client.post("/api/playlists", json={"name": "Workout"})
++    assert resp.status_code == 409, resp.text
++
++    resp = client.post("/api/playlists", json={"name": "   "})
++    assert resp.status_code == 409, resp.text  # whitespace-only name rejected
++
++    # --- add items ---
++    resp = client.post(f"/api/playlists/{workout_id}/items", json={"filename": "Song One.mp3"})
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    resp = client.post(f"/api/playlists/{workout_id}/items", json={"filename": "missing.mp3"})
++    assert resp.status_code == 404, resp.text
++
++    resp = client.post(f"/api/playlists/{default_id}/items", json={"filename": "Song One.mp3"})
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- rename ---
++    resp = client.patch(f"/api/playlists/{workout_id}", json={"name": "Gym Mix"})
++    assert resp.status_code == 200 and resp.json()["playlist"]["name"] == "Gym Mix", resp.text
++
++    resp = client.patch(f"/api/playlists/{workout_id}", json={"name": "My Playlist"})
++    assert resp.status_code == 409, resp.text
++
++    resp = client.patch("/api/playlists/99999", json={"name": "Nope"})
++    assert resp.status_code == 404, resp.text
++
++    # --- counts reflect items ---
++    resp = client.get("/api/playlists")
++    counts = {p["name"]: p["item_count"] for p in resp.json()["playlists"]}
++    assert counts == {"My Playlist": 1, "Gym Mix": 1}, counts
++
++    # --- reorder (scoped) ---
++    client.post(f"/api/playlists/{workout_id}/items", json={"filename": "Clip Three.webm"})
++    resp = client.post(f"/api/playlists/{workout_id}/reorder", json=["Clip Three.webm", "Song One.mp3"])
++    assert resp.json() == ["Clip Three.webm", "Song One.mp3"], resp.text
++    assert client.get(f"/api/playlists/{default_id}/items").json() == ["Song One.mp3"]
++
++    # --- remove item ---
++    resp = client.delete(f"/api/playlists/{workout_id}/items/Clip%20Three.webm")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- delete playlist ---
++    resp = client.delete(f"/api/playlists/{workout_id}")
++    assert resp.status_code == 200, resp.text
++    resp = client.delete(f"/api/playlists/{workout_id}")
++    assert resp.status_code == 404, resp.text
++    assert client.get(f"/api/playlists/{workout_id}/items").status_code == 404
++
++    # --- legacy endpoints still work on the default playlist ---
++    resp = client.get("/api/playlist")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++    resp = client.post("/api/playlist/add/Video%20Two.mp4")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3", "Video Two.mp4"], resp.text
++    resp = client.delete("/api/playlist/remove/Video%20Two.mp4")
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++    resp = client.post("/api/playlist/reorder", json=["Song One.mp3"])
++    assert resp.status_code == 200 and resp.json() == ["Song One.mp3"], resp.text
++
++    # --- after deleting every playlist, the legacy endpoints recreate a default ---
++    client.delete(f"/api/playlists/{default_id}")
++    assert client.get("/api/playlists").json()["playlists"] == []
++    resp = client.get("/api/playlist")
++    assert resp.status_code == 200 and resp.json() == [], resp.text
++    names = [p["name"] for p in client.get("/api/playlists").json()["playlists"]]
++    assert names == ["My Playlist"], names
++
++    print("ALL API PLAYLIST TESTS PASSED")
++finally:
++    shutil.rmtree(tmp_dir, ignore_errors=True)
