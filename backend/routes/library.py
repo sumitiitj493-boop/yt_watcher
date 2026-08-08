@@ -38,6 +38,15 @@ router = APIRouter()
 
 CACHE_TTL_SECONDS = 5
 _files_cache = {"ts": 0.0, "data": []}
+
+
+def invalidate_files_cache() -> None:
+    """Force the next /api/files call to re-scan the downloads folder.
+
+    Called by other routes (e.g. photo/video download) so a freshly saved
+    file is visible immediately instead of up to CACHE_TTL_SECONDS later.
+    """
+    _files_cache["ts"] = 0.0
 MEDIA_EXTENSIONS = {
     "mp4", "webm", "mkv", "mov", "avi",
     "mp3", "m4a", "aac", "ogg", "flac", "wav",
@@ -81,10 +90,12 @@ def _get_cached_files() -> list[dict]:
     now = time.time()
     if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
         return _files_cache["data"]
-
     # Patterns to exclude from library
     EXCLUDE_SUFFIXES = {".part", ".temp", ".ytdl", ".json"}
     EXCLUDE_PATTERNS = [".f399.", ".f137.", ".f248.", ".f251.", ".temp."]
+    # Images are never "partial downloads" — the size filter below exists to
+    # hide incomplete video/audio files, not legitimate small photos.
+    IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 
     file_list = []
     for file_path in DOWNLOAD_DIR.iterdir():
@@ -100,8 +111,9 @@ def _get_cached_files() -> list[dict]:
         # Skip non-media files
         if file_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
             continue
-        # Skip very small files (likely corrupted/partial) under 100KB
-        if file_path.stat().st_size < 102400:
+        # Skip very small files (likely corrupted/partial) under 100KB —
+        # but NOT for images, which can be legitimately small.
+        if file_path.stat().st_size < 102400 and file_path.suffix.lower() not in IMAGE_SUFFIXES:
             continue
 
         stat_info = file_path.stat()

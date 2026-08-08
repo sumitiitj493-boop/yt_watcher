@@ -11,6 +11,7 @@ const cleanTitle = (filename = '') => (
 
 const mediaExt = (filename = '') => filename.split('.').pop()?.toLowerCase() || '';
 const isAudio = (filename = '') => ['mp3', 'm4a', 'aac', 'ogg', 'flac', 'wav'].includes(mediaExt(filename));
+const isImage = (filename = '') => ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(mediaExt(filename));
 const extractVideoId = (filename = '') => {
   const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
   return match ? match[1] : '';
@@ -104,6 +105,20 @@ const naturalCompare = (left, right) => {
 function PlaylistThumb({ file }) {
   const title = file.title || cleanTitle(file.filename || '');
   const videoId = file.video_id || extractVideoId(file.filename || '');
+
+  if (isImage(file.filename || '')) {
+    return (
+      <img
+        className="media-thumb"
+        src={`${API_BASE}/stream/${encodeURIComponent(file.filename)}`}
+        alt={title}
+        loading="lazy"
+        onError={(event) => {
+          event.currentTarget.style.display = 'none';
+        }}
+      />
+    );
+  }
 
   if (videoId) {
     return (
@@ -761,7 +776,13 @@ export default function PlaylistPage({ files = [], onNotify }) {
       {currentFile ? (
         <section className="panel panel--preview">
           <div className="preview-media">
-            {isAudio(currentFile.filename) ? (
+            {isImage(currentFile.filename) ? (
+              <img
+                className="preview-image"
+                src={`${API_BASE}/stream/${encodeURIComponent(currentFile.filename)}`}
+                alt={currentFile.title || cleanTitle(currentFile.filename)}
+              />
+            ) : isAudio(currentFile.filename) ? (
               <div className="preview-audio">
                 <div className="preview-audio__art">♪</div>
                 <audio

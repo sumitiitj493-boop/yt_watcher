@@ -8,6 +8,10 @@ normal video pipeline reports "No video formats found". This module:
 2. picks the largest-resolution image URL for every carousel item,
 3. downloads each image directly (curl_cffi + browser impersonation)
    into DOWNLOAD_DIR so they appear in the Library.
+
+If a Netscape-format instagram_cookies.txt exists (from a logged-in browser),
+it is passed to both yt-dlp and the CDN fetch — this is what allows viewing
+posts from private accounts the logged-in user follows.
 """
 import re
 import time
@@ -18,6 +22,7 @@ from threading import RLock
 from curl_cffi import requests as cffi_requests
 
 from services.files import DOWNLOAD_DIR
+from services.yt_dlp_options import apply_social_auth_options, get_cookiefile_for_url
 
 _PHOTO_JOBS: dict[str, dict] = {}
 _PHOTO_JOBS_LOCK = RLock()
@@ -34,6 +39,36 @@ _HEADERS = {
 _PIXEL_RE = re.compile(r"_(?:s|p)(\d+)x(\d+)")
 
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _cookie_header() -> str:
+    """Build a 'name=value; ...' Cookie header from the social cookies.txt file.
+
+    Only rows for instagram(.com) domains are used. Returns "" if no file or
+    no usable rows.
+    """
+    path = get_cookiefile_for_url("https://www.instagram.com/")
+    if not path:
+        return ""
+    pairs: list[str] = []
+    try:
+        for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            domain, _, _, _, _, name, value = parts[:7]
+            if "instagram" in domain and name and value:
+                pairs.append(f"{name}={value}")
+    except OSError:
+        return ""
+    return "; ".join(pairs)
 
 
 def _best_photo_url(thumbnails) -> str | None:
@@ -78,6 +113,9 @@ def extract_instagram_entries(url: str, max_items: int = 30) -> tuple[dict, list
         "ignore_no_formats_error": True,
         "playlist_items": f"1:{max_items}",
     }
+    # Pass the logged-in session cookies (if present) so private posts the
+    # user follows can be extracted too.
+    apply_social_auth_options(opts, url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     entries = info.get("entries") or [info]
@@ -87,28 +125,50 @@ def extract_instagram_entries(url: str, max_items: int = 30) -> tuple[dict, list
 def download_instagram_photos(url: str, max_items: int = 30) -> list[str]:
     """Download every image in an Instagram post/carousel into DOWNLOAD_DIR.
 
-    Returns the list of saved filenames (empty if nothing was found).
+    Returns the list of saved filenames (empty if nothing was found). Only
+    files verified present on disk are counted.
     """
     info, entries = extract_instagram_entries(url, max_items=max_items)
     base_title = _clean_title(info.get("title")) or "Instagram post"
     saved: list[str] = []
+    skipped_video = 0
+    skipped_failed = 0
     for entry in entries:
         if not entry:
+            skipped_video += 1
             continue
         photo_url = _best_photo_url(entry.get("thumbnails"))
         if not photo_url:
+            skipped_failed += 1
             continue
         entry_id = str(entry.get("id") or uuid.uuid4().hex[:11])
         path = _unique_path(base_title, entry_id)
         try:
+            headers = dict(_HEADERS)
+            cookie_header = _cookie_header()
+            if cookie_header:
+                headers["Cookie"] = cookie_header
             response = cffi_requests.get(
-                photo_url, headers=_HEADERS, impersonate="chrome", timeout=30
+                photo_url, headers=headers, impersonate="chrome", timeout=30
             )
             if response.status_code == 200 and len(response.content) > 1000:
                 path.write_bytes(response.content)
-                saved.append(path.name)
+                if path.exists() and path.stat().st_size > 1000:
+                    saved.append(path.name)
+                else:
+                    skipped_failed += 1
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            else:
+                skipped_failed += 1
         except Exception:
-            continue
+            skipped_failed += 1
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
     return saved
 
 

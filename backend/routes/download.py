@@ -23,6 +23,7 @@ from services.yt_dlp_options import (
 from services.youtube_access import check_youtube_access
 from services.url_guard import validate_public_url
 from services import instagram_images
+from routes.library import invalidate_files_cache
 from services.downloader import (
     clear_downloads,
     delete_download,
@@ -228,7 +229,14 @@ async def instagram_photos_download(request: MetadataRequest):
     if not saved:
         raise HTTPException(status_code=404, detail="No photos found in this post")
 
-    return {"saved": saved, "count": len(saved)}
+    # Make the library/gallery see the new files immediately (no stale cache).
+    invalidate_files_cache()
+
+    return {
+        "saved": saved,
+        "count": len(saved),
+        "saved_to": str(instagram_images.DOWNLOAD_DIR),
+    }
 
 
 @router.get("/whisper-transcriptions/{job_id}")

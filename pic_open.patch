@@ -1,0 +1,177 @@
+diff --git a/backend/services/files.py b/backend/services/files.py
+index db6da99..c896c71 100644
+--- a/backend/services/files.py
++++ b/backend/services/files.py
+@@ -10,18 +10,32 @@ VIDEO_ID_RE = re.compile(r"\(([A-Za-z0-9_-]{11})\)")
+ 
+ 
+ def resolve_download_path(filename: str) -> Path:
++    """Resolve a user-supplied filename to a real path inside the downloads area.
++
++    Security: only paths inside DOWNLOAD_DIR (or the Instagram temp subfolder)
++    are allowed; anything else raises ``ValueError``.
++
++    Note: this returns the path even if the file does not exist yet — callers
++    are responsible for checking existence and responding with 404. Raising on
++    missing files would make every route return 400 instead of 404.
++    """
+     decoded = unquote(filename)
+     candidate = (DOWNLOAD_DIR / decoded).resolve()
+-    if candidate != DOWNLOAD_DIR and DOWNLOAD_DIR in candidate.parents and candidate.exists():
++
++    # Guard against path traversal / absolute paths.
++    if candidate == DOWNLOAD_DIR or DOWNLOAD_DIR not in candidate.parents:
++        raise ValueError("Invalid filename")
++
++    # Existing file in the main downloads folder.
++    if candidate.exists():
+         return candidate
+ 
++    # Existing file in the Instagram temporary subfolder.
+     temp_candidate = (INSTAGRAM_TEMP_DIR / decoded).resolve()
+-    if temp_candidate.exists():
++    if temp_candidate.parent == INSTAGRAM_TEMP_DIR and temp_candidate.exists():
+         return temp_candidate
+ 
+-    if candidate == DOWNLOAD_DIR or DOWNLOAD_DIR not in candidate.parents:
+-        raise ValueError("Invalid filename")
+-    raise ValueError("File not found")
++    return candidate
+ 
+ 
+ def extract_video_id(filename: str) -> str | None:
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 322af35..2b0b301 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3489,3 +3489,12 @@ body[data-theme='dark'] .main-stage {
+ 	font-size: 16px;
+ 	word-break: break-word;
+ }
++
++/* ===== Instagram photo preview ===== */
++.preview-image {
++	width: 100%;
++	max-height: 520px;
++	object-fit: contain;
++	border-radius: 22px;
++	background: rgba(0, 0, 0, 0.04);
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 5bc6808..68e61a3 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -2049,7 +2049,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+       {previewFile ? (
+         <section className="panel panel--preview">
+           <div className="preview-media">
+-            {isVideoExt(previewExt) ? (
++            {isImageExt(previewExt) ? (
++              <img
++                className="preview-image"
++                src={previewUrl}
++                alt={previewTitle}
++                loading="lazy"
++              />
++            ) : isVideoExt(previewExt) ? (
+               <video
+                 ref={videoRef}
+                 className="preview-player"
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index dd18fff..0fe7196 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -11,6 +11,7 @@ const cleanTitle = (filename = '') => (
+ 
+ const mediaExt = (filename = '') => filename.split('.').pop()?.toLowerCase() || '';
+ const isAudio = (filename = '') => ['mp3', 'm4a', 'aac', 'ogg', 'flac', 'wav'].includes(mediaExt(filename));
++const isImage = (filename = '') => ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(mediaExt(filename));
+ const extractVideoId = (filename = '') => {
+   const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
+   return match ? match[1] : '';
+@@ -105,6 +106,20 @@ function PlaylistThumb({ file }) {
+   const title = file.title || cleanTitle(file.filename || '');
+   const videoId = file.video_id || extractVideoId(file.filename || '');
+ 
++  if (isImage(file.filename || '')) {
++    return (
++      <img
++        className="media-thumb"
++        src={`${API_BASE}/stream/${encodeURIComponent(file.filename)}`}
++        alt={title}
++        loading="lazy"
++        onError={(event) => {
++          event.currentTarget.style.display = 'none';
++        }}
++      />
++    );
++  }
++
+   if (videoId) {
+     return (
+       <img
+@@ -761,7 +776,13 @@ export default function PlaylistPage({ files = [], onNotify }) {
+       {currentFile ? (
+         <section className="panel panel--preview">
+           <div className="preview-media">
+-            {isAudio(currentFile.filename) ? (
++            {isImage(currentFile.filename) ? (
++              <img
++                className="preview-image"
++                src={`${API_BASE}/stream/${encodeURIComponent(currentFile.filename)}`}
++                alt={currentFile.title || cleanTitle(currentFile.filename)}
++              />
++            ) : isAudio(currentFile.filename) ? (
+               <div className="preview-audio">
+                 <div className="preview-audio__art">♪</div>
+                 <audio
+diff --git a/tmp_frontend_index.html b/tmp_frontend_index.html
+deleted file mode 100644
+index 1c51500..0000000
+--- a/tmp_frontend_index.html
++++ /dev/null
+@@ -1,16 +0,0 @@
+-﻿<!doctype html>
+-<html lang="en">
+-  <head>
+-    <script type="module" src="/@vite/client"></script>
+-
+-    <meta charset="UTF-8" />
+-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-    <title>frontend</title>
+-  </head>
+-  <body>
+-    <div id="root"></div>
+-    <script type="module" src="/src/main.jsx"></script>
+-  </body>
+-</html>
+-
+diff --git a/tmp_main.jsx b/tmp_main.jsx
+deleted file mode 100644
+index 95ca05c..0000000
+--- a/tmp_main.jsx
++++ /dev/null
+@@ -1,22 +0,0 @@
+-﻿const StrictMode = __vite__cjsImport0_react["StrictMode"];const createRoot = __vite__cjsImport1_reactDom_client["createRoot"];const _jsxDEV = __vite__cjsImport5_react_jsxDevRuntime["jsxDEV"];import __vite__cjsImport0_react from "/node_modules/.vite/deps/react.js?v=b5f38e54";
+-import __vite__cjsImport1_reactDom_client from "/node_modules/.vite/deps/react-dom_client.js?v=d901950f";
+-import { BrowserRouter } from "/node_modules/.vite/deps/react-router-dom.js?v=418843be";
+-import "/src/index.css";
+-import App from "/src/App.jsx";
+-var _jsxFileName = "D:/semesters/sem4/projects/yt_watcher/frontend/src/main.jsx";
+-import __vite__cjsImport5_react_jsxDevRuntime from "/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=b5f38e54";
+-createRoot(document.getElementById("root")).render(/* @__PURE__ */ _jsxDEV(StrictMode, { children: /* @__PURE__ */ _jsxDEV(BrowserRouter, { children: /* @__PURE__ */ _jsxDEV(App, {}, void 0, false, {
+-	fileName: _jsxFileName,
+-	lineNumber: 10,
+-	columnNumber: 7
+-}, this) }, void 0, false, {
+-	fileName: _jsxFileName,
+-	lineNumber: 9,
+-	columnNumber: 5
+-}, this) }, void 0, false, {
+-	fileName: _jsxFileName,
+-	lineNumber: 8,
+-	columnNumber: 3
+-}, this));
+-
+-//# sourceMappingURL=data:application/json;base64,eyJtYXBwaW5ncyI6IkFBQUEsU0FBUyxrQkFBa0I7QUFDM0IsU0FBUyxrQkFBa0I7QUFDM0IsU0FBUyxxQkFBcUI7QUFDOUIsT0FBTztBQUNQLE9BQU8sU0FBUzs7O0FBRWhCLFdBQVcsU0FBUyxlQUFlLE9BQU8sQ0FBQyxDQUFDLE9BQzFDLHdCQUFDLFlBQUQsWUFDRSx3QkFBQyxlQUFELFlBQ0Usd0JBQUMsS0FBRCxFQUFPOzs7O1VBQ087Ozs7VUFDTDs7OztTQUNkIiwibmFtZXMiOltdLCJzb3VyY2VzIjpbIm1haW4uanN4Il0sInZlcnNpb24iOjMsInNvdXJjZXNDb250ZW50IjpbImltcG9ydCB7IFN0cmljdE1vZGUgfSBmcm9tICdyZWFjdCc7XG5pbXBvcnQgeyBjcmVhdGVSb290IH0gZnJvbSAncmVhY3QtZG9tL2NsaWVudCc7XG5pbXBvcnQgeyBCcm93c2VyUm91dGVyIH0gZnJvbSAncmVhY3Qtcm91dGVyLWRvbSc7XG5pbXBvcnQgJy4vaW5kZXguY3NzJztcbmltcG9ydCBBcHAgZnJvbSAnLi9BcHAuanN4JztcblxuY3JlYXRlUm9vdChkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncm9vdCcpKS5yZW5kZXIoXG4gIDxTdHJpY3RNb2RlPlxuICAgIDxCcm93c2VyUm91dGVyPlxuICAgICAgPEFwcCAvPlxuICAgIDwvQnJvd3NlclJvdXRlcj5cbiAgPC9TdHJpY3RNb2RlPixcbik7XG4iXX0=

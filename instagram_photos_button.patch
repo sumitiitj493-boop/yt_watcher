@@ -1,0 +1,202 @@
+diff --git a/backend/services/downloader.py b/backend/services/downloader.py
+index 60bb63b..b0f5815 100644
+--- a/backend/services/downloader.py
++++ b/backend/services/downloader.py
+@@ -652,6 +652,30 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
+                 return
+             # Small delay to allow Windows to release file locks from antivirus/indexing
+             time.sleep(0.5)
++
++            # Instagram photo posts produce no video: yt-dlp leaves a junk
++            # ".NA" placeholder instead of a real file. Detect that and fail
++            # with clear guidance instead of reporting a bogus "completed".
++            if is_instagram_post:
++                resolved = _resolve_downloaded_file(ydl, info, format_ext)
++                junk_na = bool(resolved and resolved.lower().endswith(".na"))
++                real_file = bool(resolved and not junk_na and (download_root / resolved).exists())
++                if junk_na or not real_file:
++                    for junk in download_root.glob("*.NA"):
++                        try:
++                            junk.unlink(missing_ok=True)
++                        except Exception:
++                            pass
++                    for junk in download_root.glob("*.na"):
++                        try:
++                            junk.unlink(missing_ok=True)
++                        except Exception:
++                            pass
++                    raise RuntimeError(
++                        "This Instagram post contains no video (it's a photo post). "
++                        "Use the 'Download post photos' button to save the images instead."
++                    )
++
+             _mark_completed(task_id, ydl, info, format_ext)
+             print(f"[download] completed - {download_tasks[task_id].get('filename')}", flush=True)
+     except Exception as e:
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 322af35..2b0b301 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3489,3 +3489,12 @@ body[data-theme='dark'] .main-stage {
+ 	font-size: 16px;
+ 	word-break: break-word;
+ }
++
++/* ===== Instagram photo preview ===== */
++.preview-image {
++	width: 100%;
++	max-height: 520px;
++	object-fit: contain;
++	border-radius: 22px;
++	background: rgba(0, 0, 0, 0.04);
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 5bc6808..19a2d32 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -702,7 +702,7 @@ function AboutPage() {
+   );
+ }
+ 
+-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
++function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged }) {
+   const notify = useCallback((message, type = 'info') => {
+     if (onNotify) onNotify(message, type);
+   }, [onNotify]);
+@@ -722,6 +722,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
+   const [socialCookiesError, setSocialCookiesError] = useState('');
+   const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
++  const [photosDownloading, setPhotosDownloading] = useState(false);
++  const [photosResult, setPhotosResult] = useState(null);
+   const [transcriptUrl, setTranscriptUrl] = useState('');
+   const [transcriptLoading, setTranscriptLoading] = useState(false);
+   const [transcriptResult, setTranscriptResult] = useState(null);
+@@ -828,6 +830,27 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     }
+   };
+ 
++  const handleInstagramPhotos = async () => {
++    const trimmed = socialUrl.trim();
++    if (!trimmed || photosDownloading) return;
++    setPhotosDownloading(true);
++    setPhotosResult(null);
++    try {
++      const response = await api.post('/instagram-photos', { url: trimmed });
++      const data = response.data || {};
++      const count = data.count || (Array.isArray(data.saved) ? data.saved.length : 0);
++      setPhotosResult(data);
++      notify(`Saved ${count} photo${count === 1 ? '' : 's'} to your Library`, 'success', 3000);
++      if (onLibraryChanged) onLibraryChanged();
++    } catch (photosError) {
++      const msg = safeFetchError(photosError, 'Unable to download photos from this post.');
++      setPhotosResult({ error: msg });
++      notify(msg, 'error', 3500);
++    } finally {
++      setPhotosDownloading(false);
++    }
++  };
++
+   const loadSocialCookies = useCallback(async () => {
+     setSocialCookiesLoading(true);
+     setSocialCookiesError('');
+@@ -1172,6 +1195,26 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
+               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
+             </button>
++
++            <div className="transcript-actions instagram-photos-row">
++              <button
++                className="ghost-button"
++                type="button"
++                onClick={handleInstagramPhotos}
++                disabled={photosDownloading || !socialUrl.trim()}
++              >
++                {photosDownloading ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
++                {photosDownloading ? 'Downloading photos…' : 'Download post photos'}
++              </button>
++              {photosResult?.saved?.length ? (
++                <span className="field__help" style={{ margin: 0 }}>
++                  Saved {photosResult.saved.length} photo{photosResult.saved.length === 1 ? '' : 's'} to Library
++                </span>
++              ) : null}
++              {photosResult?.error ? (
++                <span className="field__help field__help--warn" style={{ margin: 0 }}>{photosResult.error}</span>
++              ) : null}
++            </div>
+           </form>
+ 
+           <div className="whisper-upload-divider"><span>Instagram note</span></div>
+@@ -2049,7 +2092,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+       {previewFile ? (
+         <section className="panel panel--preview">
+           <div className="preview-media">
+-            {isVideoExt(previewExt) ? (
++            {isImageExt(previewExt) ? (
++              <img
++                className="preview-image"
++                src={previewUrl}
++                alt={previewTitle}
++                loading="lazy"
++              />
++            ) : isVideoExt(previewExt) ? (
+               <video
+                 ref={videoRef}
+                 className="preview-player"
+@@ -2636,7 +2686,7 @@ export default function App() {
+         <Routes>
+           <Route path="/" element={<Navigate to="/about" replace />} />
+           <Route path="/about" element={<AboutPage />} />
+-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
++          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index dd18fff..0fe7196 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -11,6 +11,7 @@ const cleanTitle = (filename = '') => (
+ 
+ const mediaExt = (filename = '') => filename.split('.').pop()?.toLowerCase() || '';
+ const isAudio = (filename = '') => ['mp3', 'm4a', 'aac', 'ogg', 'flac', 'wav'].includes(mediaExt(filename));
++const isImage = (filename = '') => ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(mediaExt(filename));
+ const extractVideoId = (filename = '') => {
+   const match = String(filename).match(/\(([A-Za-z0-9_-]{11})\)/);
+   return match ? match[1] : '';
+@@ -105,6 +106,20 @@ function PlaylistThumb({ file }) {
+   const title = file.title || cleanTitle(file.filename || '');
+   const videoId = file.video_id || extractVideoId(file.filename || '');
+ 
++  if (isImage(file.filename || '')) {
++    return (
++      <img
++        className="media-thumb"
++        src={`${API_BASE}/stream/${encodeURIComponent(file.filename)}`}
++        alt={title}
++        loading="lazy"
++        onError={(event) => {
++          event.currentTarget.style.display = 'none';
++        }}
++      />
++    );
++  }
++
+   if (videoId) {
+     return (
+       <img
+@@ -761,7 +776,13 @@ export default function PlaylistPage({ files = [], onNotify }) {
+       {currentFile ? (
+         <section className="panel panel--preview">
+           <div className="preview-media">
+-            {isAudio(currentFile.filename) ? (
++            {isImage(currentFile.filename) ? (
++              <img
++                className="preview-image"
++                src={`${API_BASE}/stream/${encodeURIComponent(currentFile.filename)}`}
++                alt={currentFile.title || cleanTitle(currentFile.filename)}
++              />
++            ) : isAudio(currentFile.filename) ? (
+               <div className="preview-audio">
+                 <div className="preview-audio__art">♪</div>
+                 <audio

@@ -39,6 +39,7 @@ import PlaylistPage from './pages/Playlist';
 import PlaylistPicker from './components/PlaylistPicker';
 import LibraryPicker from './components/LibraryPicker';
 import AudioExtractorPage from './pages/AudioExtractor';
+import PhotosPage from './pages/Photos';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
@@ -702,7 +703,7 @@ function AboutPage() {
   );
 }
 
-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify }) {
+function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged }) {
   const notify = useCallback((message, type = 'info') => {
     if (onNotify) onNotify(message, type);
   }, [onNotify]);
@@ -722,6 +723,8 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [socialCookiesLoading, setSocialCookiesLoading] = useState(false);
   const [socialCookiesError, setSocialCookiesError] = useState('');
   const [socialCookiesUploading, setSocialCookiesUploading] = useState(false);
+  const [photosDownloading, setPhotosDownloading] = useState(false);
+  const [photosResult, setPhotosResult] = useState(null);
   const [transcriptUrl, setTranscriptUrl] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const [transcriptResult, setTranscriptResult] = useState(null);
@@ -825,6 +828,27 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       setSocialUrl('');
     } finally {
       setSocialSubmitting(false);
+    }
+  };
+
+  const handleInstagramPhotos = async () => {
+    const trimmed = socialUrl.trim();
+    if (!trimmed || photosDownloading) return;
+    setPhotosDownloading(true);
+    setPhotosResult(null);
+    try {
+      const response = await api.post('/instagram-photos', { url: trimmed });
+      const data = response.data || {};
+      const count = data.count || (Array.isArray(data.saved) ? data.saved.length : 0);
+      setPhotosResult(data);
+      notify(`Saved ${count} photo${count === 1 ? '' : 's'} to your Library`, 'success', 3000);
+      if (onLibraryChanged) onLibraryChanged();
+    } catch (photosError) {
+      const msg = safeFetchError(photosError, 'Unable to download photos from this post.');
+      setPhotosResult({ error: msg });
+      notify(msg, 'error', 3500);
+    } finally {
+      setPhotosDownloading(false);
     }
   };
 
@@ -1172,6 +1196,26 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               {socialSubmitting ? <Loader2 className="spinner" size={16} /> : <Download size={16} />}
               {socialSubmitting ? 'Processing…' : 'Process Public Link'}
             </button>
+
+            <div className="transcript-actions instagram-photos-row">
+              <button
+                className="ghost-button"
+                type="button"
+                onClick={handleInstagramPhotos}
+                disabled={photosDownloading || !socialUrl.trim()}
+              >
+                {photosDownloading ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
+                {photosDownloading ? 'Downloading photos…' : 'Download post photos'}
+              </button>
+              {photosResult?.saved?.length ? (
+                <span className="field__help" style={{ margin: 0 }}>
+                  Saved {photosResult.saved.length} photo{photosResult.saved.length === 1 ? '' : 's'} to Library
+                </span>
+              ) : null}
+              {photosResult?.error ? (
+                <span className="field__help field__help--warn" style={{ margin: 0 }}>{photosResult.error}</span>
+              ) : null}
+            </div>
           </form>
 
           <div className="whisper-upload-divider"><span>Instagram note</span></div>
@@ -2049,7 +2093,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
       {previewFile ? (
         <section className="panel panel--preview">
           <div className="preview-media">
-            {isVideoExt(previewExt) ? (
+            {isImageExt(previewExt) ? (
+              <img
+                className="preview-image"
+                src={previewUrl}
+                alt={previewTitle}
+                loading="lazy"
+              />
+            ) : isVideoExt(previewExt) ? (
               <video
                 ref={videoRef}
                 className="preview-player"
@@ -2208,6 +2259,14 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
           <LibraryBig size={18} />
           <span>Library</span>
           {files.length > 0 ? <span className="nav-link__badge">{files.length}</span> : null}
+        </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/photos" end>
+          <ImageIcon size={18} />
+          <span>Photos</span>
+          {files.filter((file) => isImageExt(mediaExt(file.filename || ''))).length > 0 ? (
+            <span className="nav-link__badge">{files.filter((file) => isImageExt(mediaExt(file.filename || ''))).length}</span>
+          ) : null}
         </NavLink>
 
         <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/playlist" end>
@@ -2636,12 +2695,13 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/about" replace />} />
           <Route path="/about" element={<AboutPage />} />
-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} />} />
+          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+          <Route path="/photos" element={<PhotosPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onNotify={pushToast} />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
         </Routes>
       </main>

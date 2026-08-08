@@ -135,7 +135,7 @@ def _categorize_error(message: str) -> str:
     ]
     bot_markers = ["confirm you're not a bot", "confirm you’re not a bot", "unusual traffic", "bot check"]
     geo_markers = ["not available in your country", "geo", "region"]
-    unsupported_markers = ["unsupported url", "no suitable extractor", "no video formats found", "no video formats"]
+    unsupported_markers = ["unsupported url", "no suitable extractor", "no video formats found", "no video formats", "no downloadable media", "no video in this post"]
     removed_markers = ["video unavailable", "removed", "deleted", "does not exist"]
     if any(marker in text for marker in timeout_markers):
         return "timeout"
@@ -644,6 +644,21 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
             _set_task_message(task_id, "Authenticating/extracting media info...")
             info = ydl.extract_info(url, download=True)
             watchdog_stop.set()
+
+            # yt-dlp returns None when every playlist entry failed (e.g. an
+            # Instagram photo post with no video). Handle it as a clean error
+            # instead of crashing on info.get().
+            if not info or not isinstance(info, dict):
+                for junk in list(download_root.glob("*.NA")) + list(download_root.glob("*.na")):
+                    try:
+                        junk.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "No downloadable media found. If this is an Instagram photo post, "
+                    "use the 'Download post photos' button to save the images instead."
+                )
+
             download_tasks[task_id]["title"] = info.get("title", "Unknown")
             download_tasks[task_id]["video_id"] = info.get("id")
             if download_tasks[task_id].get("status") == "cancelled":
@@ -652,6 +667,30 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
                 return
             # Small delay to allow Windows to release file locks from antivirus/indexing
             time.sleep(0.5)
+
+            # Instagram photo posts produce no video: yt-dlp leaves a junk
+            # ".NA" placeholder instead of a real file. Detect that and fail
+            # with clear guidance instead of reporting a bogus "completed".
+            if is_instagram_post:
+                # Instagram photo posts produce no video: yt-dlp leaves a junk
+                # ".NA" placeholder (or nothing). Detect it by scanning the
+                # download folder directly (avoid ydl.prepare_filename, which
+                # crashes on playlist results) and fail with clear guidance.
+                real_files = [
+                    p for p in download_root.iterdir()
+                    if p.is_file() and p.suffix.lower() not in {".na", ".part", ".ytdl", ".json"}
+                ]
+                if not real_files:
+                    for junk in list(download_root.glob("*.NA")) + list(download_root.glob("*.na")):
+                        try:
+                            junk.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        "This Instagram post contains no video (it's a photo post). "
+                        "Use the 'Download post photos' button to save the images instead."
+                    )
+
             _mark_completed(task_id, ydl, info, format_ext)
             print(f"[download] completed - {download_tasks[task_id].get('filename')}", flush=True)
     except Exception as e:
