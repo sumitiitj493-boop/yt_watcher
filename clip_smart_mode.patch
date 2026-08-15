@@ -1,0 +1,134 @@
+diff --git a/backend/models.py b/backend/models.py
+index bc9f638..6f9f9db 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -168,7 +168,7 @@ class ClipCreateRequest(BaseModel):
+     title: str = Field(default="", max_length=200)
+     collection: str = Field(default="", max_length=120)
+     target_playlist_id: int | None = Field(default=None)
+-    mode: str = Field(default="fast", pattern="^(fast|accurate)$")
++    mode: str = Field(default="fast", pattern="^(fast|smart|accurate)$")
+ 
+ 
+ class SocialDownloadRequest(BaseModel):
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index bad3fd2..044b1cb 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -143,8 +143,8 @@ def start_clip_job(
+         raise FileNotFoundError("Video file not found")
+ 
+     mode = (mode or "fast").strip().lower()
+-    if mode not in ("fast", "accurate"):
+-        raise ValueError("Mode must be 'fast' or 'accurate'")
++    if mode not in ("fast", "smart", "accurate"):
++        raise ValueError("Mode must be 'fast', 'smart' or 'accurate'")
+ 
+     start = max(0.0, float(start_seconds or 0))
+     end = float(end_seconds or 0)
+@@ -199,7 +199,12 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+     clip_duration = max(0.1, end - start)
+     try:
+         job["status"] = "cutting"
+-        job["message"] = "Cutting clip (fast)..." if mode == "fast" else "Cutting clip (accurate)..."
++        mode_msg = {
++            "fast": "Cutting clip (fast)...",
++            "smart": "Cutting clip (smart: exact + fast)...",
++            "accurate": "Cutting clip (accurate)...",
++        }
++        job["message"] = mode_msg.get(mode, "Cutting clip...")
+ 
+         # Input seeking (-ss before -i) is dramatically faster than output
+         # seeking — ffmpeg jumps to the timestamp via the index, then only
+@@ -212,14 +217,26 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+ 
+         if mode == "fast":
+             # Stream copy: no re-encode, just copy the exact bytes between
+-            # keyframes. Nearly instant for any file size.
++            # keyframes. Nearly instant for any file size, but the cut lands
++            # on the nearest keyframe (may be a second or two off).
+             cmd += [
+                 "-c", "copy",
+                 "-avoid_negative_ts", "make_zero",
+                 "-movflags", "+faststart",
+             ]
++        elif mode == "smart":
++            # Best of both worlds: re-encode ONLY the video with the ultrafast
++            # preset at CRF 18 (visually lossless) so the cut is frame-exact,
++            # while copying the audio stream exactly (audio has no keyframes,
++            # so -c:a copy keeps it sample-accurate). ultrafast is ~2-3x
++            # faster than veryfast, so this is both exact AND fast.
++            cmd += [
++                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
++                "-c:a", "copy",
++                "-movflags", "+faststart",
++            ]
+         else:
+-            # Accurate: re-encode so the cut is frame-exact.
++            # Accurate: re-encode video + audio so the cut is frame-exact.
+             cmd += [
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-c:a", "aac", "-b:a", "128k",
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index e54ac95..e084e04 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -5322,3 +5322,15 @@ body,
+ 	flex: 1;
+ 	min-width: 200px;
+ }
++
++/* Recommended (Smart) mode button gets a subtle highlight */
++.clip-mode-toggle__btn--recommended {
++	border-color: rgba(34, 211, 238, 0.5);
++	color: var(--accent-cool);
++}
++
++.clip-mode-toggle__btn--recommended.clip-mode-toggle__btn--active {
++	border-color: var(--accent-cool);
++	background: rgba(34, 211, 238, 0.12);
++	color: var(--text);
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index ae58b66..f6f115a 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -133,7 +133,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+   const [clipTitle, setClipTitle] = useState('');
+   const [collection, setCollection] = useState('');
+   const [targetPlaylist, setTargetPlaylist] = useState('');
+-  const [clipMode, setClipMode] = useState('fast'); // 'fast' (instant) | 'accurate'
++  const [clipMode, setClipMode] = useState('smart'); // 'fast' | 'smart' (recommended) | 'accurate'
+   const [creating, setCreating] = useState(false);
+   const [job, setJob] = useState(null);
+   const [error, setError] = useState('');
+@@ -586,17 +586,26 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                     >
+                       ⚡ Fast (instant)
+                     </button>
++                    <button
++                      type="button"
++                      className={`clip-mode-toggle__btn clip-mode-toggle__btn--recommended ${clipMode === 'smart' ? 'clip-mode-toggle__btn--active' : ''}`}
++                      onClick={() => setClipMode('smart')}
++                    >
++                      ✨ Smart (exact + fast) ★
++                    </button>
+                     <button
+                       type="button"
+                       className={`clip-mode-toggle__btn ${clipMode === 'accurate' ? 'clip-mode-toggle__btn--active' : ''}`}
+                       onClick={() => setClipMode('accurate')}
+                     >
+-                      🎯 Accurate (exact)
++                      🎯 Accurate (max precision)
+                     </button>
+                     <span className="clip-mode-toggle__hint">
+                       {clipMode === 'fast'
+-                        ? 'No re-encode — copies the video instantly, cut lands on the nearest keyframe (±1–2s).'
+-                        : 'Re-encodes for frame-exact cut — slower but precise.'}
++                        ? 'No re-encode — copies instantly, cut lands on nearest keyframe (±1–2s).'
++                        : clipMode === 'smart'
++                          ? 'Recommended: re-encodes only video at ultrafast + CRF 18 (visually lossless) — exact timestamps, ~2–3× faster than Accurate.'
++                          : 'Re-encodes video + audio at veryfast — frame-exact, slowest but maximum precision.'}
+                     </span>
+                   </div>
+                   <div className="transcript-actions">

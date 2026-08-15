@@ -1,0 +1,317 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 92c2b5c..3f45f25 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4817,237 +4817,6 @@ body,
+ 	animation: hint-pop 240ms ease both;
+ }
+ 
+-/* Media converter modal */
+-.converter-backdrop {
+-	position: fixed;
+-	inset: 0;
+-	z-index: 1550;
+-	background: rgba(3, 6, 18, 0.6);
+-	backdrop-filter: blur(6px);
+-	-webkit-backdrop-filter: blur(6px);
+-	display: flex;
+-	align-items: center;
+-	justify-content: center;
+-	padding: 20px;
+-}
+-
+-.converter-modal {
+-	width: 100%;
+-	max-width: 440px;
+-	background: var(--surface);
+-	border: 1px solid var(--border);
+-	border-radius: 18px;
+-	box-shadow: var(--shadow);
+-	padding: 20px;
+-	display: grid;
+-	gap: 14px;
+-}
+-
+-.converter-modal__head {
+-	display: flex;
+-	align-items: center;
+-	gap: 12px;
+-}
+-
+-.converter-modal__icon {
+-	width: 36px;
+-	height: 36px;
+-	border-radius: 10px;
+-	display: grid;
+-	place-items: center;
+-	background: var(--surface-muted);
+-	border: 1px solid var(--border);
+-	color: var(--accent-cool);
+-	flex-shrink: 0;
+-}
+-
+-.converter-modal__title {
+-	display: flex;
+-	flex-direction: column;
+-	gap: 2px;
+-	min-width: 0;
+-	flex: 1;
+-}
+-
+-.converter-modal__subtitle {
+-	font-size: 0.78rem;
+-	color: var(--text-muted);
+-	overflow: hidden;
+-	text-overflow: ellipsis;
+-	white-space: nowrap;
+-}
+-
+-.converter-modal__close {
+-	background: none;
+-	border: none;
+-	color: var(--text-muted);
+-	cursor: pointer;
+-	padding: 6px;
+-	border-radius: 8px;
+-	display: inline-flex;
+-	flex-shrink: 0;
+-}
+-
+-.converter-modal__close:hover {
+-	color: var(--text);
+-	background: rgba(255, 255, 255, 0.06);
+-}
+-
+-.converter-form {
+-	display: grid;
+-	gap: 12px;
+-}
+-
+-.converter-progress {
+-	display: grid;
+-	gap: 8px;
+-}
+-
+-.converter-progress__row {
+-	display: flex;
+-	justify-content: space-between;
+-	font-size: 0.85rem;
+-	color: var(--text-muted);
+-}
+-
+-.converter-done {
+-	display: grid;
+-	gap: 8px;
+-	text-align: center;
+-	padding: 8px 0;
+-}
+-
+-.converter-done__title {
+-	margin: 0;
+-	font-weight: 700;
+-	color: #34d399;
+-	font-size: 1rem;
+-}
+-
+-.converter-done__meta {
+-	margin: 0;
+-	color: var(--text-muted);
+-	font-size: 0.82rem;
+-	overflow: hidden;
+-	text-overflow: ellipsis;
+-	white-space: nowrap;
+-}
+-
+-/* ==========================================================================
+-   Clip Studio
+-   ========================================================================== */
+-.clip-creator {
+-	display: grid;
+-	gap: 14px;
+-	border: 1px dashed var(--border);
+-	border-radius: 16px;
+-	padding: 16px;
+-	background: rgba(255, 255, 255, 0.02);
+-}
+-
+-.clip-creator__meta {
+-	display: flex;
+-	gap: 8px;
+-	flex-wrap: wrap;
+-}
+-
+-.clip-creator__preview {
+-	width: 100%;
+-	max-height: 360px;
+-	border-radius: 12px;
+-	background: #000;
+-}
+-
+-.clip-creator__timeline {
+-	display: grid;
+-	gap: 8px;
+-}
+-
+-.clip-creator__range-label {
+-	display: flex;
+-	justify-content: space-between;
+-	gap: 10px;
+-	flex-wrap: wrap;
+-	font-size: 0.85rem;
+-	color: var(--text-muted);
+-}
+-
+-.clip-creator__range-label strong {
+-	color: var(--text);
+-}
+-
+-.clip-creator__len {
+-	color: var(--accent-cool);
+-}
+-
+-.clip-creator__slider-row {
+-	display: grid;
+-	gap: 8px;
+-}
+-
+-.clip-creator__slider-row input[type='range'] {
+-	width: 100%;
+-	cursor: pointer;
+-	height: 26px;
+-}
+-
+-.clip-creator__time-inputs {
+-	display: flex;
+-	gap: 16px;
+-	flex-wrap: wrap;
+-}
+-
+-.clip-creator__time-inputs label {
+-	display: inline-flex;
+-	align-items: center;
+-	gap: 8px;
+-	color: var(--text-muted);
+-	font-size: 0.85rem;
+-}
+-
+-.clip-creator__time-inputs .input--num {
+-	width: 90px;
+-}
+-
+-.clip-creator__done {
+-	color: #34d399;
+-	font-weight: 600;
+-}
+-
+-.clip-card {
+-	width: 100%;
+-	display: flex;
+-	flex-direction: column;
+-	gap: 8px;
+-}
+-
+-.clip-card__head {
+-	display: flex;
+-	align-items: flex-start;
+-	justify-content: space-between;
+-	gap: 12px;
+-}
+-
+-.clip-card__title {
+-	display: flex;
+-	flex-direction: column;
+-	gap: 3px;
+-	min-width: 0;
+-}
+-
+-.clip-card__actions {
+-	display: flex;
+-	gap: 4px;
+-	flex-shrink: 0;
+-}
+-
+-.clip-card__player {
+-	width: 100%;
+-	max-height: 300px;
+-	border-radius: 12px;
+-	background: #000;
+-}
+-
+ /* Subtitle search (find video by pasted text) */
+ .subtitle-search {
+ 	display: grid;
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 8623047..2cfd059 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -37,7 +37,6 @@ import {
+   XCircle,
+   BookOpenText,
+   ArrowUp,
+-  ArrowLeftRight,
+   Scissors,
+ } from 'lucide-react';
+ 
+@@ -56,7 +55,6 @@ import ShortcutsModal from './components/ShortcutsModal';
+ import ConfettiBurst from './components/ConfettiBurst';
+ import Skeleton from './components/Skeleton';
+ import WelcomeQuote from './components/WelcomeQuote';
+-import ConverterDialog from './components/ConverterDialog';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -495,7 +493,7 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
+   );
+ }
+ 
+-function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, onConvert, selectMode = false, selected = false, onToggleSelect }) {
++function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMode = false, selected = false, onToggleSelect }) {
+   const title = file.title || cleanTitle(file.filename || 'Unknown file');
+   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
+   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
+@@ -530,12 +528,6 @@ function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, onConvert
+           <a className="icon-button" href={downloadUrl} download title="Download file" onClick={(event) => event.stopPropagation()}>
+             <Download size={15} />
+           </a>
+-          <button className="icon-button" type="button" title="Convert file" onClick={(event) => {
+-            event.stopPropagation();
+-            onConvert?.(file);
+-          }}>
+-            <ArrowLeftRight size={15} />
+-          </button>
+           <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => {
+             event.stopPropagation();
+             onAddToPlaylist?.(file.filename);
+@@ -2836,7 +2828,6 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+   const [selectionMode, setSelectionMode] = useState(false);
+   const [selectedFiles, setSelectedFiles] = useState(() => new Set());
+-  const [convertFile, setConvertFile] = useState(null);
+   const [hidePlaylistFiles, setHidePlaylistFiles] = useState(true);
+   const [libraryFiles, setLibraryFiles] = useState(files);
+ 
+@@ -3268,7 +3259,6 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+                 onSelect={setSelectedFile}
+                 onDelete={handleDeleteFile}
+                 onAddToPlaylist={onAddToPlaylist}
+-                onConvert={setConvertFile}
+                 selectMode={selectionMode}
+                 selected={selectedFiles.has(file.filename)}
+                 onToggleSelect={toggleSelectFile}
+@@ -3278,16 +3268,6 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+           </div>
+         )}
+       </section>
+-
+-      {convertFile ? (
+-        <ConverterDialog
+-          file={convertFile}
+-          onClose={() => setConvertFile(null)}
+-          onConverted={() => {
+-            if (onRefreshFiles) onRefreshFiles();
+-          }}
+-        />
+-      ) : null}
+     </div>
+   );
+ }

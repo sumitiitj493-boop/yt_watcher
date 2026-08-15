@@ -1,0 +1,31 @@
+diff --git a/backend/models.py b/backend/models.py
+index 6f9f9db..742c2f2 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -168,7 +168,7 @@ class ClipCreateRequest(BaseModel):
+     title: str = Field(default="", max_length=200)
+     collection: str = Field(default="", max_length=120)
+     target_playlist_id: int | None = Field(default=None)
+-    mode: str = Field(default="fast", pattern="^(fast|smart|accurate)$")
++    mode: str = Field(default="smart", max_length=20)
+ 
+ 
+ class SocialDownloadRequest(BaseModel):
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index 044b1cb..38ab017 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -142,9 +142,11 @@ def start_clip_job(
+     if not source.exists():
+         raise FileNotFoundError("Video file not found")
+ 
+-    mode = (mode or "fast").strip().lower()
++    mode = (mode or "smart").strip().lower()
++    # Never hard-fail on an unknown mode — coerce to the recommended smart mode
++    # so a stale frontend/backend mismatch can't cause 422 errors.
+     if mode not in ("fast", "smart", "accurate"):
+-        raise ValueError("Mode must be 'fast', 'smart' or 'accurate'")
++        mode = "smart"
+ 
+     start = max(0.0, float(start_seconds or 0))
+     end = float(end_seconds or 0)

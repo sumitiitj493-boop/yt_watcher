@@ -1,0 +1,19 @@
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index cb53d21..ae58b66 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -529,6 +529,14 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                     <Clock size={13} /> End
+                     <input className="input input--num" value={endInput} onChange={(e) => setEndInput(e.target.value)} onBlur={applyEndInput} onKeyDown={(e) => { if (e.key === 'Enter') applyEndInput(); }} placeholder="1:00" />
+                   </label>
++                  <button
++                    className="ghost-button ghost-button--small"
++                    type="button"
++                    onClick={() => { applyStartInput(); applyEndInput(); }}
++                    title="Apply the typed timestamps to the timeline"
++                  >
++                    <Check size={14} /> Apply
++                  </button>
+                 </div>
+               </div>
+ 

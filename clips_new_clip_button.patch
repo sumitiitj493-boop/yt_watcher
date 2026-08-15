@@ -1,0 +1,79 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index d007f1a..e54ac95 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -5308,3 +5308,17 @@ body,
+ 	font-size: 0.78rem;
+ 	color: var(--text-muted);
+ }
++
++/* "New clip from same video" action after a cut completes */
++.clip-creator__done-wrap {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.clip-creator__done-wrap .clip-creator__done {
++	margin: 0;
++	flex: 1;
++	min-width: 200px;
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index 5aff5c3..cb53d21 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -8,6 +8,7 @@ import {
+   Loader2,
+   Pause,
+   Play,
++  Plus,
+   RefreshCw,
+   Scissors,
+   Search,
+@@ -313,6 +314,30 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+     setError('');
+   };
+ 
++  // "New clip" — cut another clip from the SAME video: keep the source,
++  // clear the range/job/title, and re-analyze instantly.
++  const startNewClipFromSame = async () => {
++    if (!selectedFile) return;
++    setJob(null);
++    stopRef.current = false;
++    setStartSec(0);
++    setEndSec(Math.min(60, duration || 60));
++    setStartInput('0:00');
++    setEndInput(formatSec(Math.min(60, duration || 60)));
++    setClipTitle('');
++    setCollection('');
++    setTargetPlaylist('');
++    setError('');
++    setAnalysis(null);
++    // Re-run the analysis so the timeline resets to the full video.
++    try {
++      const res = await api.post('/clips/analyze', { filename: selectedFile });
++      setAnalysis(res.data || {});
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to re-analyze');
++    }
++  };
++
+   const handleDelete = async (clip) => {
+     if (confirmDeleteId === clip.id) {
+       try {
+@@ -533,7 +558,12 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                     <div className="dock__bar-fill" style={{ width: `${job.progress ?? 0}%` }} />
+                   </div>
+                   {job.status === 'completed' ? (
+-                    <p className="clip-creator__done">✓ Clip saved{job.filename ? `: ${job.filename}` : ''}</p>
++                    <div className="clip-creator__done-wrap">
++                      <p className="clip-creator__done">✓ Clip saved{job.filename ? `: ${job.filename}` : ''}</p>
++                      <button className="primary-button" type="button" onClick={startNewClipFromSame}>
++                        <Plus size={16} /> New clip from same video
++                      </button>
++                    </div>
+                   ) : job.status === 'error' ? (
+                     <p className="download-card__error">{job.error}</p>
+                   ) : null}

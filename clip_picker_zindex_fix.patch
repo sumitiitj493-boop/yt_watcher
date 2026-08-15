@@ -1,0 +1,20 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 1296bc6..5d073e5 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -5071,3 +5071,15 @@ body,
+ 	color: var(--text-muted);
+ 	font-size: 0.85rem;
+ }
++
++/* Fix: dropdown must float above the clips list below.
++   backdrop-filter on .panel creates a stacking context, so the picker's
++   parent panel needs its own z-index to paint above later sibling panels. */
++.panel--form:has(.clip-picker) {
++	position: relative;
++	z-index: 30;
++}
++
++.clip-picker__dropdown {
++	z-index: 1000;
++}

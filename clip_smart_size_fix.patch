@@ -1,0 +1,49 @@
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index 38ab017..3e4bcbc 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -227,13 +227,14 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+                 "-movflags", "+faststart",
+             ]
+         elif mode == "smart":
+-            # Best of both worlds: re-encode ONLY the video with the ultrafast
+-            # preset at CRF 18 (visually lossless) so the cut is frame-exact,
+-            # while copying the audio stream exactly (audio has no keyframes,
+-            # so -c:a copy keeps it sample-accurate). ultrafast is ~2-3x
+-            # faster than veryfast, so this is both exact AND fast.
++            # Best of both worlds: re-encode ONLY the video so the cut is
++            # frame-exact, while copying the audio stream exactly (audio has no
++            # keyframes, so -c:a copy keeps it sample-accurate AND avoids
++            # re-encoding bloat). veryfast + CRF 20 keeps the file size close
++            # to the source quality (never bigger) — ultrafast was far too
++            # lossy on compression and produced huge files.
+             cmd += [
+-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
++                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-c:a", "copy",
+                 "-movflags", "+faststart",
+             ]
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index f6f115a..5860210 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -591,7 +591,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                       className={`clip-mode-toggle__btn clip-mode-toggle__btn--recommended ${clipMode === 'smart' ? 'clip-mode-toggle__btn--active' : ''}`}
+                       onClick={() => setClipMode('smart')}
+                     >
+-                      ✨ Smart (exact + fast) ★
++                      ✨ Smart (exact) ★
+                     </button>
+                     <button
+                       type="button"
+@@ -604,8 +604,8 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                       {clipMode === 'fast'
+                         ? 'No re-encode — copies instantly, cut lands on nearest keyframe (±1–2s).'
+                         : clipMode === 'smart'
+-                          ? 'Recommended: re-encodes only video at ultrafast + CRF 18 (visually lossless) — exact timestamps, ~2–3× faster than Accurate.'
+-                          : 'Re-encodes video + audio at veryfast — frame-exact, slowest but maximum precision.'}
++                          ? 'Recommended: frame-exact cut, keeps original audio, file size stays close to source quality (normal size).'
++                          : 'Re-encodes video + audio — frame-exact, similar speed to Smart but re-encodes audio too.'}
+                     </span>
+                   </div>
+                   <div className="transcript-actions">

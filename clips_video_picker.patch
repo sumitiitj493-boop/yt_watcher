@@ -1,0 +1,332 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 17a3956..1296bc6 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4907,3 +4907,167 @@ body,
+ 	flex: 1;
+ 	min-width: 220px;
+ }
++
++/* Clip video picker (searchable, folder-organized) */
++.clip-picker {
++	position: relative;
++}
++
++.clip-picker__trigger {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 10px;
++	width: 100%;
++	padding: 11px 14px;
++	border-radius: 14px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text);
++	font-family: inherit;
++	font-size: 0.92rem;
++	cursor: pointer;
++	text-align: left;
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.clip-picker__trigger:hover {
++	border-color: var(--accent-strong);
++}
++
++.clip-picker__trigger-text {
++	flex: 1;
++	min-width: 0;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.clip-picker__trigger-count {
++	font-size: 0.74rem;
++	color: var(--text-muted);
++	background: rgba(255, 255, 255, 0.06);
++	border: 1px solid var(--border);
++	border-radius: 999px;
++	padding: 2px 8px;
++	flex-shrink: 0;
++}
++
++.clip-picker__dropdown {
++	position: absolute;
++	top: calc(100% + 6px);
++	left: 0;
++	right: 0;
++	z-index: 200;
++	background: var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 14px;
++	box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
++	padding: 8px;
++	display: grid;
++	gap: 8px;
++}
++
++.clip-picker__search {
++	display: flex;
++	align-items: center;
++	gap: 8px;
++	border: 1px solid var(--border);
++	border-radius: 10px;
++	padding: 4px 10px;
++	background: var(--surface-muted);
++}
++
++.clip-picker__search-icon {
++	color: var(--text-muted);
++	flex-shrink: 0;
++}
++
++.clip-picker__search input {
++	background: none;
++	border: none;
++	outline: none;
++	color: var(--text);
++	font-family: inherit;
++	font-size: 0.9rem;
++	width: 100%;
++}
++
++.clip-picker__folders {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 6px;
++}
++
++.clip-picker__folder {
++	padding: 4px 10px;
++	border-radius: 999px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text-muted);
++	font-size: 0.76rem;
++	cursor: pointer;
++	transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
++}
++
++.clip-picker__folder:hover {
++	border-color: var(--accent-strong);
++	color: var(--text);
++}
++
++.clip-picker__folder--active {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.14);
++	color: var(--text);
++}
++
++.clip-picker__list {
++	max-height: 260px;
++	overflow-y: auto;
++	display: grid;
++	gap: 2px;
++}
++
++.clip-picker__option {
++	display: flex;
++	flex-direction: column;
++	gap: 2px;
++	padding: 8px 10px;
++	border-radius: 10px;
++	border: none;
++	background: none;
++	color: var(--text);
++	font-family: inherit;
++	text-align: left;
++	cursor: pointer;
++}
++
++.clip-picker__option:hover {
++	background: rgba(255, 255, 255, 0.05);
++}
++
++.clip-picker__option--active {
++	background: rgba(124, 58, 237, 0.14);
++}
++
++.clip-picker__option-title {
++	font-size: 0.88rem;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.clip-picker__option-folder {
++	font-size: 0.72rem;
++	color: var(--accent-cool);
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.clip-picker__empty {
++	padding: 16px;
++	text-align: center;
++	color: var(--text-muted);
++	font-size: 0.85rem;
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index ddd88d5..a0f1c68 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -47,6 +47,81 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+     () => (files || []).filter((f) => VIDEO_EXTS.has((f.ext || String(f.filename || '').split('.').pop() || '').toLowerCase())),
+     [files],
+   );
++  // Playlists (used to organize the video picker by folder)
++  const [allPlaylists, setAllPlaylists] = useState([]);
++  useEffect(() => {
++    api.get('/playlists')
++      .then((res) => setAllPlaylists(Array.isArray(res.data?.playlists) ? res.data.playlists : []))
++      .catch(() => setAllPlaylists([]));
++  }, []);
++  // map filename -> playlist names it belongs to
++  const [playlistItemsMap, setPlaylistItemsMap] = useState({});
++  useEffect(() => {
++    if (!allPlaylists.length) return;
++    let active = true;
++    Promise.all(allPlaylists.map((p) => api.get(`/playlists/${p.id}/items`).catch(() => ({ data: [] }))))
++      .then((responses) => {
++        if (!active) return;
++        const map = {};
++        responses.forEach((res, idx) => {
++          const name = allPlaylists[idx]?.name || 'Playlist';
++          (res.data || []).forEach((filename) => {
++            if (!map[filename]) map[filename] = [];
++            map[filename].push(name);
++          });
++        });
++        setPlaylistItemsMap(map);
++      })
++      .catch(() => {});
++    return () => { active = false; };
++  }, [allPlaylists]);
++
++  // Search + folder filter for the video picker
++  const [pickerQuery, setPickerQuery] = useState('');
++  const [pickerFolder, setPickerFolder] = useState('all');
++  const [pickerOpen, setPickerOpen] = useState(false);
++  const pickerRef = useRef(null);
++
++  const filteredVideoFiles = useMemo(() => {
++    const needle = pickerQuery.trim().toLowerCase();
++    return videoFiles.filter((f) => {
++      if (pickerFolder !== 'all') {
++        const folders = playlistItemsMap[f.filename] || [];
++        if (pickerFolder === 'unfiled') {
++          if (folders.length > 0) return false;
++        } else if (!folders.includes(pickerFolder)) {
++          return false;
++        }
++      }
++      if (!needle) return true;
++      const title = (f.title || f.filename || '').toLowerCase();
++      const filename = (f.filename || '').toLowerCase();
++      return title.includes(needle) || filename.includes(needle);
++    });
++  }, [videoFiles, pickerQuery, pickerFolder, playlistItemsMap]);
++
++  const pickerFolders = useMemo(() => {
++    const set = new Set();
++    videoFiles.forEach((f) => {
++      (playlistItemsMap[f.filename] || []).forEach((name) => set.add(name));
++    });
++    return ['all', 'unfiled', ...[...set].sort((a, b) => a.localeCompare(b))];
++  }, [videoFiles, playlistItemsMap]);
++
++  const folderLabel = (folder) => {
++    if (folder === 'all') return 'All videos';
++    if (folder === 'unfiled') return 'No folder';
++    return folder;
++  };
++
++  useEffect(() => {
++    const onClickOutside = (event) => {
++      if (pickerRef.current && !pickerRef.current.contains(event.target)) setPickerOpen(false);
++    };
++    if (pickerOpen) document.addEventListener('mousedown', onClickOutside);
++    return () => document.removeEventListener('mousedown', onClickOutside);
++  }, [pickerOpen]);
++
+   const [selectedFile, setSelectedFile] = useState('');
+   const [analysis, setAnalysis] = useState(null);
+   const [analyzing, setAnalyzing] = useState(false);
+@@ -290,12 +365,67 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+           <div className="form-grid">
+             <div className="field">
+               <label className="field__label" htmlFor="clip-file">VIDEO</label>
+-              <select id="clip-file" className="select" value={selectedFile} onChange={(e) => { setSelectedFile(e.target.value); setAnalysis(null); setError(''); }}>
+-                <option value="">Select a downloaded video…</option>
+-                {videoFiles.map((f) => (
+-                  <option key={f.filename} value={f.filename}>{f.title || f.filename}</option>
+-                ))}
+-              </select>
++              <div className="clip-picker" ref={pickerRef}>
++                <button className="clip-picker__trigger" type="button" onClick={() => setPickerOpen((v) => !v)}>
++                  <span className="clip-picker__trigger-text">
++                    {selectedFile
++                      ? videoFiles.find((f) => f.filename === selectedFile)?.title || selectedFile
++                      : 'Select a downloaded video…'}
++                  </span>
++                  <span className="clip-picker__trigger-count">{videoFiles.length} video{videoFiles.length === 1 ? '' : 's'}</span>
++                </button>
++
++                {pickerOpen ? (
++                  <div className="clip-picker__dropdown">
++                    <div className="clip-picker__search">
++                      <Search size={14} className="clip-picker__search-icon" />
++                      <input
++                        className="input input--search"
++                        value={pickerQuery}
++                        onChange={(event) => setPickerQuery(event.target.value)}
++                        placeholder="Search videos by name…"
++                        autoFocus
++                      />
++                    </div>
++                    <div className="clip-picker__folders">
++                      {pickerFolders.map((folder) => (
++                        <button
++                          key={folder}
++                          type="button"
++                          className={`clip-picker__folder ${pickerFolder === folder ? 'clip-picker__folder--active' : ''}`}
++                          onClick={() => setPickerFolder(folder)}
++                        >
++                          {folderLabel(folder)}
++                        </button>
++                      ))}
++                    </div>
++                    <div className="clip-picker__list">
++                      {filteredVideoFiles.length === 0 ? (
++                        <div className="clip-picker__empty">No videos match</div>
++                      ) : (
++                        filteredVideoFiles.map((f) => (
++                          <button
++                            key={f.filename}
++                            type="button"
++                            className={`clip-picker__option ${selectedFile === f.filename ? 'clip-picker__option--active' : ''}`}
++                            onClick={() => {
++                              setSelectedFile(f.filename);
++                              setAnalysis(null);
++                              setError('');
++                              setPickerOpen(false);
++                            }}
++                          >
++                            <span className="clip-picker__option-title">{f.title || f.filename}</span>
++                            {(playlistItemsMap[f.filename] || []).length > 0 ? (
++                              <span className="clip-picker__option-folder">{playlistItemsMap[f.filename].join(', ')}</span>
++                            ) : null}
++                          </button>
++                        ))
++                      )}
++                    </div>
++                  </div>
++                ) : null}
++              </div>
+             </div>
+             <div className="field">
+               <label className="field__label" htmlFor="clip-title">CLIP TITLE</label>

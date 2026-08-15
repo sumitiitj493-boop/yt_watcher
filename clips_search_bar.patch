@@ -1,0 +1,123 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 3f45f25..17a3956 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4893,3 +4893,17 @@ body,
+ 	font-size: 0.78rem;
+ 	color: var(--accent-cool);
+ }
++
++/* Clips toolbar: search + collection chips */
++.clips-toolbar {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	flex-wrap: wrap;
++	margin-bottom: 12px;
++}
++
++.clips-toolbar .search-box {
++	flex: 1;
++	min-width: 220px;
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index d75b32a..ddd88d5 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -10,6 +10,7 @@ import {
+   Play,
+   RefreshCw,
+   Scissors,
++  Search,
+   Trash2,
+   X,
+ } from 'lucide-react';
+@@ -37,6 +38,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+   const [playlists, setPlaylists] = useState([]);
+   const [loading, setLoading] = useState(false);
+   const [activeCollection, setActiveCollection] = useState('all');
++  const [clipQuery, setClipQuery] = useState('');
+   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+   const [playingId, setPlayingId] = useState(null);
+ 
+@@ -85,9 +87,20 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+   }, [clips]);
+ 
+   const filtered = useMemo(() => {
+-    if (activeCollection === 'all') return clips;
+-    return clips.filter((c) => (c.collection || '').trim() === activeCollection);
+-  }, [clips, activeCollection]);
++    let list = clips;
++    if (activeCollection !== 'all') {
++      list = list.filter((c) => (c.collection || '').trim() === activeCollection);
++    }
++    const needle = clipQuery.trim().toLowerCase();
++    if (needle) {
++      list = list.filter((c) =>
++        [c.title, c.collection, c.filename, c.source_filename]
++          .filter(Boolean)
++          .some((v) => String(v).toLowerCase().includes(needle)),
++      );
++    }
++    return list;
++  }, [clips, activeCollection, clipQuery]);
+ 
+   const parseTime = (text) => {
+     const parts = String(text || '').split(':').map((p) => parseFloat(p));
+@@ -415,20 +428,31 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+           <span className="panel__badge">{filtered.length}</span>
+         </div>
+ 
+-        <div className="transcript-folder-chips">
+-          {collections.map((c) => (
+-            <button
+-              key={c}
+-              type="button"
+-              className={`transcript-folder-chip ${activeCollection === c ? 'transcript-folder-chip--active' : ''}`}
+-              onClick={() => setActiveCollection(c)}
+-            >
+-              {c === 'all' ? 'All' : c}
+-              <span className="transcript-folder-chip__count">
+-                {c === 'all' ? clips.length : clips.filter((x) => (x.collection || '').trim() === c).length}
+-              </span>
+-            </button>
+-          ))}
++        <div className="clips-toolbar">
++          <div className="search-box">
++            <Search size={15} className="search-box__icon" />
++            <input
++              className="input input--search"
++              value={clipQuery}
++              onChange={(event) => setClipQuery(event.target.value)}
++              placeholder="Search clips by name…"
++            />
++          </div>
++          <div className="transcript-folder-chips">
++            {collections.map((c) => (
++              <button
++                key={c}
++                type="button"
++                className={`transcript-folder-chip ${activeCollection === c ? 'transcript-folder-chip--active' : ''}`}
++                onClick={() => setActiveCollection(c)}
++              >
++                {c === 'all' ? 'All' : c}
++                <span className="transcript-folder-chip__count">
++                  {c === 'all' ? clips.length : clips.filter((x) => (x.collection || '').trim() === c).length}
++                </span>
++              </button>
++            ))}
++          </div>
+         </div>
+ 
+         {loading ? (
+@@ -439,7 +463,9 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+             <p>No clips yet. Pick a video above, choose a range on the timeline, and cut your first clip!</p>
+           </div>
+         ) : filtered.length === 0 ? (
+-          <div className="empty-state"><p>No clips in this collection yet.</p></div>
++          <div className="empty-state">
++            <p>{clipQuery.trim() ? 'No clips match your search.' : 'No clips in this collection yet.'}</p>
++          </div>
+         ) : (
+           <div className="stack-list">
+             {filtered.map((clip) => (

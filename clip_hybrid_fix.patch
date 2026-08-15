@@ -1,0 +1,270 @@
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index e80a951..31127b8 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -81,6 +81,58 @@ def _probe_duration(path: Path) -> Optional[float]:
+         return None
+ 
+ 
++def _codecs_for_container(ext: str) -> tuple[str, str, str]:
++    """Return (video_codec, audio_codec, audio_bitrate_flag) for a container.
++
++    Used when re-encoding so the codecs always match the output container
++    (e.g. webm cannot hold libx264/aac).
++    """
++    ext = (ext or "").lower().lstrip(".")
++    if ext == "webm":
++        return "libvpx-vp9", "libopus", "-b:a"
++    if ext in ("avi",):
++        return "mpeg4", "mp3", "-b:a"
++    if ext in ("mpeg", "mpg"):
++        return "mpeg2video", "mp2", "-b:a"
++    if ext in ("wmv",):
++        return "wmv2", "wmav2", "-b:a"
++    # mp4 / mov / m4v / mkv / ts / 3gp / anything else
++    return "libx264", "aac", "-b:a"
++
++
++def _probe_streams(path: Path) -> dict:
++    """Return the video/audio codecs of the source (for concat compatibility)."""
++    try:
++        result = subprocess.run(
++            [FFPROBE, "-v", "error", "-show_entries", "stream=index,codec_type,codec_name",
++             "-of", "csv=p=0", str(path)],
++            capture_output=True,
++            text=True,
++            timeout=60,
++        )
++        vcodec = None
++        acodec = None
++        for line in result.stdout.splitlines():
++            line = line.strip()
++            if not line:
++                continue
++            parts = line.split(",")
++            if len(parts) < 3:
++                continue
++            try:
++                ctype = parts[1]
++                cname = parts[2]
++            except IndexError:
++                continue
++            if ctype == "video" and vcodec is None:
++                vcodec = cname
++            elif ctype == "audio" and acodec is None:
++                acodec = cname
++        return {"video_codec": vcodec, "audio_codec": acodec}
++    except Exception:
++        return {"video_codec": None, "audio_codec": None}
++
++
+ def _probe_keyframes(path: Path, window_start: float, window_end: float) -> list[float]:
+     """Return video keyframe timestamps (pts) within [window_start, window_end].
+ 
+@@ -139,14 +191,25 @@ def _run_smart_hybrid(job: dict, source: Path, out_path: Path, start: float, end
+     """Smart mode v2: exact boundaries with a mostly stream-copied middle.
+ 
+     - Re-encode ONLY the tiny sliver [start, first_keyframe_after_start]
+-      (usually < 1s) so the cut starts exactly at the requested timestamp.
++      (usually < 1s) so the cut starts exactly at the requested timestamp,
++      reporting LIVE progress (0-45%).
+     - Stream-copy the bulk [first_keyframe, end] — `-c copy` is instant and
+-      the end boundary is already frame-exact with `-t`.
+-    - Concatenate the two parts (no re-encode on concat).
++      the end boundary is already frame-exact with `-t` (45-90%).
++    - Concatenate the two parts (no re-encode on concat) (90-99%).
+ 
+     Returns True on success, False if the hybrid isn't applicable (falls back
+-    to the regular re-encode path).
++    to the regular re-encode path with its own progress).
+     """
++    # Concat demuxer only reliably joins identical codecs. If the source isn't
++    # h264+aac (e.g. webm/vp9/opus), skip the hybrid entirely and fall back to
++    # the normal smart re-encode — otherwise part A (h264/aac) wouldn't concat
++    # with part B (copied vp9/opus) and we'd waste time.
++    streams = _probe_streams(source)
++    vcodec = (streams.get("video_codec") or "").lower()
++    acodec = (streams.get("audio_codec") or "").lower()
++    if not (vcodec.startswith("h264") or vcodec in ("avc1", "avc")) or not (acodec.startswith("aac") or acodec in ("mp4a",)):
++        return False
++
+     probe_window = min(15.0, max(2.0, end - start))
+     keys = _probe_keyframes(source, start, min(end + 1.0, start + probe_window * 2))
+     # First keyframe at-or-after the exact start
+@@ -158,33 +221,86 @@ def _run_smart_hybrid(job: dict, source: Path, out_path: Path, start: float, end
+     part_b = out_path.with_suffix(out_path.suffix + ".part_b.mp4")
+     a_dur = first_key - start
+     b_dur = end - first_key
++    job_started = time.time()
++
++    def _run_with_progress(cmd: list[str], total_media: float, progress_from: float, progress_to: float, msg: str) -> None:
++        """Run ffmpeg, updating job progress smoothly from -> to as it decodes."""
++        cmd = list(cmd) + ["-progress", "pipe:1", "-nostats"]
++        proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            encoding="utf-8",
++            errors="replace",
++        )
++        error_lines: list[str] = []
++
++        def _read_stderr() -> None:
++            assert proc.stderr is not None
++            for line in proc.stderr:
++                error_lines.append(line)
++
++        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
++        stderr_thread.start()
++
++        phase_started = time.time()
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            stripped = line.strip()
++            if stripped.startswith("out_time_ms="):
++                try:
++                    ms = int(stripped.split("=", 1)[1])
++                except ValueError:
++                    continue
++                seconds = ms / 1_000_000
++                fraction = min(1.0, seconds / total_media) if total_media > 0 else 1.0
++                job["progress"] = round(progress_from + (progress_to - progress_from) * fraction)
++                elapsed = time.time() - phase_started
++                job["elapsed_seconds"] = round(time.time() - job_started)
++                if seconds > 0.5 and elapsed > 0.5:
++                    remaining = max(0.0, total_media - seconds)
++                    speed = seconds / elapsed
++                    job["eta_seconds"] = round(remaining / speed) if speed > 0 else None
++                else:
++                    job["eta_seconds"] = None
++                if job.get("eta_seconds") is not None:
++                    job["message"] = f"{msg} · ETA {_format_eta(job['eta_seconds'])}"
++                else:
++                    job["message"] = msg
++        proc.wait()
++        stderr_thread.join(timeout=5)
++        if proc.returncode != 0:
++            raise RuntimeError("".join(error_lines[-6:]).strip() or "ffmpeg exited with an error")
+ 
+     try:
+-        job["message"] = "Cutting clip... exact start (0-20%)"
++        job["message"] = "Precise start... (phase 1/3)"
+         # Part A: re-encode only the start sliver (exact start). Both video AND
+         # audio are re-encoded so both streams start at pts ~0 — if audio were
+         # copied here it would keep its original pts and the concat would
+         # misalign (making the container duration wrong by ~1s).
+-        subprocess.run(
++        _run_with_progress(
+             [
+                 FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{start:.3f}", "-i", str(source),
+                 "-t", f"{a_dur:.3f}",
+-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
++                # ultrafast is fine here: part A is only the sub-keyframe
++                # sliver (a few seconds max), so the size bloat that made
++                # whole-clip ultrafast huge is negligible for this tiny piece.
++                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                 "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart",
+                 str(part_a),
+             ],
+-            check=True,
+-            capture_output=True,
+-            text=True,
+-            timeout=300,
++            a_dur,
++            5,
++            45,
++            "Precise start... (phase 1/3)",
+         )
+-        job["progress"] = 40
+ 
+-        job["message"] = "Cutting clip... copying middle (instant)"
++        job["message"] = "Copying middle... (phase 2/3, instant)"
+         # Part B: stream-copy the bulk (starts at a keyframe, exact end via -t)
+-        subprocess.run(
++        _run_with_progress(
+             [
+                 FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{first_key:.3f}", "-i", str(source),
+@@ -194,16 +310,16 @@ def _run_smart_hybrid(job: dict, source: Path, out_path: Path, start: float, end
+                 "-movflags", "+faststart",
+                 str(part_b),
+             ],
+-            check=True,
+-            capture_output=True,
+-            text=True,
+-            timeout=300,
++            b_dur,
++            45,
++            90,
++            "Copying middle... (phase 2/3, instant)",
+         )
+-        job["progress"] = 90
+ 
+-        job["message"] = "Cutting clip... joining (99%)"
++        job["message"] = "Joining... (phase 3/3)"
+         _concat_parts([part_a, part_b], out_path)
+         job["progress"] = 99
++        job["eta_seconds"] = None
+         return True
+     except Exception:
+         return False
+@@ -274,7 +390,7 @@ def start_clip_job(
+     title: str = "",
+     collection: str = "",
+     target_playlist_id: Optional[int] = None,
+-    mode: str = "fast",
++    mode: str = "smart",
+ ) -> str:
+     """Queue a clip cut. Returns a job_id.
+ 
+@@ -282,6 +398,9 @@ def start_clip_job(
+       - "fast"     : stream-copy (no re-encode) — nearly instant, but the cut
+                      lands on the nearest keyframe (may be a second or two
+                      before/after the exact timestamp).
++      - "smart"    : hybrid — re-encode only the tiny start sliver, stream-copy
++                     the bulk, concat. Exact timestamps, fast. Falls back to a
++                     full re-encode if the source isn't h264/aac.
+       - "accurate" : re-encode (libx264 veryfast) — exact timestamps, slower.
+     """
+     if not ffmpeg_available():
+@@ -378,23 +497,29 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+         elif mode == "smart":
+             # Best of both worlds v2 (hybrid): re-encode only the tiny start
+             # sliver for exactness, stream-copy the bulk, then concat. Falls
+-            # back to a full re-encode (veryfast + CRF 20 + audio copy) if the
+-            # hybrid isn't applicable for this file.
++            # back to a full re-encode (codec-aware) if the hybrid isn't
++            # applicable for this file.
+             if _run_smart_hybrid(job, source, out_path, start, end):
+                 cmd = []  # hybrid already wrote the output
+             else:
++                vcodec, acodec, aflag = _codecs_for_container(out_path.suffix)
+                 cmd += [
+-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+-                    "-c:a", "copy",
+-                    "-movflags", "+faststart",
++                    "-c:v", vcodec, "-preset", "veryfast", "-crf", "20",
++                    "-c:a", acodec,
+                 ]
++                if aflag:
++                    cmd += [aflag, "128k"]
++                cmd += ["-movflags", "+faststart"]
+         else:
+             # Accurate: re-encode video + audio so the cut is frame-exact.
++            vcodec, acodec, aflag = _codecs_for_container(out_path.suffix)
+             cmd += [
+-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+-                "-c:a", "aac", "-b:a", "128k",
+-                "-movflags", "+faststart",
++                "-c:v", vcodec, "-preset", "veryfast", "-crf", "23",
++                "-c:a", acodec,
+             ]
++            if aflag:
++                cmd += [aflag, "128k"]
++            cmd += ["-movflags", "+faststart"]
+ 
+         # The hybrid smart mode may have already produced the output file.
+         hybrid_done = not cmd

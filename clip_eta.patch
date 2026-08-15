@@ -1,0 +1,93 @@
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index 3e4bcbc..8ce6db2 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -52,6 +52,21 @@ def _seconds_label(seconds: float) -> str:
+     return f"{m}:{s:02d}"
+ 
+ 
++def _format_eta(seconds) -> str:
++    if seconds is None:
++        return "…"
++    seconds = max(0, int(seconds))
++    if seconds < 60:
++        return f"{seconds}s"
++    minutes = seconds // 60
++    secs = seconds % 60
++    if minutes < 60:
++        return f"{minutes}m {secs}s"
++    hours = minutes // 60
++    minutes = minutes % 60
++    return f"{hours}h {minutes}m"
++
++
+ def _probe_duration(path: Path) -> Optional[float]:
+     try:
+         result = subprocess.run(
+@@ -276,9 +291,25 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+                 except ValueError:
+                     continue
+                 seconds = ms / 1_000_000
++                elapsed = time.time() - started
+                 job["progress"] = min(99, round(seconds / clip_duration * 100))
+-                job["message"] = f"Cutting clip... {job['progress']}%"
+-                job["elapsed_seconds"] = round(time.time() - started)
++                job["elapsed_seconds"] = round(elapsed)
++                # ETA = remaining work / observed speed (only when we have
++                # meaningful progress and elapsed time).
++                if seconds > 0.5 and elapsed > 0.5:
++                    remaining = max(0.0, clip_duration - seconds)
++                    speed = seconds / elapsed  # media-seconds per wall-second
++                    if speed > 0:
++                        eta = remaining / speed
++                        job["eta_seconds"] = round(eta)
++                    else:
++                        job["eta_seconds"] = None
++                else:
++                    job["eta_seconds"] = None
++                if job.get("eta_seconds") is not None:
++                    job["message"] = f"Cutting clip... {job['progress']}% · ETA {_format_eta(job['eta_seconds'])}"
++                else:
++                    job["message"] = f"Cutting clip... {job['progress']}%"
+ 
+         proc.wait()
+         stderr_thread.join(timeout=5)
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index e084e04..d616583 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -5334,3 +5334,16 @@ body,
+ 	background: rgba(34, 211, 238, 0.12);
+ 	color: var(--text);
+ }
++
++/* Clip ETA display */
++.converter-progress__right {
++	display: inline-flex;
++	align-items: center;
++	gap: 10px;
++}
++
++.clip-progress__eta {
++	color: var(--accent-cool);
++	font-weight: 700;
++	font-variant-numeric: tabular-nums;
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index 5860210..5ee0cfc 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -560,7 +560,12 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                 <div className="converter-progress">
+                   <div className="converter-progress__row">
+                     <span>{job.message || 'Cutting…'}</span>
+-                    <span>{job.progress ?? 0}%</span>
++                    <span className="converter-progress__right">
++                      {job.eta_seconds != null && job.status !== 'completed' ? (
++                        <span className="clip-progress__eta">⏱ {job.eta_seconds}s left</span>
++                      ) : null}
++                      <span>{job.progress ?? 0}%</span>
++                    </span>
+                   </div>
+                   <div className="dock__bar">
+                     <div className="dock__bar-fill" style={{ width: `${job.progress ?? 0}%` }} />

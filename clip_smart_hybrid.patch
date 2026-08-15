@@ -1,0 +1,311 @@
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index 8ce6db2..e80a951 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -81,6 +81,140 @@ def _probe_duration(path: Path) -> Optional[float]:
+         return None
+ 
+ 
++def _probe_keyframes(path: Path, window_start: float, window_end: float) -> list[float]:
++    """Return video keyframe timestamps (pts) within [window_start, window_end].
++
++    Used by Smart mode to find the keyframe right after the exact start so the
++    tiny start sliver can be re-encoded while the bulk is stream-copied.
++    """
++    try:
++        cmd = [
++            FFPROBE, "-v", "error",
++            "-select_streams", "v:0",
++            "-skip_frame", "nokey",
++            "-show_entries", "frame=pts_time",
++            "-of", "csv=p=0",
++            "-read_intervals", f"{max(0.0, window_start):.3f}%{max(0.0, window_end):.3f}",
++            str(path),
++        ]
++        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
++        times: list[float] = []
++        for line in result.stdout.splitlines():
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                times.append(float(line))
++            except ValueError:
++                continue
++        return times
++    except Exception:
++        return []
++
++
++def _concat_parts(parts: list[Path], out_path: Path) -> None:
++    """Concatenate the parts with the concat demuxer (all h264/aac, no re-encode)."""
++    list_file = out_path.with_suffix(out_path.suffix + ".concat.txt")
++    lines = []
++    for part in parts:
++        escaped = str(part.resolve()).replace("'", "'\\''")
++        lines.append(f"file '{escaped}'")
++    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    try:
++        subprocess.run(
++            [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out_path)],
++            check=True,
++            capture_output=True,
++            text=True,
++            timeout=600,
++        )
++    finally:
++        try:
++            list_file.unlink(missing_ok=True)
++        except Exception:
++            pass
++
++
++def _run_smart_hybrid(job: dict, source: Path, out_path: Path, start: float, end: float) -> bool:
++    """Smart mode v2: exact boundaries with a mostly stream-copied middle.
++
++    - Re-encode ONLY the tiny sliver [start, first_keyframe_after_start]
++      (usually < 1s) so the cut starts exactly at the requested timestamp.
++    - Stream-copy the bulk [first_keyframe, end] — `-c copy` is instant and
++      the end boundary is already frame-exact with `-t`.
++    - Concatenate the two parts (no re-encode on concat).
++
++    Returns True on success, False if the hybrid isn't applicable (falls back
++    to the regular re-encode path).
++    """
++    probe_window = min(15.0, max(2.0, end - start))
++    keys = _probe_keyframes(source, start, min(end + 1.0, start + probe_window * 2))
++    # First keyframe at-or-after the exact start
++    first_key = next((k for k in keys if k >= start - 0.001), None)
++    if first_key is None or first_key >= end - 0.3:
++        return False  # no copyable middle — fall back to full re-encode
++
++    part_a = out_path.with_suffix(out_path.suffix + ".part_a.mp4")
++    part_b = out_path.with_suffix(out_path.suffix + ".part_b.mp4")
++    a_dur = first_key - start
++    b_dur = end - first_key
++
++    try:
++        job["message"] = "Cutting clip... exact start (0-20%)"
++        # Part A: re-encode only the start sliver (exact start). Both video AND
++        # audio are re-encoded so both streams start at pts ~0 — if audio were
++        # copied here it would keep its original pts and the concat would
++        # misalign (making the container duration wrong by ~1s).
++        subprocess.run(
++            [
++                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
++                "-ss", f"{start:.3f}", "-i", str(source),
++                "-t", f"{a_dur:.3f}",
++                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
++                "-c:a", "aac", "-b:a", "128k",
++                "-movflags", "+faststart",
++                str(part_a),
++            ],
++            check=True,
++            capture_output=True,
++            text=True,
++            timeout=300,
++        )
++        job["progress"] = 40
++
++        job["message"] = "Cutting clip... copying middle (instant)"
++        # Part B: stream-copy the bulk (starts at a keyframe, exact end via -t)
++        subprocess.run(
++            [
++                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
++                "-ss", f"{first_key:.3f}", "-i", str(source),
++                "-t", f"{b_dur:.3f}",
++                "-c", "copy",
++                "-avoid_negative_ts", "make_zero",
++                "-movflags", "+faststart",
++                str(part_b),
++            ],
++            check=True,
++            capture_output=True,
++            text=True,
++            timeout=300,
++        )
++        job["progress"] = 90
++
++        job["message"] = "Cutting clip... joining (99%)"
++        _concat_parts([part_a, part_b], out_path)
++        job["progress"] = 99
++        return True
++    except Exception:
++        return False
++    finally:
++        for part in (part_a, part_b):
++            try:
++                part.unlink(missing_ok=True)
++            except Exception:
++                pass
++
++
+ def analyze_file(filename: str) -> dict:
+     """Return duration + metadata for a downloaded video (no cutting)."""
+     if not ffmpeg_available():
+@@ -242,17 +376,18 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+                 "-movflags", "+faststart",
+             ]
+         elif mode == "smart":
+-            # Best of both worlds: re-encode ONLY the video so the cut is
+-            # frame-exact, while copying the audio stream exactly (audio has no
+-            # keyframes, so -c:a copy keeps it sample-accurate AND avoids
+-            # re-encoding bloat). veryfast + CRF 20 keeps the file size close
+-            # to the source quality (never bigger) — ultrafast was far too
+-            # lossy on compression and produced huge files.
+-            cmd += [
+-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+-                "-c:a", "copy",
+-                "-movflags", "+faststart",
+-            ]
++            # Best of both worlds v2 (hybrid): re-encode only the tiny start
++            # sliver for exactness, stream-copy the bulk, then concat. Falls
++            # back to a full re-encode (veryfast + CRF 20 + audio copy) if the
++            # hybrid isn't applicable for this file.
++            if _run_smart_hybrid(job, source, out_path, start, end):
++                cmd = []  # hybrid already wrote the output
++            else:
++                cmd += [
++                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
++                    "-c:a", "copy",
++                    "-movflags", "+faststart",
++                ]
+         else:
+             # Accurate: re-encode video + audio so the cut is frame-exact.
+             cmd += [
+@@ -261,62 +396,68 @@ def _run_clip_job(job_id, source, out_path, start, end, title, collection, targe
+                 "-movflags", "+faststart",
+             ]
+ 
+-        cmd += ["-progress", "pipe:1", "-nostats", str(out_path)]
+-
+-        proc = subprocess.Popen(
+-            cmd,
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.PIPE,
+-            text=True,
+-            encoding="utf-8",
+-            errors="replace",
+-        )
+-
+-        error_lines: list[str] = []
+-
+-        def _read_stderr() -> None:
+-            assert proc.stderr is not None
+-            for line in proc.stderr:
+-                error_lines.append(line)
+-
+-        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+-        stderr_thread.start()
+-
+-        assert proc.stdout is not None
+-        for line in proc.stdout:
+-            stripped = line.strip()
+-            if stripped.startswith("out_time_ms="):
+-                try:
+-                    ms = int(stripped.split("=", 1)[1])
+-                except ValueError:
+-                    continue
+-                seconds = ms / 1_000_000
+-                elapsed = time.time() - started
+-                job["progress"] = min(99, round(seconds / clip_duration * 100))
+-                job["elapsed_seconds"] = round(elapsed)
+-                # ETA = remaining work / observed speed (only when we have
+-                # meaningful progress and elapsed time).
+-                if seconds > 0.5 and elapsed > 0.5:
+-                    remaining = max(0.0, clip_duration - seconds)
+-                    speed = seconds / elapsed  # media-seconds per wall-second
+-                    if speed > 0:
+-                        eta = remaining / speed
+-                        job["eta_seconds"] = round(eta)
++        # The hybrid smart mode may have already produced the output file.
++        hybrid_done = not cmd
++
++        if not hybrid_done:
++            cmd += ["-progress", "pipe:1", "-nostats", str(out_path)]
++
++            proc = subprocess.Popen(
++                cmd,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++                encoding="utf-8",
++                errors="replace",
++            )
++
++            error_lines: list[str] = []
++
++            def _read_stderr() -> None:
++                assert proc.stderr is not None
++                for line in proc.stderr:
++                    error_lines.append(line)
++
++            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
++            stderr_thread.start()
++
++            assert proc.stdout is not None
++            for line in proc.stdout:
++                stripped = line.strip()
++                if stripped.startswith("out_time_ms="):
++                    try:
++                        ms = int(stripped.split("=", 1)[1])
++                    except ValueError:
++                        continue
++                    seconds = ms / 1_000_000
++                    elapsed = time.time() - started
++                    job["progress"] = min(99, round(seconds / clip_duration * 100))
++                    job["elapsed_seconds"] = round(elapsed)
++                    # ETA = remaining work / observed speed (only when we have
++                    # meaningful progress and elapsed time).
++                    if seconds > 0.5 and elapsed > 0.5:
++                        remaining = max(0.0, clip_duration - seconds)
++                        speed = seconds / elapsed  # media-seconds per wall-second
++                        if speed > 0:
++                            eta = remaining / speed
++                            job["eta_seconds"] = round(eta)
++                        else:
++                            job["eta_seconds"] = None
+                     else:
+                         job["eta_seconds"] = None
+-                else:
+-                    job["eta_seconds"] = None
+-                if job.get("eta_seconds") is not None:
+-                    job["message"] = f"Cutting clip... {job['progress']}% · ETA {_format_eta(job['eta_seconds'])}"
+-                else:
+-                    job["message"] = f"Cutting clip... {job['progress']}%"
+-
+-        proc.wait()
+-        stderr_thread.join(timeout=5)
+-
+-        if proc.returncode != 0 or not out_path.exists():
+-            err_text = "".join(error_lines[-8:]).strip() or "ffmpeg exited with an error"
+-            raise RuntimeError(err_text)
++                    if job.get("eta_seconds") is not None:
++                        job["message"] = f"Cutting clip... {job['progress']}% · ETA {_format_eta(job['eta_seconds'])}"
++                    else:
++                        job["message"] = f"Cutting clip... {job['progress']}%"
++
++            proc.wait()
++            stderr_thread.join(timeout=5)
++
++            if proc.returncode != 0 or not out_path.exists():
++                err_text = "".join(error_lines[-8:]).strip() or "ffmpeg exited with an error"
++                raise RuntimeError(err_text)
++        elif not out_path.exists():
++            raise RuntimeError("Hybrid cut produced no output file")
+ 
+         size = out_path.stat().st_size
+ 
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index 5ee0cfc..e6b1407 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -609,7 +609,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                       {clipMode === 'fast'
+                         ? 'No re-encode — copies instantly, cut lands on nearest keyframe (±1–2s).'
+                         : clipMode === 'smart'
+-                          ? 'Recommended: frame-exact cut, keeps original audio, file size stays close to source quality (normal size).'
++                          ? 'Recommended: exact timestamps — re-encodes only the tiny start sliver, stream-copies the rest (fast + exact).'
+                           : 'Re-encodes video + audio — frame-exact, similar speed to Smart but re-encodes audio too.'}
+                     </span>
+                   </div>

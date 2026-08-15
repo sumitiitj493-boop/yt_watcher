@@ -1,0 +1,251 @@
+diff --git a/backend/models.py b/backend/models.py
+index 3769cc7..bc9f638 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -142,6 +142,19 @@ class PlaylistTranscriptsRequest(BaseModel):
+     transcript_folder: str = Field(default="", max_length=120)
+ 
+ 
++class ConvertFormatsRequest(BaseModel):
++    """Ask which target formats are available for a source extension."""
++    ext: str = Field(default="", max_length=10)
++
++
++class ConvertRequest(BaseModel):
++    """Convert a library file to any supported format (free, ffmpeg)."""
++    filename: str = Field(min_length=1, max_length=500)
++    target_format: str = Field(default="mp4", max_length=10)
++    bitrate: str = Field(default="192k", max_length=10)
++    resolution: str = Field(default="", max_length=10)
++
++
+ class ClipAnalyzeRequest(BaseModel):
+     """Ask for a video's duration/metadata (no cutting)."""
+     filename: str = Field(min_length=1, max_length=500)
+@@ -155,6 +168,7 @@ class ClipCreateRequest(BaseModel):
+     title: str = Field(default="", max_length=200)
+     collection: str = Field(default="", max_length=120)
+     target_playlist_id: int | None = Field(default=None)
++    mode: str = Field(default="fast", pattern="^(fast|accurate)$")
+ 
+ 
+ class SocialDownloadRequest(BaseModel):
+diff --git a/backend/routes/clipper.py b/backend/routes/clipper.py
+index d94d739..681535c 100644
+--- a/backend/routes/clipper.py
++++ b/backend/routes/clipper.py
+@@ -40,6 +40,7 @@ async def clip_create(request: ClipCreateRequest):
+             request.title,
+             request.collection,
+             request.target_playlist_id,
++            request.mode,
+         )
+     except (ValueError, FileNotFoundError) as exc:
+         raise HTTPException(status_code=400, detail=str(exc))
+diff --git a/backend/services/clipper.py b/backend/services/clipper.py
+index b126336..bad3fd2 100644
+--- a/backend/services/clipper.py
++++ b/backend/services/clipper.py
+@@ -125,8 +125,16 @@ def start_clip_job(
+     title: str = "",
+     collection: str = "",
+     target_playlist_id: Optional[int] = None,
++    mode: str = "fast",
+ ) -> str:
+-    """Queue a clip cut. Returns a job_id."""
++    """Queue a clip cut. Returns a job_id.
++
++    ``mode``:
++      - "fast"     : stream-copy (no re-encode) — nearly instant, but the cut
++                     lands on the nearest keyframe (may be a second or two
++                     before/after the exact timestamp).
++      - "accurate" : re-encode (libx264 veryfast) — exact timestamps, slower.
++    """
+     if not ffmpeg_available():
+         raise ValueError("ffmpeg was not found on this system. Install ffmpeg and restart the backend.")
+ 
+@@ -134,6 +142,10 @@ def start_clip_job(
+     if not source.exists():
+         raise FileNotFoundError("Video file not found")
+ 
++    mode = (mode or "fast").strip().lower()
++    if mode not in ("fast", "accurate"):
++        raise ValueError("Mode must be 'fast' or 'accurate'")
++
+     start = max(0.0, float(start_seconds or 0))
+     end = float(end_seconds or 0)
+     duration = _probe_duration(source) or 0
+@@ -157,6 +169,7 @@ def start_clip_job(
+         "start_seconds": start,
+         "end_seconds": end,
+         "clip_duration": round(end - start, 3),
++        "mode": mode,
+         "status": "queued",
+         "progress": 0,
+         "message": "Clip cut queued",
+@@ -173,32 +186,48 @@ def start_clip_job(
+ 
+     threading.Thread(
+         target=_run_clip_job,
+-        args=(job_id, source, out_path, start, end, title, collection, target_playlist_id),
++        args=(job_id, source, out_path, start, end, title, collection, target_playlist_id, mode),
+         daemon=True,
+     ).start()
+     return job_id
+ 
+ 
+-def _run_clip_job(job_id, source, out_path, start, end, title, collection, target_playlist_id) -> None:
++def _run_clip_job(job_id, source, out_path, start, end, title, collection, target_playlist_id, mode) -> None:
+     job = CLIP_JOBS[job_id]
+     started = time.time()
+     job["started_at"] = started
+     clip_duration = max(0.1, end - start)
+     try:
+         job["status"] = "cutting"
+-        job["message"] = "Cutting clip..."
++        job["message"] = "Cutting clip (fast)..." if mode == "fast" else "Cutting clip (accurate)..."
+ 
++        # Input seeking (-ss before -i) is dramatically faster than output
++        # seeking — ffmpeg jumps to the timestamp via the index, then only
++        # decodes/copies the short clip.
+         cmd = [
+             FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-ss", f"{start:.3f}", "-i", str(source),
+             "-t", f"{clip_duration:.3f}",
+-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+-            "-c:a", "aac", "-b:a", "128k",
+-            "-movflags", "+faststart",
+-            "-progress", "pipe:1", "-nostats",
+-            str(out_path),
+         ]
+ 
++        if mode == "fast":
++            # Stream copy: no re-encode, just copy the exact bytes between
++            # keyframes. Nearly instant for any file size.
++            cmd += [
++                "-c", "copy",
++                "-avoid_negative_ts", "make_zero",
++                "-movflags", "+faststart",
++            ]
++        else:
++            # Accurate: re-encode so the cut is frame-exact.
++            cmd += [
++                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
++                "-c:a", "aac", "-b:a", "128k",
++                "-movflags", "+faststart",
++            ]
++
++        cmd += ["-progress", "pipe:1", "-nostats", str(out_path)]
++
+         proc = subprocess.Popen(
+             cmd,
+             stdout=subprocess.PIPE,
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 4e255fb..d007f1a 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -5271,3 +5271,40 @@ body,
+ 		grid-template-columns: 1fr;
+ 	}
+ }
++
++/* Clip mode toggle: fast (instant) vs accurate */
++.clip-mode-toggle {
++	display: flex;
++	align-items: center;
++	gap: 8px;
++	flex-wrap: wrap;
++}
++
++.clip-mode-toggle__btn {
++	padding: 7px 14px;
++	border-radius: 999px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text-muted);
++	font-family: inherit;
++	font-size: 0.82rem;
++	font-weight: 600;
++	cursor: pointer;
++	transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
++}
++
++.clip-mode-toggle__btn:hover {
++	border-color: var(--accent-strong);
++	color: var(--text);
++}
++
++.clip-mode-toggle__btn--active {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.14);
++	color: var(--text);
++}
++
++.clip-mode-toggle__hint {
++	font-size: 0.78rem;
++	color: var(--text-muted);
++}
+diff --git a/frontend/src/pages/Clips.jsx b/frontend/src/pages/Clips.jsx
+index c576356..5aff5c3 100644
+--- a/frontend/src/pages/Clips.jsx
++++ b/frontend/src/pages/Clips.jsx
+@@ -132,6 +132,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+   const [clipTitle, setClipTitle] = useState('');
+   const [collection, setCollection] = useState('');
+   const [targetPlaylist, setTargetPlaylist] = useState('');
++  const [clipMode, setClipMode] = useState('fast'); // 'fast' (instant) | 'accurate'
+   const [creating, setCreating] = useState(false);
+   const [job, setJob] = useState(null);
+   const [error, setError] = useState('');
+@@ -255,6 +256,7 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+         title: clipTitle.trim(),
+         collection: collection.trim(),
+         target_playlist_id: targetPlaylist ? Number(targetPlaylist) : null,
++        mode: clipMode,
+       });
+       stopRef.current = false;
+       setJob({ job_id: res.data?.job_id, status: 'queued', progress: 0, message: 'Queued' });
+@@ -537,13 +539,36 @@ export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+                   ) : null}
+                 </div>
+               ) : (
+-                <div className="transcript-actions">
+-                  <button className="primary-button" type="button" onClick={handleCreate} disabled={creating}>
+-                    {creating ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
+-                    {creating ? 'Cutting…' : `Cut clip (${formatSec(Math.max(0, endSec - startSec))})`}
+-                  </button>
+-                  <button className="ghost-button" type="button" onClick={resetCreator}><X size={16} /> Reset</button>
+-                </div>
++                <>
++                  <div className="clip-mode-toggle">
++                    <button
++                      type="button"
++                      className={`clip-mode-toggle__btn ${clipMode === 'fast' ? 'clip-mode-toggle__btn--active' : ''}`}
++                      onClick={() => setClipMode('fast')}
++                    >
++                      ⚡ Fast (instant)
++                    </button>
++                    <button
++                      type="button"
++                      className={`clip-mode-toggle__btn ${clipMode === 'accurate' ? 'clip-mode-toggle__btn--active' : ''}`}
++                      onClick={() => setClipMode('accurate')}
++                    >
++                      🎯 Accurate (exact)
++                    </button>
++                    <span className="clip-mode-toggle__hint">
++                      {clipMode === 'fast'
++                        ? 'No re-encode — copies the video instantly, cut lands on the nearest keyframe (±1–2s).'
++                        : 'Re-encodes for frame-exact cut — slower but precise.'}
++                    </span>
++                  </div>
++                  <div className="transcript-actions">
++                    <button className="primary-button" type="button" onClick={handleCreate} disabled={creating}>
++                      {creating ? <Loader2 className="spin" size={16} /> : <Scissors size={16} />}
++                      {creating ? 'Cutting…' : `Cut clip (${formatSec(Math.max(0, endSec - startSec))})`}
++                    </button>
++                    <button className="ghost-button" type="button" onClick={resetCreator}><X size={16} /> Reset</button>
++                  </div>
++                </>
+               )}
+             </div>
+           ) : null}
