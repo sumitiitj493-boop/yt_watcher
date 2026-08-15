@@ -330,6 +330,18 @@ def _mark_completed(task_id: str, ydl, info: dict, format_ext: str) -> None:
     })
     _touch_task(task_id)
 
+    # Remember the source URL so transcripts can be re-fetched later without
+    # re-downloading (cleaned up when the file is deleted).
+    try:
+        from services.database import save_file_link
+        save_file_link(
+            Path(filename).name,
+            download_tasks.get(task_id, {}).get("url", ""),
+            extract_video_id(filename) or info.get("id") or "",
+        )
+    except Exception:
+        pass
+
 
 def _mark_error_or_retry(task_id: str, clean_error: str) -> None:
     category = _categorize_error(clean_error)

@@ -1,3 +1,4 @@
+import asyncio
 import mimetypes
 import time
 
@@ -10,12 +11,17 @@ from services.database import (
     add_playlist_items,
     create_note,
     create_playlist,
+    delete_file_link,
     delete_note,
     delete_playlist,
+    find_saved_transcript_by_video_id,
     get_default_playlist_id,
+    get_file_link,
     get_playlist_items,
     list_notes,
     list_playlists,
+    playlist_all_filenames,
+    remove_file_from_all_playlists,
     remove_playlist_item,
     rename_playlist,
     reorder_playlist,
@@ -28,7 +34,7 @@ import stat
 import sys
 from services.files import DOWNLOAD_DIR, clean_title, extract_video_id, resolve_download_path
 from services.stream_state import active_streams
-from services.transcripts import fetch_online_transcript
+from services.transcripts import fetch_online_transcript, fetch_url_transcript
 from services.audio_extractor import (
     get_audio_extraction_job,
     start_audio_extraction,
@@ -86,9 +92,9 @@ class AudioExtractRequest(BaseModel):
     bitrate: str = Field(default="192k", max_length=10)
 
 
-def _get_cached_files() -> list[dict]:
+def _get_cached_files(hide_playlist: bool = False) -> list[dict]:
     now = time.time()
-    if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
+    if now - _files_cache["ts"] <= CACHE_TTL_SECONDS and not hide_playlist:
         return _files_cache["data"]
     # Patterns to exclude from library
     EXCLUDE_SUFFIXES = {".part", ".temp", ".ytdl", ".json"}
@@ -96,6 +102,8 @@ def _get_cached_files() -> list[dict]:
     # Images are never "partial downloads" — the size filter below exists to
     # hide incomplete video/audio files, not legitimate small photos.
     IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+
+    in_playlist = playlist_all_filenames()
 
     file_list = []
     for file_path in DOWNLOAD_DIR.iterdir():
@@ -111,6 +119,9 @@ def _get_cached_files() -> list[dict]:
         # Skip non-media files
         if file_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
             continue
+        # Hide files that already belong to a playlist (they live in the playlist).
+        if hide_playlist and file_path.name in in_playlist:
+            continue
         # Skip very small files (likely corrupted/partial) under 100KB —
         # but NOT for images, which can be legitimately small.
         if file_path.stat().st_size < 102400 and file_path.suffix.lower() not in IMAGE_SUFFIXES:
@@ -124,6 +135,7 @@ def _get_cached_files() -> list[dict]:
             "size": stat_info.st_size,
             "created_at": stat_info.st_mtime,
             "ext": file_path.suffix.lower().lstrip("."),
+            "in_playlist": file_path.name in in_playlist,
         })
 
     file_list = sorted(
@@ -131,16 +143,19 @@ def _get_cached_files() -> list[dict]:
         key=lambda item: item.get("created_at", 0),
         reverse=True,
     )
-    _files_cache["ts"] = now
-    _files_cache["data"] = file_list
+    # Only the unfiltered scan may populate the shared cache; filtered
+    # (hide_playlist) scans must not poison it for other callers.
+    if not hide_playlist:
+        _files_cache["ts"] = now
+        _files_cache["data"] = file_list
     return file_list
 
 
 @router.get("/files")
-async def list_files():
+async def list_files(hide_playlist: int = 0):
     if not DOWNLOAD_DIR.exists():
         return {"files": []}
-    return {"files": _get_cached_files()}
+    return {"files": _get_cached_files(hide_playlist=bool(hide_playlist))}
 
 
 @router.get("/storage")
@@ -215,17 +230,14 @@ async def extract_audio_status(job_id: str):
 
 
 @router.delete("/delete/{filename}")
-async def delete_file(filename: str):
-    try:
-        file_path = resolve_download_path(filename)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-
+def _delete_file_permanently(filename: str) -> None:
+    """Delete a media file from disk and clean up every reference to it:
+    file link, all playlists. Shared by library delete, clear-all and
+    playlist-item delete so the model is consistent everywhere.
+    """
+    file_path = resolve_download_path(filename)
     # Attempt to release any known active streams for this file, then delete.
-    active_streams.discard(filename)
+    active_streams.discard(file_path.name)
     gc.collect()
     try:
         file_path.unlink()
@@ -243,6 +255,21 @@ async def delete_file(filename: str):
                     detail={"message": "Stop playback first then try again.", "filename": filename},
                 )
     _files_cache["ts"] = 0.0
+    delete_file_link(file_path.name)
+    remove_file_from_all_playlists(file_path.name)
+
+
+@router.delete("/delete/{filename}")
+async def delete_file(filename: str):
+    try:
+        file_path = resolve_download_path(filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    _delete_file_permanently(file_path.name)
     return {"message": "Deleted"}
 
 
@@ -258,6 +285,109 @@ async def search_files(query: str):
         if normalized in item["filename"].lower() or normalized in item["title"].lower()
     ]
     return {"results": results}
+
+
+class SearchByTranscriptRequest(BaseModel):
+    """Find a downloaded video by pasting a snippet of its transcript/subtitle."""
+    query: str = Field(min_length=2, max_length=2000)
+    playlist_id: int | None = Field(default=None)
+    fetch_missing: bool = Field(default=True)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+def _snippet_around(text: str, query: str, radius: int = 70) -> str:
+    idx = text.lower().find(query.lower())
+    if idx < 0:
+        return text[: radius * 2]
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(query) + radius)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{text[start:end].strip()}{suffix}"
+
+
+@router.post("/search-by-transcript")
+async def search_by_transcript(request: SearchByTranscriptRequest):
+    """Find which downloaded video contains the pasted subtitle text.
+
+    Searches saved transcripts first (fast); if nothing matches and
+    ``fetch_missing`` is on, it fetches YouTube transcripts for videos that
+    have none saved (small concurrency) and checks those too.
+    """
+    query = request.query.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Type at least 2 characters to search")
+
+    # Candidate files: the playlist's items, or every media file in the library.
+    if request.playlist_id is not None:
+        if not any(p.get("id") == request.playlist_id for p in list_playlists()):
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        candidates = get_playlist_items(request.playlist_id)
+    else:
+        candidates = [f["filename"] for f in _get_cached_files() if f.get("ext") not in {"jpg", "jpeg", "png", "webp", "gif", "avif"}]
+
+    matches: list[dict] = []
+    missing: list[dict] = []
+    checked = 0
+
+    for filename in candidates:
+        filename = str(filename)
+        video_id = extract_video_id(filename)
+        row = find_saved_transcript_by_video_id(video_id) if video_id else None
+        checked += 1
+        if row and row.get("text"):
+            text = row["text"]
+            if query.lower() in text.lower():
+                matches.append({
+                    "filename": filename,
+                    "title": clean_title(filename),
+                    "video_id": video_id or "",
+                    "snippet": _snippet_around(text, query),
+                    "source": "saved",
+                })
+        else:
+            missing.append({"filename": filename, "video_id": video_id or ""})
+
+    fetched = 0
+    if request.fetch_missing and missing and (len(matches) == 0 or len(matches) < 3):
+        targets = missing[: request.limit]
+        sem = asyncio.Semaphore(3)
+
+        async def check_one(item: dict) -> None:
+            nonlocal fetched
+            async with sem:
+                url = (get_file_link(item["filename"]) or {}).get("url") or ""
+                if not url and item["video_id"]:
+                    url = f"https://www.youtube.com/watch?v={item['video_id']}"
+                if not url:
+                    return
+                try:
+                    result = await fetch_url_transcript(url)
+                except Exception:
+                    return
+                if not result.get("available"):
+                    return
+                fetched += 1
+                text = result.get("text") or ""
+                if query.lower() in text.lower():
+                    matches.append({
+                        "filename": item["filename"],
+                        "title": clean_title(item["filename"]),
+                        "video_id": item["video_id"] or "",
+                        "snippet": _snippet_around(text, query),
+                        "source": "online",
+                    })
+
+        await asyncio.gather(*(check_one(item) for item in targets), return_exceptions=True)
+
+    return {
+        "query": query,
+        "matches": matches[: request.limit],
+        "count": len(matches[: request.limit]),
+        "checked": checked,
+        "fetched_missing": fetched,
+        "no_transcript": len(missing),
+    }
 
 
 @router.get("/transcript/{filename}")
@@ -315,15 +445,17 @@ async def clear_files():
         active_streams.discard(file_path.name)
         gc.collect()
         try:
-            file_path.unlink()
+            _delete_file_permanently(file_path.name)
             deleted += 1
         except PermissionError:
             try:
                 os.chmod(str(file_path), stat.S_IWRITE)
-                file_path.unlink()
+                _delete_file_permanently(file_path.name)
                 deleted += 1
             except Exception:
                 failed.append(file_path.name)
+        except Exception:
+            failed.append(file_path.name)
 
     _files_cache["ts"] = 0.0
     # Return a summary so the client can handle partial failures (e.g., files in use on Windows).
@@ -465,13 +597,23 @@ async def playlists_add_items_batch(playlist_id: int, payload: PlaylistAddItemsR
 
 @router.delete('/playlists/{playlist_id}/items/{filename}')
 async def playlists_remove_item(playlist_id: int, filename: str):
+    """Remove an item from a playlist AND delete the file permanently.
+
+    Removing from a playlist means "I don't want this anymore" — so the file is
+    also removed from disk, the Library and every other playlist.
+    """
     if not _playlist_exists(playlist_id):
         raise HTTPException(status_code=404, detail="Playlist not found")
     try:
         safe_path = resolve_download_path(filename)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    return remove_playlist_item(playlist_id, safe_path.name)
+    if not safe_path.exists():
+        # File already gone — just clean up references.
+        remove_file_from_all_playlists(safe_path.name)
+        return {"message": "Deleted", "permanently": True}
+    _delete_file_permanently(safe_path.name)
+    return {"message": "Deleted from playlist and device", "permanently": True}
 
 
 @router.post('/playlists/{playlist_id}/reorder')

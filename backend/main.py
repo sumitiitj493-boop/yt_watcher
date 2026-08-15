@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-from routes import about, download, library, stream
+from routes import about, clipper, download, library, playlist_batch, stream, transcript_saver
 from services.database import init_db
 from services.downloader import resume_pending_downloads
 
@@ -136,7 +136,10 @@ app.add_middleware(PasswordProtectionMiddleware)
 
 app.include_router(download.router, prefix="/api")
 app.include_router(about.router, prefix="/api")
+app.include_router(clipper.router, prefix="/api")
 app.include_router(library.router, prefix="/api")
+app.include_router(playlist_batch.router, prefix="/api")
+app.include_router(transcript_saver.router, prefix="/api")
 app.include_router(stream.router, prefix="/api")
 
 
