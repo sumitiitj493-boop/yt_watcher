@@ -27,7 +27,6 @@ export default function DownloadDock({ downloads, onCancel }) {
 
   // Collapse the panel automatically when nothing is active anymore.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- collapse when queue empties
     if (active.length === 0) setExpanded(false);
   }, [active.length]);
 

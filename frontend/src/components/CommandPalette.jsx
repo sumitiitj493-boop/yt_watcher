@@ -50,11 +50,8 @@ export default function CommandPalette({ open, onClose, navigate, downloads, the
 
   useEffect(() => {
     if (!open) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
     setQuery('');
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
     setSelected(0);
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
     setTranscripts([]);
     window.setTimeout(() => inputRef.current?.focus(), 30);
     api
@@ -140,7 +137,6 @@ export default function CommandPalette({ open, onClose, navigate, downloads, the
   }, [query, downloads, transcripts, theme, onToggleTheme, onClose, navigate]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset selection when results change
     setSelected(0);
   }, [query, items.length]);
 

@@ -2,14 +2,23 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
+backend/venv/
+.pytest_cache/
 
 # Node
 node_modules/
 dist/
+frontend/dist/
 
 # Downloads
 downloads/
 backend/downloads/
+*.mp4
+*.webm
+*.mkv
+*.mp3
+*.m4a
 
 # Secrets
 cookies.txt
@@ -21,6 +30,14 @@ backend/youtube_cookies.txt
 # Logs
 logs/
 backend/logs/
+*.log
+
+# Local data and scratch files
+*.db
+*.sqlite
+*.sqlite3
+tmp_*
+*.exe
 
 # OS
 .DS_Store

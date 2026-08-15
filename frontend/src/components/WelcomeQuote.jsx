@@ -1,23 +1,29 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Volume2, VolumeX } from 'lucide-react';
 
-// Short, motivating quotes — one is picked per page load (random).
 const QUOTES = [
   'Small steps every day lead to big results.',
   'Discipline beats motivation when motivation fades.',
   'Study now, shine later.',
   'Consistency is the quiet superpower.',
   'Every expert was once a beginner.',
-  'One video at a time — you are building your future.',
+  'One video at a time - you are building your future.',
   'Focus on progress, not perfection.',
   'Your future self will thank you for today.',
   'Learn a little, improve a lot.',
   'The best time to start was yesterday. The next best is now.',
 ];
 
-// Simple, reliable spoken "Welcome" using the browser's built-in speech
-// synthesis — no audio files, nothing to download, nothing to break.
 let playedThisLoad = false;
+
+function pickQuote() {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const values = new Uint32Array(1);
+    crypto.getRandomValues(values);
+    return QUOTES[values[0] % QUOTES.length];
+  }
+  return QUOTES[Math.floor(Math.random() * QUOTES.length)];
+}
 
 function speakWelcome() {
   try {
@@ -26,10 +32,9 @@ function speakWelcome() {
     const utter = new SpeechSynthesisUtterance('Welcome!');
     utter.lang = 'en-US';
     utter.rate = 0.95;
-    // Prefer an English voice if one is available.
     const voices = window.speechSynthesis.getVoices();
-    const en = voices.find((v) => String(v.lang || '').toLowerCase().startsWith('en'));
-    if (en) utter.voice = en;
+    const englishVoice = voices.find((voice) => String(voice.lang || '').toLowerCase().startsWith('en'));
+    if (englishVoice) utter.voice = englishVoice;
     window.speechSynthesis.speak(utter);
     return true;
   } catch {
@@ -38,7 +43,7 @@ function speakWelcome() {
 }
 
 export default function WelcomeQuote({ voiceOn = true }) {
-  const quote = useMemo(() => QUOTES[Math.floor(Math.random() * QUOTES.length)], []);
+  const [quote] = useState(() => pickQuote());
   const [needsClick, setNeedsClick] = useState(false);
   const playedRef = useRef(false);
 
@@ -51,19 +56,19 @@ export default function WelcomeQuote({ voiceOn = true }) {
     const ok = speakWelcome();
     if (ok) return undefined;
 
-    // Blocked by the browser (autoplay rules) — wait for the first click.
     setNeedsClick(true);
-    const onFirstInteraction = () => {
-      cleanup();
-      speakWelcome();
-      setNeedsClick(false);
-    };
     const cleanup = () => {
       window.removeEventListener('pointerdown', onFirstInteraction);
       window.removeEventListener('keydown', onFirstInteraction);
       window.removeEventListener('click', onFirstInteraction);
       window.removeEventListener('touchstart', onFirstInteraction);
     };
+    const onFirstInteraction = () => {
+      cleanup();
+      speakWelcome();
+      setNeedsClick(false);
+    };
+
     window.addEventListener('pointerdown', onFirstInteraction);
     window.addEventListener('keydown', onFirstInteraction);
     window.addEventListener('click', onFirstInteraction);
@@ -78,7 +83,7 @@ export default function WelcomeQuote({ voiceOn = true }) {
   return (
     <div className="welcome-quote">
       <h1 className="welcome-quote__title">
-        Welcome 👋
+        Welcome
         <button
           className="welcome-quote__speak"
           type="button"
@@ -92,9 +97,9 @@ export default function WelcomeQuote({ voiceOn = true }) {
           {voiceOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
         </button>
       </h1>
-      <p className="welcome-quote__text">“{quote}”</p>
+      <p className="welcome-quote__text">"{quote}"</p>
       {needsClick ? (
-        <p className="welcome-quote__hint">🔊 Click anywhere to hear “Welcome”</p>
+        <p className="welcome-quote__hint">Click anywhere to hear "Welcome".</p>
       ) : null}
     </div>
   );

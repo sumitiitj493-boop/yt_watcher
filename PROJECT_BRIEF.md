@@ -1,57 +1,60 @@
-# YT Private Suite — Project Brief
+# YT Private Suite - Project Brief
 
-## What this is
-A personal, local web application with two main features:
-1. Download any YouTube video (any quality, format, subtitles, playlists)
-2. Watch YouTube videos in a clean, ad-free environment with study tools
+## Purpose
+
+YT Private Suite is a personal local web app for saving, organizing, studying, and clipping video content on your own machine.
 
 ## Architecture
-- Backend: Python FastAPI server (port 8000)
-- Frontend: React/Vite app (port 5173)
-- Engine: yt-dlp for all downloading
-- Player: Plyr.js for video playback
-- Database: SQLite for metadata and notes
-- Runs fully locally — no cloud, no cost
 
-## Key Features
-- Download: URL input → quality/format picker → real-time progress → saved to /downloads
-- Ad-free viewer: YouTube videos embedded via iframe API, ad domains blocked via browser extension
-- Study mode: fullscreen player, notes panel with timestamps, A-B loop repeat
-- Library: browse, search, play, delete downloaded videos
-- Subtitles: auto-downloaded with every video
+- Backend: FastAPI on port `8000`
+- Frontend: React/Vite on port `8080`
+- Downloader: `yt-dlp`
+- Database: SQLite managed by backend services
+- Storage: local `backend/downloads/`
+- Scope: private/local use
 
-## File Structure
-yt-private-suite/
-│
-├── backend/
-│   ├── main.py              # FastAPI app entry point
-│   ├── routes/
-│   │   ├── download.py      # /download, /status, /cancel
-│   │   ├── library.py       # /files, /delete, /search
-│   │   └── stream.py        # serve local video files
-│   ├── services/
-│   │   ├── downloader.py    # yt-dlp wrapper logic
-│   │   └── database.py      # SQLite operations
-│   ├── models.py            # Pydantic data models
-│   ├── requirements.txt
-│   └── downloads/           # your saved videos go here
-│
-├── frontend/
-│   ├── src/
-...
-├── extension/               # Chrome extension (ad blocker)
-│   ├── manifest.json
-│   ├── background.js        # blocks ad domains
-│   └── content.js           # hides ad elements on youtube.com
-│
-├── docker-compose.yml
-├── Dockerfile.backend
-├── Dockerfile.frontend
-└── README.md
+## Core Features
 
-## How to run (development)
-cd backend && uvicorn main:app --reload
-cd frontend && npm run dev
+- Video and playlist downloads with progress tracking.
+- Multi-link batch downloads.
+- Local media library with search, delete, preview, storage, and playlist actions.
+- Saved transcripts with folders, editing, search, refetch, and URL fetch.
+- Local playlist manager with continuous playback.
+- Clip Studio for precise video clipping and clip history.
+- Audio extraction and Whisper transcription flows.
+- Instagram/social cookie support for logged-in downloads.
+- Browser extension files for optional YouTube ad hiding.
 
-## How to run (production)
-docker-compose up
+## Important Paths
+
+```text
+backend/main.py                     FastAPI app entry point
+backend/models.py                   API request/response models
+backend/routes/                     HTTP and websocket route modules
+backend/services/                   Download, transcript, clip, file, and database logic
+frontend/src/App.jsx                Main app shell and route wiring
+frontend/src/pages/                 Feature pages
+frontend/src/components/            Shared UI components
+testing/                            Backend/API tests and repro scripts
+extension/                          Optional browser extension
+```
+
+## Run Locally
+
+Windows:
+
+```bat
+start.bat
+```
+
+Linux/macOS:
+
+```bash
+./start.sh
+```
+
+Open `http://localhost:8080`.
+
+## Notes
+
+This project is intentionally local-first. Keep cookies, downloads, logs, virtual environments, generated builds, and SQLite databases out of Git.

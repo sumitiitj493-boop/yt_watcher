@@ -41,7 +41,7 @@ import {
 } from 'lucide-react';
 
 import './App.css';
-import { api, API_BASE, clearStoredAppPassword, getStoredAppPassword, setStoredAppPassword } from './lib/api';
+import { api, API_BASE, clearStoredAppPassword, setStoredAppPassword } from './lib/api';
 import PlaylistPage from './pages/Playlist';
 import PlaylistPicker from './components/PlaylistPicker';
 import LibraryPicker from './components/LibraryPicker';
@@ -1280,7 +1280,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   }, []);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch cookie status on mount
     loadSocialCookies();
   }, [loadSocialCookies]);
 
@@ -1345,7 +1344,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           });
           notify('Auto-saved to Transcripts', 'success');
           if (onTranscriptsChanged) onTranscriptsChanged();
-        } catch (err) {
+        } catch {
           // non-fatal: transcript is still shown in the panel
         }
       }
@@ -1362,7 +1361,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
       await navigator.clipboard.writeText(transcriptText);
       setTranscriptCopyStatus('Copied');
       window.setTimeout(() => setTranscriptCopyStatus('Copy Transcript'), 1600);
-    } catch (error) {
+    } catch {
       setTranscriptCopyStatus('Copy Failed');
       window.setTimeout(() => setTranscriptCopyStatus('Copy Transcript'), 1600);
     }
@@ -2877,18 +2876,18 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
       if (video) {
         video.pause();
         video.removeAttribute('src');
-        try { video.load(); } catch (e) { /* ignore */ }
+        try { video.load(); } catch { /* ignore */ }
       }
 
       document.querySelectorAll('audio').forEach((audio) => {
         audio.pause();
         audio.removeAttribute('src');
-        try { audio.load(); } catch (e) { /* ignore */ }
+        try { audio.load(); } catch { /* ignore */ }
       });
 
       await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
       await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
-    } catch (error) {
+    } catch {
       // ignore UI cleanup errors
     }
   }, []);
@@ -2950,7 +2949,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
         ctx.drawImage(video, 0, 0, w, h);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
         if (mounted) setGeneratedThumb(dataUrl);
-      } catch (err) {
+      } catch {
         // ignore capture errors
       }
     };
@@ -2965,11 +2964,11 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
             video.removeEventListener('seeked', onSeeked);
           };
           video.addEventListener('seeked', onSeeked);
-          try { video.currentTime = t; } catch (e) { capture(); }
+          try { video.currentTime = t; } catch { capture(); }
         } else {
           capture();
         }
-      } catch (e) {
+      } catch {
         capture();
       }
     };
@@ -3409,6 +3408,8 @@ export default function App() {
   const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
+  const downloadInProgressRef = useRef(false);
+  const socialDownloadInProgressRef = useRef(false);
   const [transcriptCount, setTranscriptCount] = useState(0);
   const [clipsCount, setClipsCount] = useState(0);
 
@@ -3489,11 +3490,6 @@ export default function App() {
     }
   }, [authReady, isUnlocked]);
 
-  const activeDownloadCount = useMemo(
-    () => downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length,
-    [downloads],
-  );
-
   useEffect(() => {
     if (!authReady || !isUnlocked) return undefined;
     refreshDownloads();
@@ -3568,7 +3564,7 @@ export default function App() {
 
       previousStatusesRef.current.set(item.task_id, item.status);
     }
-  }, [downloads, isMobileDevice, downloadNotification]);
+  }, [downloads, downloadNotification, pushToast]);
 
   const [storageBytes, setStorageBytes] = useState(null);  // null = loading
 
@@ -3624,9 +3620,8 @@ export default function App() {
       pushToast('Enter the password first', 'warning');
       return;
     }
-    if (!startDownload._inProgress) startDownload._inProgress = false;
-    if (startDownload._inProgress) return;
-    startDownload._inProgress = true;
+    if (downloadInProgressRef.current) return;
+    downloadInProgressRef.current = true;
     try {
       const res = await api.post('/download', { url, quality, format });
       const tid = res?.data?.task_id;
@@ -3640,7 +3635,7 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to start download'), 'error');
     } finally {
-      startDownload._inProgress = false;
+      downloadInProgressRef.current = false;
     }
   }, [isUnlocked, pushToast, refreshDownloads]);
 
@@ -3649,9 +3644,8 @@ export default function App() {
       pushToast('Enter the password first', 'warning');
       return;
     }
-    if (!startSocialDownload._inProgress) startSocialDownload._inProgress = false;
-    if (startSocialDownload._inProgress) return;
-    startSocialDownload._inProgress = true;
+    if (socialDownloadInProgressRef.current) return;
+    socialDownloadInProgressRef.current = true;
     try {
       const res = await api.post('/social-download', { url, quality, format });
       const tid = res?.data?.task_id;
@@ -3661,7 +3655,7 @@ export default function App() {
     } catch (error) {
       pushToast(safeFetchError(error, 'Failed to start social download'), 'error');
     } finally {
-      startSocialDownload._inProgress = false;
+      socialDownloadInProgressRef.current = false;
     }
   }, [isUnlocked, pushToast, refreshDownloads]);
 
@@ -3821,12 +3815,6 @@ export default function App() {
     const stage = document.querySelector('.main-stage');
     if (stage) stage.scrollTo({ top: 0, behavior: 'smooth' });
   };
-
-  const openDownloadFromHistory = useCallback(({ url, quality = 'best', format = 'mp4' }) => {
-    if (!url) return;
-
-    navigate('/download', { state: { url, quality, format, autoStart: true } });
-  }, [navigate]);
 
   const reprocessInProgress = useRef(new Set());
   const reprocessFromHistory = useCallback(async (item) => {

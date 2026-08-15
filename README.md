@@ -1,62 +1,88 @@
 # YT Private Suite
 
-Self-hosted YouTube downloader and private viewer built for local disk storage.
+A private local downloader, library, transcript, playlist, and clip studio for videos you save on your own machine.
 
-## Production setup
+## What It Does
 
-This repo is now wired for a self-hosted Docker deployment:
+- Download YouTube videos, playlists, multi-link batches, and supported social media posts.
+- Save and search local media in the Library.
+- Fetch, save, edit, refetch, and organize transcripts.
+- Build playlists from downloaded files and play them continuously.
+- Cut precise clips from downloaded videos.
+- Extract audio and run local Whisper transcription workflows.
+- Keep Instagram/social cookies local for private downloads that need a logged-in session.
 
-- Backend runs as a single FastAPI container because download state is kept in memory.
-- Frontend is built as a static nginx container.
-- Downloads and logs are persisted in Docker volumes.
-- The frontend proxies `/api` to the backend, so the app works on a single public origin.
+## Local Ports
 
-## Run locally with Docker
+- Backend: `http://localhost:8000`
+- Frontend: `http://localhost:8080`
+- Vite proxies `/api` to the backend.
 
-```bash
-docker compose up -d --build
+## Run On Windows
+
+```bat
+start.bat
 ```
 
-Open the app at `http://localhost:8080`.
+The launcher checks Python and Node, installs missing dependencies, starts the backend and frontend, then opens `http://localhost:8080`.
 
-## Coolify deployment
+For a dependency/startup check without launching:
 
-Use the same Docker setup in Coolify:
-
-1. Deploy this repo as a Docker Compose app.
-2. Expose only the frontend service publicly on port `80`.
-3. Keep the backend service internal.
-4. Attach persistent volumes for `downloads` and `logs`.
-5. Keep the backend at a single replica.
-
-If you want a public URL without opening ports on your machine, use Cloudflare Tunnel.
-
-### Cloudflare Tunnel
-
-1. Create a tunnel in Cloudflare Zero Trust.
-2. Point the public hostname to `http://frontend:80`.
-3. Copy the tunnel token into `CLOUDFLARED_TUNNEL_TOKEN`.
-4. Start the tunnel with:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.tunnel.yml --profile tunnel up -d --build
+```bat
+start.bat --check
 ```
 
-That keeps the app private on your machine while still giving you a public URL.
+## Run On Linux Or macOS
 
-## Important note
+```bash
+chmod +x start.sh
+./start.sh
+```
 
-Do not scale the backend to multiple replicas unless you move download state out of memory and into a shared store. The current code keeps job status in process memory.
+## Manual Development Run
 
-## Local backend only mode (no Cloudflare)
+Backend:
 
-If you want to run without Cloudflare tunnels:
+```bash
+cd backend
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
 
-1. Run `start_everything.bat`.
-2. This starts only the local backend at `http://127.0.0.1:8005`.
-3. No scheduler, no auto tunnel process, no extra tunnel terminal.
+Frontend:
 
-Note:
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-- A hosted HTTPS frontend (for example Vercel) cannot reliably call a local HTTP backend because of browser security and network visibility limits.
-- For local backend testing, use a local frontend/dev server on your machine, or deploy backend to a public HTTPS host.
+## Private Files
+
+The app stores downloads, logs, cookies, local databases, build output, virtual environments, and temporary files outside Git via `.gitignore`.
+
+Cookie files must stay local:
+
+- `backend/youtube_cookies.txt`
+- `backend/instagram_cookies.txt`
+- `backend/cookies.txt`
+
+## Final Checks
+
+```bash
+cd frontend
+npm run lint
+npm run build
+
+cd ..
+python -m compileall backend
+```
+
+Python tests live in `testing/`, but `pytest` is not included in `backend/requirements.txt` by default.
+
+To run the test suite:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest testing
+```

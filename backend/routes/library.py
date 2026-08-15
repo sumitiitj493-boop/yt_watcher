@@ -229,7 +229,6 @@ async def extract_audio_status(job_id: str):
     return job
 
 
-@router.delete("/delete/{filename}")
 def _delete_file_permanently(filename: str) -> None:
     """Delete a media file from disk and clean up every reference to it:
     file link, all playlists. Shared by library delete, clear-all and

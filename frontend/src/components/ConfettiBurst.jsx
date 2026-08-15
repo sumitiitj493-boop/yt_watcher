@@ -4,7 +4,7 @@ const COLORS = ['#8b5cf6', '#22d3ee', '#34d399', '#f472b6', '#fbbf24', '#6366f1'
 
 /**
  * A small celebratory confetti burst, fired whenever `burstId` changes.
- * Renders ~26 particles that fly up/out from the bottom of the screen and fade.
+ * Renders particles that fly up/out from the bottom of the screen and fade.
  */
 export default function ConfettiBurst({ burstId = 0 }) {
   const [particles, setParticles] = useState([]);

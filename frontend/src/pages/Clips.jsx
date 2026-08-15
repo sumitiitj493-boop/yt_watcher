@@ -3,7 +3,6 @@ import {
   Check,
   Clapperboard,
   Clock,
-  Crop,
   Download,
   Loader2,
   Pause,
@@ -34,7 +33,7 @@ function fmtBytes(bytes) {
   return `${mb.toFixed(1)} MB`;
 }
 
-export default function ClipsPage({ files, onNotify, onClipsChanged }) {
+export default function ClipsPage({ files, onClipsChanged }) {
   const [clips, setClips] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [loading, setLoading] = useState(false);

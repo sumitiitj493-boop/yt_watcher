@@ -442,13 +442,11 @@ export default function PlaylistPage({ files = [], onNotify, onLibraryChanged })
   }, [notify]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
     loadPlaylists();
   }, [loadPlaylists]);
 
   useEffect(() => {
     if (activePlaylistId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- load items for the newly active playlist
       loadItems(activePlaylistId);
     } else {
       setPlaylist([]);
@@ -456,17 +454,14 @@ export default function PlaylistPage({ files = [], onNotify, onLibraryChanged })
   }, [activePlaylistId, loadItems]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- when no playlists remain, force the "new" target
     if (playlists.length === 0) setAddTarget('new');
   }, [playlists.length]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset player on file change
     setUseCompatiblePlayback(false);
   }, [currentFile?.filename]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset transcript state on file change
     setTranscriptStatus('Get Transcript');
     setTranscriptLoading(false);
   }, [currentFile?.filename]);
@@ -479,7 +474,6 @@ export default function PlaylistPage({ files = [], onNotify, onLibraryChanged })
 
   useEffect(() => {
     if (currentIndex >= playlistFiles.length) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- clamp index when list shrinks
       setCurrentIndex(Math.max(0, playlistFiles.length - 1));
     }
   }, [currentIndex, playlistFiles.length]);
