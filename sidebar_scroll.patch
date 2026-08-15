@@ -1,0 +1,90 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index a2cf156..44a1018 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -734,7 +734,8 @@ body[data-theme='dark'] .main-stage {
+ /* New dashboard shell */
+ .app-shell {
+ 	display: flex;
+-	min-height: 100vh;
++	height: 100vh;
++	overflow: hidden;
+ 	background: linear-gradient(135deg, rgba(248, 250, 252, 0.94) 0%, rgba(241, 245, 249, 0.98) 40%, rgba(244, 246, 255, 0.92) 100%);
+ }
+ 
+@@ -750,6 +751,7 @@ body[data-theme='dark'] .main-stage {
+ 	position: sticky;
+ 	top: 0;
+ 	height: 100vh;
++	overflow: hidden;
+ 	box-shadow: 0 24px 60px rgba(15, 23, 42, 0.04);
+ }
+ 
+@@ -791,6 +793,27 @@ body[data-theme='dark'] .main-stage {
+ 	gap: 8px;
+ 	padding: 8px 4px;
+ 	flex: 1;
++	min-height: 0;
++	overflow-y: auto;
++	scrollbar-width: thin;
++	scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
++}
++
++.nav-stack::-webkit-scrollbar {
++	width: 8px;
++}
++
++.nav-stack::-webkit-scrollbar-track {
++	background: transparent;
++}
++
++.nav-stack::-webkit-scrollbar-thumb {
++	background: rgba(148, 163, 184, 0.35);
++	border-radius: 999px;
++}
++
++.nav-stack::-webkit-scrollbar-thumb:hover {
++	background: rgba(148, 163, 184, 0.55);
+ }
+ 
+ .nav-link {
+@@ -857,7 +880,10 @@ body[data-theme='dark'] .main-stage {
+ .main-stage {
+ 	flex: 1;
+ 	min-width: 0;
+-	overflow: auto;
++	min-height: 0;
++	height: 100vh;
++	overflow-y: auto;
++	overflow-x: hidden;
+ 	padding: 34px 44px 56px;
+ }
+ 
+@@ -2337,17 +2363,27 @@ body[data-theme='dark'] .main-stage {
+ @media (max-width: 960px) {
+ 	.app-shell {
+ 		flex-direction: column;
++		height: auto;
++		overflow: visible;
+ 	}
+ 
+ 	.sidebar {
+ 		width: 100%;
+ 		height: auto;
+ 		position: static;
++		overflow: visible;
+ 		border-right: 0;
+ 		border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+ 	}
+ 
++	.nav-stack {
++		overflow: visible;
++		max-height: none;
++	}
++
+ 	.main-stage {
++		height: auto;
++		overflow: visible;
+ 		padding: 24px 16px 36px;
+ 	}
+ 

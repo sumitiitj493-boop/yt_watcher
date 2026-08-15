@@ -1,0 +1,1051 @@
+diff --git a/UI_PREMIUM_FEATURE.md b/UI_PREMIUM_FEATURE.md
+new file mode 100644
+index 0000000..5ea18c8
+--- /dev/null
++++ b/UI_PREMIUM_FEATURE.md
+@@ -0,0 +1,53 @@
++# Premium UI Upgrade
++
++Four quality-of-life features added to the whole app (they work on every page):
++
++## 1. Command palette — `Ctrl+K` (or `Cmd+K`)
++- Press **Ctrl+K** anywhere → a fuzzy-search palette opens (VS Code / Spotify style).
++- Search across **pages** (Download, Transcripts, Playlist, Library, History, Whisper,
++  Audio Extractor, Photos), **quick actions** (toggle theme, open downloads folder,
++  start a new download), your **recent downloads** and **saved transcripts**.
++- Arrow keys to navigate, **Enter** to run, **Esc** to close. Clicking outside closes it.
++
++## 2. Keyboard shortcuts
++- `?` opens a shortcuts help modal (also lists them all).
++- Single-letter navigation (when not typing): **D** Download, **T** Transcripts,
++  **P** Playlist, **L** Library, **H** History, **W** Whisper, **A** Audio Extractor.
++- `Esc` closes popups/overlays.
++
++## 3. Download manager dock
++- A floating **green pill (bottom-right)** appears whenever anything is downloading —
++  including videos queued by playlist batches.
++- Click it to expand: every active download with title, live progress bar, % and a
++  per-item **cancel** button. "Open History" link at the bottom.
++- Auto-collapses when the queue empties. The app now polls downloads continuously
++  (cheap) so the dock and the sidebar History badge stay accurate at all times.
++
++## 4. Scroll polish
++- **Scroll-to-top button** (bottom-left) appears once you scroll down the page —
++  click to smooth-scroll back to the top.
++- **Scroll resets to top automatically** when you switch pages (previously you could
++  land mid-page after navigating).
++
++---
++
++## Files changed
++
++- `frontend/src/components/CommandPalette.jsx` *(new)*
++- `frontend/src/components/DownloadDock.jsx` *(new)*
++- `frontend/src/components/ShortcutsModal.jsx` *(new)*
++- `frontend/src/App.jsx` — wiring, hotkeys, scroll handling, unconditional download polling
++- `frontend/src/App.css` — styles for all of the above
++
++No backend changes. After applying: **hard refresh (Ctrl+F5)** — no backend restart needed.
++
++## Apply order (full list)
++
++1. `playlist_batch_feature_local.patch`
++2. `transcript_saver_feature.patch`
++3. `transcript_saver_v3.patch`
++4. `transcript_saver_v4.patch`
++5. `transcript_saver_v5.patch`
++6. `transcript_saver_v6.patch`
++7. `sidebar_scroll.patch`
++8. `ui_premium.patch` (this one)
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 44a1018..5276402 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4121,3 +4121,458 @@ body[data-theme='dark'] .main-stage {
+ 		width: 100%;
+ 	}
+ }
++
++/* ==========================================================================
++   Premium UI: command palette, keyboard shortcuts, download dock, scroll-top
++   ========================================================================== */
++
++/* --- Command palette (Ctrl+K) ------------------------------------------ */
++.cmd-palette-backdrop {
++	position: fixed;
++	inset: 0;
++	z-index: 1500;
++	background: rgba(3, 6, 18, 0.55);
++	backdrop-filter: blur(6px);
++	-webkit-backdrop-filter: blur(6px);
++	display: flex;
++	align-items: flex-start;
++	justify-content: center;
++	padding: 12vh 20px 20px;
++}
++
++.cmd-palette {
++	width: 100%;
++	max-width: 620px;
++	background: var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 18px;
++	box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
++	overflow: hidden;
++	display: flex;
++	flex-direction: column;
++	max-height: 70vh;
++}
++
++.cmd-palette__search {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	padding: 14px 16px;
++	border-bottom: 1px solid var(--border);
++}
++
++.cmd-palette__search-icon {
++	color: var(--text-muted);
++	flex-shrink: 0;
++}
++
++.cmd-palette__input {
++	flex: 1;
++	background: none;
++	border: none;
++	outline: none;
++	color: var(--text);
++	font-size: 1rem;
++	font-family: inherit;
++}
++
++.cmd-palette__input::placeholder {
++	color: var(--text-muted);
++}
++
++.cmd-palette__kbd kbd {
++	font-size: 0.72rem;
++	padding: 2px 7px;
++	border-radius: 6px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	color: var(--text-muted);
++}
++
++.cmd-palette__results {
++	overflow-y: auto;
++	padding: 8px;
++}
++
++.cmd-palette__group-label {
++	font-size: 0.7rem;
++	letter-spacing: 0.12em;
++	text-transform: uppercase;
++	color: var(--text-muted);
++	padding: 8px 10px 4px;
++}
++
++.cmd-palette__item {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	width: 100%;
++	padding: 9px 10px;
++	border: none;
++	border-radius: 12px;
++	background: none;
++	color: var(--text);
++	font-family: inherit;
++	text-align: left;
++	cursor: pointer;
++}
++
++.cmd-palette__item--active {
++	background: rgba(124, 58, 237, 0.16);
++}
++
++.cmd-palette__item-icon {
++	width: 30px;
++	height: 30px;
++	border-radius: 9px;
++	display: grid;
++	place-items: center;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	color: var(--accent-cool);
++	flex-shrink: 0;
++}
++
++.cmd-palette__item-text {
++	display: flex;
++	flex-direction: column;
++	gap: 1px;
++	min-width: 0;
++	flex: 1;
++}
++
++.cmd-palette__item-label {
++	font-size: 0.92rem;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.cmd-palette__item-sub {
++	font-size: 0.76rem;
++	color: var(--text-muted);
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.cmd-palette__enter {
++	color: var(--text-muted);
++	flex-shrink: 0;
++}
++
++.cmd-palette__empty {
++	padding: 28px 16px;
++	text-align: center;
++	color: var(--text-muted);
++	font-size: 0.9rem;
++}
++
++/* --- Shortcuts help modal (?) ------------------------------------------ */
++.shortcuts-backdrop {
++	position: fixed;
++	inset: 0;
++	z-index: 1450;
++	background: rgba(3, 6, 18, 0.55);
++	backdrop-filter: blur(6px);
++	-webkit-backdrop-filter: blur(6px);
++	display: flex;
++	align-items: center;
++	justify-content: center;
++	padding: 20px;
++}
++
++.shortcuts-modal {
++	width: 100%;
++	max-width: 480px;
++	background: var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 18px;
++	box-shadow: var(--shadow);
++	padding: 20px;
++}
++
++.shortcuts-modal__head {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	margin-bottom: 14px;
++}
++
++.shortcuts-modal__icon {
++	width: 32px;
++	height: 32px;
++	border-radius: 9px;
++	display: grid;
++	place-items: center;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	color: var(--accent-cool);
++}
++
++.shortcuts-modal__head h2 {
++	flex: 1;
++	margin: 0;
++}
++
++.shortcuts-modal__close {
++	background: none;
++	border: none;
++	color: var(--text-muted);
++	cursor: pointer;
++	padding: 6px;
++	border-radius: 8px;
++	display: inline-flex;
++}
++
++.shortcuts-modal__close:hover {
++	color: var(--text);
++	background: rgba(255, 255, 255, 0.06);
++}
++
++.shortcuts-modal__list {
++	display: grid;
++	gap: 4px;
++}
++
++.shortcuts-modal__row {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	padding: 7px 6px;
++	border-radius: 10px;
++}
++
++.shortcuts-modal__row:hover {
++	background: var(--surface-muted);
++}
++
++.shortcuts-modal__keys {
++	display: flex;
++	gap: 5px;
++}
++
++.shortcuts-modal__keys kbd {
++	font-size: 0.74rem;
++	font-family: inherit;
++	padding: 3px 8px;
++	border-radius: 6px;
++	border: 1px solid var(--border);
++	border-bottom-width: 2px;
++	background: var(--surface-muted);
++	color: var(--text);
++	min-width: 22px;
++	text-align: center;
++}
++
++.shortcuts-modal__label {
++	color: var(--text);
++	font-size: 0.88rem;
++}
++
++.shortcuts-modal__note {
++	margin: 14px 0 0;
++	font-size: 0.78rem;
++	color: var(--text-muted);
++}
++
++/* --- Download dock ------------------------------------------------------ */
++.dock {
++	position: fixed;
++	right: 22px;
++	bottom: 22px;
++	z-index: 1200;
++	display: flex;
++	flex-direction: column;
++	align-items: flex-end;
++	gap: 10px;
++}
++
++.dock__toggle {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	padding: 10px 16px 10px 10px;
++	border: none;
++	border-radius: 999px;
++	cursor: pointer;
++	color: #fff;
++	background: linear-gradient(135deg, #10b981, #059669);
++	box-shadow: 0 10px 26px rgba(16, 185, 129, 0.4);
++	font-family: inherit;
++	font-size: 0.88rem;
++	font-weight: 600;
++	transition: transform 150ms ease, box-shadow 150ms ease;
++}
++
++.dock__toggle:hover {
++	transform: translateY(-2px);
++	box-shadow: 0 14px 32px rgba(16, 185, 129, 0.5);
++}
++
++.dock__toggle-icon {
++	width: 26px;
++	height: 26px;
++	border-radius: 50%;
++	display: grid;
++	place-items: center;
++	background: rgba(255, 255, 255, 0.22);
++}
++
++.dock__toggle-caret {
++	font-size: 0.7rem;
++	opacity: 0.85;
++}
++
++.dock__panel {
++	width: 340px;
++	max-width: calc(100vw - 44px);
++	background: var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 16px;
++	box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
++	overflow: hidden;
++	display: flex;
++	flex-direction: column;
++	animation: dock-pop 160ms ease;
++}
++
++@keyframes dock-pop {
++	from { opacity: 0; transform: translateY(8px); }
++	to { opacity: 1; transform: translateY(0); }
++}
++
++.dock__panel-head {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	padding: 12px 14px;
++	border-bottom: 1px solid var(--border);
++	font-size: 0.9rem;
++}
++
++.dock__close {
++	background: none;
++	border: none;
++	color: var(--text-muted);
++	cursor: pointer;
++	padding: 4px;
++	border-radius: 8px;
++	display: inline-flex;
++}
++
++.dock__close:hover {
++	color: var(--text);
++	background: rgba(255, 255, 255, 0.06);
++}
++
++.dock__list {
++	max-height: 320px;
++	overflow-y: auto;
++	display: grid;
++	gap: 2px;
++	padding: 6px;
++}
++
++.dock__row {
++	display: grid;
++	grid-template-columns: 1fr auto;
++	gap: 4px 10px;
++	align-items: center;
++	padding: 9px 10px;
++	border-radius: 10px;
++}
++
++.dock__row:hover {
++	background: var(--surface-muted);
++}
++
++.dock__row-title {
++	font-size: 0.85rem;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.dock__row-meta {
++	display: flex;
++	gap: 10px;
++	font-size: 0.74rem;
++	color: var(--text-muted);
++}
++
++.dock__bar {
++	grid-column: 1 / 2;
++	height: 5px;
++	border-radius: 999px;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	overflow: hidden;
++}
++
++.dock__bar-fill {
++	height: 100%;
++	background: linear-gradient(90deg, #10b981, #34d399);
++	border-radius: 999px;
++	transition: width 300ms ease;
++}
++
++.dock__cancel {
++	grid-column: 2 / 3;
++	grid-row: 1 / 3;
++	background: none;
++	border: none;
++	color: var(--text-muted);
++	cursor: pointer;
++	padding: 5px;
++	border-radius: 8px;
++	display: inline-flex;
++	align-self: center;
++}
++
++.dock__cancel:hover {
++	color: #f87171;
++	background: rgba(239, 68, 68, 0.1);
++}
++
++.dock__history {
++	display: flex;
++	align-items: center;
++	justify-content: center;
++	gap: 6px;
++	padding: 11px;
++	border-top: 1px solid var(--border);
++	color: var(--accent-cool);
++	font-size: 0.85rem;
++	font-weight: 600;
++	text-decoration: none;
++}
++
++.dock__history:hover {
++	background: var(--surface-muted);
++}
++
++/* --- Scroll to top ------------------------------------------------------ */
++.scroll-top-btn {
++	position: fixed;
++	left: 22px;
++	bottom: 22px;
++	z-index: 1150;
++	width: 44px;
++	height: 44px;
++	border-radius: 50%;
++	border: 1px solid var(--border);
++	cursor: pointer;
++	color: var(--text);
++	background: var(--surface);
++	box-shadow: 0 10px 24px rgba(0, 0, 0, 0.3);
++	display: grid;
++	place-items: center;
++	transition: transform 150ms ease, background 150ms ease;
++}
++
++.scroll-top-btn:hover {
++	transform: translateY(-2px);
++	background: var(--surface-muted);
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 47c63b0..cd604d0 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -36,6 +36,7 @@ import {
+   CheckCircle2,
+   XCircle,
+   BookOpenText,
++  ArrowUp,
+ } from 'lucide-react';
+ 
+ import './App.css';
+@@ -46,6 +47,9 @@ import LibraryPicker from './components/LibraryPicker';
+ import AudioExtractorPage from './pages/AudioExtractor';
+ import PhotosPage from './pages/photos';
+ import TranscriptsPage from './pages/Transcripts';
++import CommandPalette from './components/CommandPalette';
++import DownloadDock from './components/DownloadDock';
++import ShortcutsModal from './components/ShortcutsModal';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -3017,8 +3021,10 @@ export default function App() {
+   }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
+ 
+   useEffect(() => {
+-    if (!authReady || !isUnlocked || !activeDownloadCount) return undefined;
++    if (!authReady || !isUnlocked) return undefined;
+ 
++    // Poll downloads + files while unlocked so the download dock and badges
++    // stay accurate even for downloads started elsewhere (e.g. playlist batches).
+     const downloadTimer = window.setInterval(() => {
+       refreshDownloads();
+       refreshFiles();
+@@ -3026,7 +3032,7 @@ export default function App() {
+     return () => {
+       window.clearInterval(downloadTimer);
+     };
+-  }, [authReady, isUnlocked, activeDownloadCount, refreshDownloads, refreshFiles]);
++  }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
+ 
+   useEffect(() => {
+     if (isMobileDevice) {
+@@ -3274,6 +3280,66 @@ export default function App() {
+ 
+   const navigate = useNavigate();
+ 
++  // --- Global UI: command palette, shortcuts, scroll helpers -------------
++  const [paletteOpen, setPaletteOpen] = useState(false);
++  const [shortcutsOpen, setShortcutsOpen] = useState(false);
++  const [showScrollTop, setShowScrollTop] = useState(false);
++
++  const isTypingTarget = (event) => {
++    const target = event?.target;
++    return !!target && (
++      target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
++    );
++  };
++
++  useEffect(() => {
++    const onKeyDown = (event) => {
++      // Ctrl/Cmd+K — command palette (works even while typing)
++      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
++        event.preventDefault();
++        setPaletteOpen((v) => !v);
++        return;
++      }
++      if (isTypingTarget(event)) return;
++      if (event.key === '?') {
++        event.preventDefault();
++        setShortcutsOpen((v) => !v);
++        return;
++      }
++      if (paletteOpen) return;
++      const pageKeys = { d: '/download', t: '/transcripts', p: '/playlist', l: '/library', h: '/history', w: '/whisper', a: '/extract-audio' };
++      const path = pageKeys[event.key.toLowerCase()];
++      if (path) {
++        const active = document.activeElement;
++        const inNav = active && active.closest && active.closest('a, button, [role="button"]');
++        if (!inNav) navigate(path);
++      }
++    };
++    window.addEventListener('keydown', onKeyDown);
++    return () => window.removeEventListener('keydown', onKeyDown);
++  }, [navigate, paletteOpen]);
++
++  // Reset the main scroll when changing pages, and track it for jump-to-top.
++  const location = useLocation();
++  useEffect(() => {
++    const stage = document.querySelector('.main-stage');
++    if (stage) stage.scrollTop = 0;
++  }, [location.pathname]);
++
++  useEffect(() => {
++    const stage = document.querySelector('.main-stage');
++    if (!stage) return undefined;
++    const onScroll = () => setShowScrollTop(stage.scrollTop > 500);
++    stage.addEventListener('scroll', onScroll, { passive: true });
++    onScroll();
++    return () => stage.removeEventListener('scroll', onScroll);
++  }, [location.pathname]);
++
++  const scrollMainToTop = () => {
++    const stage = document.querySelector('.main-stage');
++    if (stage) stage.scrollTo({ top: 0, behavior: 'smooth' });
++  };
++
+   const openDownloadFromHistory = useCallback(({ url, quality = 'best', format = 'mp4' }) => {
+     if (!url) return;
+ 
+@@ -3393,6 +3459,23 @@ export default function App() {
+           onSubmit={handleUnlockSubmit}
+         />
+       ) : null}
++
++      <CommandPalette
++        open={paletteOpen}
++        onClose={() => setPaletteOpen(false)}
++        navigate={navigate}
++        downloads={downloads}
++        theme={theme}
++        onToggleTheme={toggleTheme}
++      />
++      <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
++      <DownloadDock downloads={downloads} onCancel={cancelDownload} />
++
++      {showScrollTop ? (
++        <button className="scroll-top-btn" type="button" onClick={scrollMainToTop} title="Scroll to top" aria-label="Scroll to top">
++          <ArrowUp size={18} />
++        </button>
++      ) : null}
+     </div>
+   );
+ }
+diff --git a/frontend/src/components/CommandPalette.jsx b/frontend/src/components/CommandPalette.jsx
+new file mode 100644
+index 0000000..6715d97
+--- /dev/null
++++ b/frontend/src/components/CommandPalette.jsx
+@@ -0,0 +1,232 @@
++import { useEffect, useMemo, useRef, useState } from 'react';
++import {
++  AudioLines,
++  BookOpenText,
++  CornerDownLeft,
++  Download,
++  FileText,
++  FolderOpen,
++  History,
++  Image as ImageIcon,
++  LibraryBig,
++  Mic2,
++  Moon,
++  Music2,
++  Search,
++  SunMedium,
++} from 'lucide-react';
++import { api } from '../lib/api';
++
++const PAGE_ITEMS = [
++  { key: 'page-download', group: 'Pages', label: 'Download', sub: 'Download videos or playlists', icon: Download, path: '/download', keywords: 'video youtube playlist' },
++  { key: 'page-transcripts', group: 'Pages', label: 'Transcripts', sub: 'Saved lecture transcripts', icon: BookOpenText, path: '/transcripts', keywords: 'saver transcript' },
++  { key: 'page-playlist', group: 'Pages', label: 'Playlist', sub: 'Manage playlists & play continuously', icon: Music2, path: '/playlist', keywords: 'queue' },
++  { key: 'page-library', group: 'Pages', label: 'Library', sub: 'All downloaded files', icon: LibraryBig, path: '/library', keywords: 'files media' },
++  { key: 'page-history', group: 'Pages', label: 'History', sub: 'Download history & retries', icon: History, path: '/history', keywords: 'jobs' },
++  { key: 'page-whisper', group: 'Pages', label: 'Whisper', sub: 'Local AI transcription', icon: Mic2, path: '/whisper', keywords: 'ai transcribe' },
++  { key: 'page-audio', group: 'Pages', label: 'Audio Extractor', sub: 'Extract audio from files', icon: AudioLines, path: '/extract-audio', keywords: 'mp3 music' },
++  { key: 'page-photos', group: 'Pages', label: 'Photos', sub: 'Saved images', icon: ImageIcon, path: '/photos', keywords: 'instagram images' },
++];
++
++function rankMatch(query, text) {
++  const q = query.trim().toLowerCase();
++  const t = String(text || '').toLowerCase();
++  if (!q) return 0;
++  if (t.startsWith(q)) return 0;
++  if (t.includes(q)) return 1;
++  let i = 0;
++  for (const ch of t) {
++    if (ch === q[i]) i += 1;
++    if (i === q.length) return 2;
++  }
++  return -1;
++}
++
++export default function CommandPalette({ open, onClose, navigate, downloads, theme, onToggleTheme }) {
++  const [query, setQuery] = useState('');
++  const [selected, setSelected] = useState(0);
++  const [transcripts, setTranscripts] = useState([]);
++  const inputRef = useRef(null);
++
++  useEffect(() => {
++    if (!open) return;
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
++    setQuery('');
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
++    setSelected(0);
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on open is intended
++    setTranscripts([]);
++    window.setTimeout(() => inputRef.current?.focus(), 30);
++    api
++      .get('/transcript-saver')
++      .then((res) => {
++        const list = Array.isArray(res.data?.transcripts) ? res.data.transcripts : [];
++        setTranscripts(list.slice(0, 8));
++      })
++      .catch(() => setTranscripts([]));
++  }, [open]);
++
++  const items = useMemo(() => {
++    const out = [];
++
++    for (const page of PAGE_ITEMS) {
++      const text = `${page.label} ${page.sub} ${page.keywords}`;
++      const rank = rankMatch(query, text);
++      if (rank >= 0) {
++        out.push({
++          ...page,
++          rank,
++          run: () => {
++            onClose();
++            navigate(page.path);
++          },
++        });
++      }
++    }
++
++    const actionItems = [
++      {
++        key: 'action-theme', group: 'Actions', label: theme === 'dark' ? 'Switch to Light mode' : 'Switch to Dark mode',
++        sub: 'Toggle appearance', icon: theme === 'dark' ? SunMedium : Moon,
++        rank: rankMatch(query, 'theme dark light appearance'), run: () => { onClose(); onToggleTheme(); },
++      },
++      {
++        key: 'action-folder', group: 'Actions', label: 'Open downloads folder', sub: 'Reveal in file explorer',
++        icon: FolderOpen, rank: rankMatch(query, 'open downloads folder explore disk'),
++        run: () => { api.post('/open-downloads-folder').catch(() => {}); onClose(); },
++      },
++      {
++        key: 'action-download', group: 'Actions', label: 'Start a new download', sub: 'Go to Download page',
++        icon: Download, rank: rankMatch(query, 'start new download url link'),
++        run: () => { onClose(); navigate('/download'); },
++      },
++    ];
++    for (const item of actionItems) {
++      if (item.rank >= 0) out.push(item);
++    }
++
++    const recentDownloads = (downloads || [])
++      .slice()
++      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
++      .slice(0, 6);
++    for (const d of recentDownloads) {
++      const label = d.title || 'Download';
++      const rank = rankMatch(query, `${label} ${d.filename || ''} ${d.url || ''} download`);
++      if (rank >= 0) {
++        out.push({
++          key: `dl-${d.task_id}`, group: 'Recent downloads', label, sub: `${d.status || ''} · ${d.format || ''}`,
++          icon: Download, rank, run: () => { onClose(); navigate('/history'); },
++        });
++      }
++    }
++
++    for (const t of transcripts) {
++      const rank = rankMatch(query, `${t.title || ''} transcript ${t.folder || ''}`);
++      if (rank >= 0) {
++        out.push({
++          key: `tr-${t.id}`, group: 'Transcripts', label: t.title || 'Transcript', sub: `${t.folder || 'General'} · ${t.line_count || 0} lines`,
++          icon: FileText, rank, run: () => { onClose(); navigate(t.folder ? `/transcripts?folder=${encodeURIComponent(t.folder)}` : '/transcripts'); },
++        });
++      }
++    }
++
++    out.sort((a, b) => {
++      if (a.rank !== b.rank) return a.rank - b.rank;
++      const ga = PAGE_ITEMS.some((p) => p.key === a.key) ? 0 : 1;
++      const gb = PAGE_ITEMS.some((p) => p.key === b.key) ? 0 : 1;
++      return ga - gb;
++    });
++    return out;
++  }, [query, downloads, transcripts, theme, onToggleTheme, onClose, navigate]);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset selection when results change
++    setSelected(0);
++  }, [query, items.length]);
++
++  if (!open) return null;
++
++  const runSelected = () => {
++    const item = items[selected];
++    if (item) item.run();
++  };
++
++  const groups = [];
++  const seen = new Set();
++  for (const item of items) {
++    if (!seen.has(item.group)) {
++      seen.add(item.group);
++      groups.push({ name: item.group, items: [] });
++    }
++    groups[groups.length - 1].items.push(item);
++  }
++
++  const onKeyDown = (event) => {
++    if (event.key === 'Escape') {
++      event.preventDefault();
++      onClose();
++    } else if (event.key === 'ArrowDown') {
++      event.preventDefault();
++      setSelected((s) => Math.min(s + 1, items.length - 1));
++    } else if (event.key === 'ArrowUp') {
++      event.preventDefault();
++      setSelected((s) => Math.max(s - 1, 0));
++    } else if (event.key === 'Enter') {
++      event.preventDefault();
++      runSelected();
++    }
++  };
++
++  return (
++    <div className="cmd-palette-backdrop" onMouseDown={onClose}>
++      <div className="cmd-palette" onMouseDown={(e) => e.stopPropagation()}>
++        <div className="cmd-palette__search">
++          <Search size={18} className="cmd-palette__search-icon" />
++          <input
++            ref={inputRef}
++            className="cmd-palette__input"
++            value={query}
++            onChange={(event) => setQuery(event.target.value)}
++            onKeyDown={onKeyDown}
++            placeholder="Search pages, actions, downloads, transcripts…  (Esc to close)"
++            spellCheck="false"
++            autoComplete="off"
++          />
++          <span className="cmd-palette__kbd"><kbd>Esc</kbd></span>
++        </div>
++
++        <div className="cmd-palette__results">
++          {items.length === 0 ? (
++            <div className="cmd-palette__empty">No matches for “{query}”</div>
++          ) : (
++            groups.map((group) => (
++              <div className="cmd-palette__group" key={group.name}>
++                <div className="cmd-palette__group-label">{group.name}</div>
++                {group.items.map((item) => {
++                  const flatIndex = items.indexOf(item);
++                  const Icon = item.icon;
++                  return (
++                    <button
++                      key={item.key}
++                      type="button"
++                      className={`cmd-palette__item ${flatIndex === selected ? 'cmd-palette__item--active' : ''}`}
++                      onMouseEnter={() => setSelected(flatIndex)}
++                      onClick={item.run}
++                    >
++                      <span className="cmd-palette__item-icon"><Icon size={17} /></span>
++                      <span className="cmd-palette__item-text">
++                        <span className="cmd-palette__item-label">{item.label}</span>
++                        {item.sub ? <span className="cmd-palette__item-sub">{item.sub}</span> : null}
++                      </span>
++                      {flatIndex === selected ? <CornerDownLeft size={14} className="cmd-palette__enter" /> : null}
++                    </button>
++                  );
++                })}
++              </div>
++            ))
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/DownloadDock.jsx b/frontend/src/components/DownloadDock.jsx
+new file mode 100644
+index 0000000..a1072ea
+--- /dev/null
++++ b/frontend/src/components/DownloadDock.jsx
+@@ -0,0 +1,90 @@
++import { useEffect, useMemo, useState } from 'react';
++import { Link } from 'react-router-dom';
++import { ArrowRight, Download, X } from 'lucide-react';
++
++const ACTIVE_STATUSES = new Set(['pending', 'queued', 'starting', 'downloading', 'processing']);
++
++const STATUS_LABEL = {
++  pending: 'Queued',
++  queued: 'Queued',
++  starting: 'Starting',
++  downloading: 'Downloading',
++  processing: 'Processing',
++};
++
++function percentOf(item) {
++  if (Number.isFinite(item?.progress)) return Math.min(Math.max(item.progress, 0), 100);
++  const parsed = Number.parseFloat(item?.percent || '');
++  return Number.isNaN(parsed) ? 0 : Math.min(Math.max(parsed, 0), 100);
++}
++
++export default function DownloadDock({ downloads, onCancel }) {
++  const [expanded, setExpanded] = useState(false);
++  const active = useMemo(
++    () => (downloads || []).filter((d) => ACTIVE_STATUSES.has(d.status)),
++    [downloads],
++  );
++
++  // Collapse the panel automatically when nothing is active anymore.
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- collapse when queue empties
++    if (active.length === 0) setExpanded(false);
++  }, [active.length]);
++
++  if (active.length === 0) return null;
++
++  return (
++    <div className={`dock ${expanded ? 'dock--expanded' : ''}`}>
++      <button
++        className="dock__toggle"
++        type="button"
++        onClick={() => setExpanded((v) => !v)}
++        title={expanded ? 'Collapse downloads' : 'Show active downloads'}
++      >
++        <span className="dock__toggle-icon"><Download size={16} /></span>
++        <span className="dock__toggle-text">
++          {active.length} download{active.length === 1 ? '' : 's'} active
++        </span>
++        <span className="dock__toggle-caret">{expanded ? '▾' : '▴'}</span>
++      </button>
++
++      {expanded ? (
++        <div className="dock__panel">
++          <div className="dock__panel-head">
++            <strong>Active downloads</strong>
++            <button className="dock__close" type="button" onClick={() => setExpanded(false)} title="Close">
++              <X size={15} />
++            </button>
++          </div>
++          <div className="dock__list">
++            {active.map((item) => (
++              <div className="dock__row" key={item.task_id}>
++                <div className="dock__row-title" title={item.title || item.filename || 'Download'}>
++                  {item.title || item.filename || 'Download'}
++                </div>
++                <div className="dock__row-meta">
++                  <span>{STATUS_LABEL[item.status] || item.status}</span>
++                  <span>{percentOf(item).toFixed(0)}%</span>
++                </div>
++                <div className="dock__bar">
++                  <div className="dock__bar-fill" style={{ width: `${percentOf(item)}%` }} />
++                </div>
++                <button
++                  className="dock__cancel"
++                  type="button"
++                  title="Cancel"
++                  onClick={() => onCancel?.(item.task_id)}
++                >
++                  <X size={13} />
++                </button>
++              </div>
++            ))}
++          </div>
++          <Link className="dock__history" to="/history" onClick={() => setExpanded(false)}>
++            Open History <ArrowRight size={14} />
++          </Link>
++        </div>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/frontend/src/components/ShortcutsModal.jsx b/frontend/src/components/ShortcutsModal.jsx
+new file mode 100644
+index 0000000..3ec1d50
+--- /dev/null
++++ b/frontend/src/components/ShortcutsModal.jsx
+@@ -0,0 +1,55 @@
++import { useEffect } from 'react';
++import { Keyboard, X } from 'lucide-react';
++
++const SHORTCUTS = [
++  { keys: ['Ctrl', 'K'], label: 'Open command palette' },
++  { keys: ['?'], label: 'Show this shortcuts help' },
++  { keys: ['D'], label: 'Go to Download' },
++  { keys: ['T'], label: 'Go to Transcripts' },
++  { keys: ['P'], label: 'Go to Playlist' },
++  { keys: ['L'], label: 'Go to Library' },
++  { keys: ['H'], label: 'Go to History' },
++  { keys: ['W'], label: 'Go to Whisper' },
++  { keys: ['A'], label: 'Go to Audio Extractor' },
++  { keys: ['Esc'], label: 'Close popups / overlays' },
++];
++
++export default function ShortcutsModal({ open, onClose }) {
++  useEffect(() => {
++    if (!open) return undefined;
++    const onKey = (event) => {
++      if (event.key === 'Escape') onClose();
++    };
++    window.addEventListener('keydown', onKey);
++    return () => window.removeEventListener('keydown', onKey);
++  }, [open, onClose]);
++
++  if (!open) return null;
++
++  return (
++    <div className="shortcuts-backdrop" onMouseDown={onClose}>
++      <div className="shortcuts-modal" onMouseDown={(e) => e.stopPropagation()}>
++        <div className="shortcuts-modal__head">
++          <span className="shortcuts-modal__icon"><Keyboard size={18} /></span>
++          <h2 className="panel__title panel__title--tight">Keyboard shortcuts</h2>
++          <button className="shortcuts-modal__close" type="button" onClick={onClose} title="Close">
++            <X size={16} />
++          </button>
++        </div>
++        <div className="shortcuts-modal__list">
++          {SHORTCUTS.map((shortcut) => (
++            <div className="shortcuts-modal__row" key={shortcut.label}>
++              <span className="shortcuts-modal__keys">
++                {shortcut.keys.map((key) => (
++                  <kbd key={key}>{key}</kbd>
++                ))}
++              </span>
++              <span className="shortcuts-modal__label">{shortcut.label}</span>
++            </div>
++          ))}
++        </div>
++        <p className="shortcuts-modal__note">Shortcuts work anywhere except while typing in a text field.</p>
++      </div>
++    </div>
++  );
++}

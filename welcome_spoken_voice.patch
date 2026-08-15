@@ -1,0 +1,138 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index ed1e9f3..a866d52 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4787,3 +4787,32 @@ body,
+ 	font-size: 0.95rem;
+ 	font-style: italic;
+ }
++
++/* Welcome speaker button + hint */
++.welcome-quote__speak {
++	display: inline-flex;
++	align-items: center;
++	justify-content: center;
++	margin-left: 10px;
++	padding: 6px;
++	border: 1px solid var(--border);
++	border-radius: 999px;
++	background: var(--surface-muted);
++	color: var(--accent-strong);
++	cursor: pointer;
++	vertical-align: middle;
++	transition: transform 140ms ease, background 140ms ease;
++}
++
++.welcome-quote__speak:hover {
++	transform: scale(1.1);
++	background: rgba(124, 58, 237, 0.12);
++}
++
++.welcome-quote__hint {
++	margin: 10px 0 0;
++	color: var(--accent-cool);
++	font-size: 0.88rem;
++	font-weight: 600;
++	animation: hint-pop 240ms ease both;
++}
+diff --git a/frontend/src/components/WelcomeQuote.jsx b/frontend/src/components/WelcomeQuote.jsx
+index c97c4e4..a00ecbb 100644
+--- a/frontend/src/components/WelcomeQuote.jsx
++++ b/frontend/src/components/WelcomeQuote.jsx
+@@ -1,4 +1,5 @@
+-import { useMemo } from 'react';
++import { useEffect, useMemo, useRef, useState } from 'react';
++import { Volume2, VolumeX } from 'lucide-react';
+ 
+ // Short, motivating quotes — one is picked per page load (random).
+ const QUOTES = [
+@@ -14,13 +15,87 @@ const QUOTES = [
+   'The best time to start was yesterday. The next best is now.',
+ ];
+ 
+-export default function WelcomeQuote() {
++// Simple, reliable spoken "Welcome" using the browser's built-in speech
++// synthesis — no audio files, nothing to download, nothing to break.
++let playedThisLoad = false;
++
++function speakWelcome() {
++  try {
++    if (!('speechSynthesis' in window)) return false;
++    window.speechSynthesis.cancel();
++    const utter = new SpeechSynthesisUtterance('Welcome!');
++    utter.lang = 'en-US';
++    utter.rate = 0.95;
++    // Prefer an English voice if one is available.
++    const voices = window.speechSynthesis.getVoices();
++    const en = voices.find((v) => String(v.lang || '').toLowerCase().startsWith('en'));
++    if (en) utter.voice = en;
++    window.speechSynthesis.speak(utter);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++export default function WelcomeQuote({ voiceOn = true }) {
+   const quote = useMemo(() => QUOTES[Math.floor(Math.random() * QUOTES.length)], []);
++  const [needsClick, setNeedsClick] = useState(false);
++  const playedRef = useRef(false);
++
++  useEffect(() => {
++    if (!voiceOn) return undefined;
++    if (playedThisLoad || playedRef.current) return undefined;
++    playedThisLoad = true;
++    playedRef.current = true;
++
++    const ok = speakWelcome();
++    if (ok) return undefined;
++
++    // Blocked by the browser (autoplay rules) — wait for the first click.
++    setNeedsClick(true);
++    const onFirstInteraction = () => {
++      cleanup();
++      speakWelcome();
++      setNeedsClick(false);
++    };
++    const cleanup = () => {
++      window.removeEventListener('pointerdown', onFirstInteraction);
++      window.removeEventListener('keydown', onFirstInteraction);
++      window.removeEventListener('click', onFirstInteraction);
++      window.removeEventListener('touchstart', onFirstInteraction);
++    };
++    window.addEventListener('pointerdown', onFirstInteraction);
++    window.addEventListener('keydown', onFirstInteraction);
++    window.addEventListener('click', onFirstInteraction);
++    window.addEventListener('touchstart', onFirstInteraction);
++    const hideTimer = window.setTimeout(() => setNeedsClick(false), 8000);
++    return () => {
++      cleanup();
++      window.clearTimeout(hideTimer);
++    };
++  }, [voiceOn]);
+ 
+   return (
+     <div className="welcome-quote">
+-      <h1 className="welcome-quote__title">Welcome 👋</h1>
++      <h1 className="welcome-quote__title">
++        Welcome 👋
++        <button
++          className="welcome-quote__speak"
++          type="button"
++          onClick={(event) => {
++            event.stopPropagation();
++            if (voiceOn) speakWelcome();
++          }}
++          title={voiceOn ? 'Say "Welcome"' : 'Voice is off'}
++          aria-label="Speak welcome"
++        >
++          {voiceOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
++        </button>
++      </h1>
+       <p className="welcome-quote__text">“{quote}”</p>
++      {needsClick ? (
++        <p className="welcome-quote__hint">🔊 Click anywhere to hear “Welcome”</p>
++      ) : null}
+     </div>
+   );
+ }

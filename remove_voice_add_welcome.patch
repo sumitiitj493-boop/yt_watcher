@@ -1,0 +1,349 @@
+diff --git a/UI_VOICE.md b/UI_VOICE.md
+deleted file mode 100644
+index 0b807f9..0000000
+--- a/UI_VOICE.md
++++ /dev/null
+@@ -1,58 +0,0 @@
+-# Voice Greetings (Hindi + English)
+-
+-The app now **speaks a random greeting** every time it loads (refresh or starting
+-the server), alternating between **Hindi** and **English** with premium
+-AI-generated voices you chose during setup.
+-
+-## How to install (2 steps — this avoids Windows line-ending problems)
+-
+-**Step 1 — apply the code patch** (text-only, so it applies on Windows safely):
+-
+-```powershell
+-git apply --whitespace=nowarn ui_voice_code.patch
+-```
+-
+-**Step 2 — put the audio files in place** (they live in `voices.zip`, not the patch,
+-because binary data breaks when a patch file is saved with Windows line endings):
+-
+-```powershell
+-New-Item -ItemType Directory -Force -Path "frontend\public\voices"
+-Expand-Archive -Path "voices.zip" -DestinationPath "frontend\public\voices" -Force
+-```
+-
+-Final check — the folder must contain the 6 mp3s **directly** (no extra sub-folder):
+-
+-```
+-frontend\public\voices\
+-├── en-1.mp3   en-2.mp3   en-3.mp3
+-├── hi-1.mp3   hi-2.mp3   hi-3.mp3
+-```
+-
+-Then **hard-refresh (Ctrl+F5)** and you'll hear a random greeting (Hindi or English).
+-
+-## How it works
+-
+-- On every page load, the app picks **one clip at random** (50% Hindi, 50%
+-  English, then one of 3 greetings in that language) and plays it.
+-- 6 built-in clips in `frontend/public/voices/`:
+-  - `hi-1.mp3`, `hi-2.mp3`, `hi-3.mp3` — Hindi (feminine voice)
+-  - `en-1.mp3`, `en-2.mp3`, `en-3.mp3` — English / Indian accent (masculine voice)
+-- **Autoplay handling:** browsers block sound until you interact with the page.
+-  The greeting tries to play immediately; if blocked, it plays on your first
+-  click/keypress. If the audio file is missing it falls back to the browser's
+-  built-in speech synthesis — so it never breaks.
+-- **Mute toggle:** a speaker button in the sidebar footer (below the theme toggle)
+-  turns the voice off/on. Your choice is remembered (localStorage).
+-
+-## Files
+-
+-- `frontend/src/components/VoiceGreeting.jsx` *(new)* — playback logic + fallback.
+-- `frontend/src/App.jsx` — integration, mute state, sidebar button.
+-- `frontend/src/App.css` — button styles.
+-- `frontend/public/voices/*.mp3` — the 6 greeting clips (from `voices.zip`).
+-
+-No backend changes.
+-
+-> Tip: use the sidebar **Voice on/off** button to mute if you don't want sound on
+-> every refresh. The choice sticks.
+-
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 61718ef..ed1e9f3 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4763,33 +4763,27 @@ body,
+ 	100% { transform: scale(1); }
+ }
+ 
+-/* Voice greeting toggle (sidebar footer) */
+-.sidebar__footer .theme-toggle {
+-	display: flex;
+-	align-items: center;
+-	gap: 10px;
+-	width: 100%;
+-	padding: 12px 14px;
+-	border-radius: 16px;
+-	font-family: inherit;
+-	font-size: 14px;
+-	font-weight: 700;
+-	color: #64748b;
+-	background: rgba(248, 250, 252, 0.9);
+-	border: 1px solid rgba(148, 163, 184, 0.18);
+-	cursor: pointer;
+-	transition: border-color 160ms ease, color 160ms ease, background 160ms ease, opacity 160ms ease;
+-}
+-
+-.sidebar__footer .theme-toggle:hover {
+-	border-color: rgba(99, 102, 241, 0.4);
+-	color: #4f46e5;
++/* Welcome + motivational quote */
++.welcome-quote {
++	text-align: center;
++	padding: 26px 20px 6px;
+ }
+ 
+-.sidebar__footer .theme-toggle svg {
+-	flex-shrink: 0;
++.welcome-quote__title {
++	margin: 0;
++	font-size: 1.9rem;
++	font-weight: 800;
++	letter-spacing: -0.02em;
++	background: linear-gradient(135deg, var(--accent), var(--accent-cool));
++	-webkit-background-clip: text;
++	background-clip: text;
++	color: transparent;
++	display: inline-block;
+ }
+ 
+-.sidebar__footer .theme-toggle--off {
+-	opacity: 0.6;
++.welcome-quote__text {
++	margin: 8px 0 0;
++	color: var(--text-muted);
++	font-size: 0.95rem;
++	font-style: italic;
+ }
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 2fbe5dd..d9e2f67 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -37,8 +37,6 @@ import {
+   XCircle,
+   BookOpenText,
+   ArrowUp,
+-  Volume2,
+-  VolumeX,
+ } from 'lucide-react';
+ 
+ import './App.css';
+@@ -54,7 +52,7 @@ import DownloadDock from './components/DownloadDock';
+ import ShortcutsModal from './components/ShortcutsModal';
+ import ConfettiBurst from './components/ConfettiBurst';
+ import Skeleton from './components/Skeleton';
+-import VoiceGreeting from './components/VoiceGreeting';
++import WelcomeQuote from './components/WelcomeQuote';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -1370,6 +1368,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+ 
+   return (
+     <div className="page-shell">
++      <WelcomeQuote />
+       <SectionHeader
+         title="Download Video"
+         subtitle="Paste a YouTube URL, process it, then choose to watch online or download the saved file."
+@@ -3245,7 +3244,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+   );
+ }
+ 
+-function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcriptCount, voiceMuted, onToggleVoice }) {
++function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcriptCount }) {
+   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length;
+   const themeIsDark = theme === 'dark';
+   const animatedBytes = useCountUp(storageBytes ?? 0);
+@@ -3320,16 +3319,6 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcr
+           {themeIsDark ? <SunMedium size={16} /> : <Moon size={16} />}
+           <span>{themeIsDark ? 'Light mode' : 'Dark mode'}</span>
+         </button>
+-        <button
+-          className={`theme-toggle ${voiceMuted ? 'theme-toggle--off' : ''}`}
+-          type="button"
+-          onClick={onToggleVoice}
+-          aria-label={voiceMuted ? 'Turn voice greeting on' : 'Mute voice greeting'}
+-          title={voiceMuted ? 'Voice greeting is off — click to turn on' : 'Voice greeting is on — click to mute'}
+-        >
+-          {voiceMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+-          <span>{voiceMuted ? 'Voice off' : 'Voice on'}</span>
+-        </button>
+         <div className="usage-card">
+           <div className="usage-card__label">Storage</div>
+           <div className="usage-card__value">
+@@ -3734,23 +3723,6 @@ export default function App() {
+   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+   const [showScrollTop, setShowScrollTop] = useState(false);
+ 
+-  // Voice greeting (plays on every refresh; mute persists)
+-  const [voiceMuted, setVoiceMuted] = useState(() => {
+-    if (typeof window === 'undefined') return false;
+-    return window.localStorage.getItem('yt-suite-voice-muted') === '1';
+-  });
+-  const toggleVoice = useCallback(() => {
+-    setVoiceMuted((current) => {
+-      const next = !current;
+-      try {
+-        window.localStorage.setItem('yt-suite-voice-muted', next ? '1' : '0');
+-      } catch {
+-        // storage unavailable — mute still works for this session
+-      }
+-      return next;
+-    });
+-  }, []);
+-
+   const isTypingTarget = (event) => {
+     const target = event?.target;
+     return !!target && (
+@@ -3864,7 +3836,7 @@ export default function App() {
+ 
+   return (
+     <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
+-      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} transcriptCount={transcriptCount} voiceMuted={voiceMuted} onToggleVoice={toggleVoice} />
++      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} transcriptCount={transcriptCount} />
+ 
+       <main className="main-stage">
+         <Routes>
+@@ -3940,7 +3912,6 @@ export default function App() {
+       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+       <DownloadDock downloads={downloads} onCancel={cancelDownload} />
+       <ConfettiBurst burstId={celebrateId} />
+-      {authReady && isUnlocked ? <VoiceGreeting muted={voiceMuted} /> : null}
+ 
+       {showScrollTop ? (
+         <button className="scroll-top-btn" type="button" onClick={scrollMainToTop} title="Scroll to top" aria-label="Scroll to top">
+diff --git a/frontend/src/components/VoiceGreeting.jsx b/frontend/src/components/VoiceGreeting.jsx
+deleted file mode 100644
+index b5b2da0..0000000
+--- a/frontend/src/components/VoiceGreeting.jsx
++++ /dev/null
+@@ -1,93 +0,0 @@
+-import { useEffect, useRef } from 'react';
+-
+-// Randomly-picked greeting clips. Files live in frontend/public/voices/
+-// (delivered alongside the code patch). If a file is missing or playback is
+-// blocked, we fall back to the browser's built-in speech synthesis so the
+-// greeting still works with zero dependencies.
+-const CLIPS = [
+-  { lang: 'hi', file: '/voices/hi-1.mp3', text: 'नमस्ते! योट प्राइवेट सूट में आपका स्वागत है। आपकी सारी चीज़ें तैयार हैं, पढ़ाई का आनंद लीजिए!' },
+-  { lang: 'hi', file: '/voices/hi-2.mp3', text: 'स्वागत है! आपके डाउनलोड और ट्रांसक्रिप्ट सब सुरक्षित हैं। आज की पढ़ाई के लिए शुभकामनाएँ!' },
+-  { lang: 'hi', file: '/voices/hi-3.mp3', text: 'नमस्ते! एक बार फिर आपका स्वागत है। खुश रहिए और मज़े से सीखिए!' },
+-  { lang: 'en', file: '/voices/en-1.mp3', text: 'Welcome back to YT Private Suite! Your downloads and transcripts are safe and ready.' },
+-  { lang: 'en', file: '/voices/en-2.mp3', text: 'Hello! Great to see you again. Everything is ready for your study session.' },
+-  { lang: 'en', file: '/voices/en-3.mp3', text: 'Welcome! Enjoy your downloads, playlists, and transcripts. Happy learning!' },
+-];
+-
+-// Play only once per page load (React StrictMode double-mounts in dev).
+-let playedThisLoad = false;
+-let currentAudio = null;
+-
+-function speakFallback(text, lang) {
+-  try {
+-    if (!('speechSynthesis' in window)) return;
+-    window.speechSynthesis.cancel();
+-    const utter = new SpeechSynthesisUtterance(text);
+-    utter.lang = lang === 'hi' ? 'hi-IN' : 'en-IN';
+-    utter.rate = 1;
+-    const voices = window.speechSynthesis.getVoices();
+-    const match = voices.find((voice) => {
+-      const vlang = String(voice.lang || '').toLowerCase();
+-      return lang === 'hi' ? vlang.startsWith('hi') : vlang.startsWith('en');
+-    });
+-    if (match) utter.voice = match;
+-    window.speechSynthesis.speak(utter);
+-  } catch {
+-    // never crash the app over a greeting
+-  }
+-}
+-
+-export default function VoiceGreeting({ muted }) {
+-  const playedRef = useRef(false);
+-
+-  useEffect(() => {
+-    if (muted) return undefined;
+-    if (playedThisLoad || playedRef.current) return undefined;
+-    playedThisLoad = true;
+-    playedRef.current = true;
+-
+-    const clip = CLIPS[Math.floor(Math.random() * CLIPS.length)];
+-    let fallbackDone = false;
+-    const doFallback = () => {
+-      if (fallbackDone) return;
+-      fallbackDone = true;
+-      speakFallback(clip.text, clip.lang);
+-    };
+-
+-    const attempt = () => {
+-      const audio = new Audio(clip.file);
+-      currentAudio = audio;
+-      audio.volume = 1;
+-      audio.addEventListener('error', doFallback);
+-
+-      const playNow = () => {
+-        const promise = audio.play();
+-        if (promise && promise.catch) promise.catch(() => { /* handled below */ });
+-      };
+-
+-      playNow();
+-      // Browsers block autoplay-with-sound until the first user interaction.
+-      // If that happens, wait for one click/keypress, then try again; if that
+-      // fails too, fall back to speech synthesis.
+-      const onFirstInteraction = () => {
+-        window.removeEventListener('pointerdown', onFirstInteraction);
+-        window.removeEventListener('keydown', onFirstInteraction);
+-        const retry = audio.play();
+-        if (retry && retry.catch) retry.catch(doFallback);
+-      };
+-      window.addEventListener('pointerdown', onFirstInteraction);
+-      window.addEventListener('keydown', onFirstInteraction);
+-      window.setTimeout(() => {
+-        window.removeEventListener('pointerdown', onFirstInteraction);
+-        window.removeEventListener('keydown', onFirstInteraction);
+-        if (!audio.paused) return;
+-        doFallback();
+-      }, 8000);
+-    };
+-
+-    // Slight delay so the page paints before the greeting.
+-    const timer = window.setTimeout(attempt, 700);
+-    return () => window.clearTimeout(timer);
+-  }, [muted]);
+-
+-  return null;
+-}
+diff --git a/frontend/src/components/WelcomeQuote.jsx b/frontend/src/components/WelcomeQuote.jsx
+new file mode 100644
+index 0000000..c97c4e4
+--- /dev/null
++++ b/frontend/src/components/WelcomeQuote.jsx
+@@ -0,0 +1,26 @@
++import { useMemo } from 'react';
++
++// Short, motivating quotes — one is picked per page load (random).
++const QUOTES = [
++  'Small steps every day lead to big results.',
++  'Discipline beats motivation when motivation fades.',
++  'Study now, shine later.',
++  'Consistency is the quiet superpower.',
++  'Every expert was once a beginner.',
++  'One video at a time — you are building your future.',
++  'Focus on progress, not perfection.',
++  'Your future self will thank you for today.',
++  'Learn a little, improve a lot.',
++  'The best time to start was yesterday. The next best is now.',
++];
++
++export default function WelcomeQuote() {
++  const quote = useMemo(() => QUOTES[Math.floor(Math.random() * QUOTES.length)], []);
++
++  return (
++    <div className="welcome-quote">
++      <h1 className="welcome-quote__title">Welcome 👋</h1>
++      <p className="welcome-quote__text">“{quote}”</p>
++    </div>
++  );
++}

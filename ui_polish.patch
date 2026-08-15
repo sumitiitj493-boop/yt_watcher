@@ -1,0 +1,684 @@
+diff --git a/UI_POLISH_FEATURE.md b/UI_POLISH_FEATURE.md
+new file mode 100644
+index 0000000..e9c17d2
+--- /dev/null
++++ b/UI_POLISH_FEATURE.md
+@@ -0,0 +1,68 @@
++# Legendary UI Polish
++
++A set of premium-feel refinements layered on top of the earlier UI upgrades.
++All are safe, frontend-only changes.
++
++## What's new
++
++### 1. Animated aurora backdrop
++A slow-drifting, multi-colour gradient glow now sits **behind** the whole app
++(sidebar + content), giving the dark theme a living, premium depth. Subtle —
++it never distracts or blocks clicks.
++
++### 2. Smooth theme switching
++Backgrounds, borders and text now **cross-fade** when you toggle light/dark mode
++instead of snapping.
++
++### 3. Page entrance animation
++Every page gently **fades + slides up** when you open it — feels buttery.
++
++### 4. Skeleton loading shimmer
++While the Library and Transcripts pages load their data, they show **shimmering
++placeholder cards** instead of a blank "Loading…" — the professional touch.
++
++### 5. Completion confetti 🎉
++When a download finishes, a small **confetti burst** pops up near the download
++dock. Delightful, brief, and non-intrusive.
++
++### 6. Animated storage counter
++The sidebar's **Storage** number now **counts up** smoothly to the real value
++instead of jumping.
++
++### 7. Undo for deleted transcripts
++Delete a transcript → a toast with **Undo** appears for a few seconds. One click
++restores it exactly (title, text, folder, link).
++
++### 8. Drag & drop playlist reordering
++In the Playlist page you can now **drag cards to reorder** them (in addition to
++the ↑/↓ buttons). The dragged card dims, the drop target highlights, and the new
++order is saved automatically. Dropping never accidentally starts playback.
++
++---
++
++## Files changed
++
++- `frontend/src/App.css` — aurora, transitions, page-in, skeletons, confetti,
++  toast action button, drag & drop styles, count-up bump.
++- `frontend/src/App.jsx` — `useCountUp` hook, confetti trigger on download
++  completion, toast actions, storage counter animation, Library skeletons,
++  `filesReady` flag.
++- `frontend/src/components/ConfettiBurst.jsx` *(new)*
++- `frontend/src/components/Skeleton.jsx` *(new)*
++- `frontend/src/pages/Transcripts.jsx` — skeletons + undo delete (+ fixed the
++  notify wrapper so toast actions actually reach the app).
++- `frontend/src/pages/Playlist.jsx` — drag & drop reordering.
++
++No backend changes. Apply then **hard refresh (Ctrl+F5)**.
++
++## Apply order (full list)
++
++1. `playlist_batch_feature_local.patch`
++2. `transcript_saver_feature.patch`
++3. `transcript_saver_v3.patch`
++4. `transcript_saver_v4.patch`
++5. `transcript_saver_v5.patch`
++6. `transcript_saver_v6.patch`
++7. `sidebar_scroll.patch`
++8. `ui_premium.patch`
++9. `ui_polish.patch` (this one)
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 5276402..b040599 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4576,3 +4576,189 @@ body[data-theme='dark'] .main-stage {
+ 	transform: translateY(-2px);
+ 	background: var(--surface-muted);
+ }
++
++/* ==========================================================================
++   Legendary polish: aurora, transitions, page-in, skeletons, confetti
++   ========================================================================== */
++
++/* Smooth theme switch */
++body,
++.app-shell,
++.sidebar,
++.main-stage,
++.panel,
++.download-card,
++.input,
++.select,
++.textarea,
++.transcript-textarea,
++.search-box {
++	transition: background-color 300ms ease, border-color 300ms ease, color 300ms ease;
++}
++
++/* Animated aurora backdrop (paints behind sidebar/main) */
++.app-shell {
++	position: relative;
++}
++
++.app-shell::before {
++	content: '';
++	position: fixed;
++	inset: -10%;
++	z-index: 0;
++	pointer-events: none;
++	background:
++		radial-gradient(42% 38% at 18% 22%, rgba(139, 92, 246, 0.16), transparent 70%),
++		radial-gradient(36% 34% at 82% 16%, rgba(34, 211, 238, 0.10), transparent 70%),
++		radial-gradient(46% 42% at 68% 88%, rgba(99, 102, 241, 0.14), transparent 70%),
++		radial-gradient(30% 30% at 30% 82%, rgba(236, 72, 153, 0.08), transparent 70%);
++	filter: blur(40px);
++	animation: aurora-drift 26s ease-in-out infinite alternate;
++	will-change: transform;
++}
++
++@keyframes aurora-drift {
++	0%   { transform: translate3d(-2%, -1%, 0) rotate(0deg) scale(1); }
++	50%  { transform: translate3d(2%, 2%, 0) rotate(6deg) scale(1.06); }
++	100% { transform: translate3d(-1%, 3%, 0) rotate(-4deg) scale(1.02); }
++}
++
++.sidebar,
++.main-stage {
++	position: relative;
++	z-index: 1;
++}
++
++/* Page entrance animation */
++.page-shell {
++	animation: page-in 320ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
++}
++
++@keyframes page-in {
++	from { opacity: 0; transform: translateY(10px); }
++	to   { opacity: 1; transform: translateY(0); }
++}
++
++/* Skeleton shimmer */
++.skeleton {
++	position: relative;
++	overflow: hidden;
++	background: var(--surface-muted);
++	border-radius: 14px;
++	min-height: 16px;
++}
++
++.skeleton::after {
++	content: '';
++	position: absolute;
++	inset: 0;
++	transform: translateX(-100%);
++	background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
++	animation: shimmer 1.4s infinite;
++}
++
++@keyframes shimmer {
++	100% { transform: translateX(100%); }
++}
++
++.skeleton-card {
++	display: flex;
++	gap: 14px;
++	align-items: center;
++	padding: 14px;
++	border: 1px solid var(--border);
++	border-radius: 16px;
++	background: var(--surface-muted);
++}
++
++.skeleton-thumb {
++	width: 96px;
++	height: 60px;
++	border-radius: 10px;
++	flex-shrink: 0;
++}
++
++.skeleton-lines {
++	display: grid;
++	gap: 10px;
++	flex: 1;
++}
++
++.skeleton-lines .skeleton:nth-child(1) { width: 70%; }
++.skeleton-lines .skeleton:nth-child(2) { width: 45%; }
++.skeleton-lines .skeleton:nth-child(3) { width: 30%; }
++
++/* Confetti burst */
++.confetti-burst {
++	position: fixed;
++	inset: 0;
++	pointer-events: none;
++	z-index: 1600;
++	overflow: hidden;
++}
++
++.confetti-piece {
++	position: absolute;
++	bottom: -12px;
++	width: 8px;
++	height: 14px;
++	border-radius: 2px;
++	animation: confetti-fly var(--dur) cubic-bezier(0.16, 0.84, 0.44, 1) forwards;
++	opacity: 0;
++}
++
++@keyframes confetti-fly {
++	0%   { transform: translate(0, 0) rotate(0deg) scale(1); opacity: 1; }
++	100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(0.7); opacity: 0; }
++}
++
++/* Toast action button (undo etc.) */
++.toast {
++	align-items: center;
++}
++
++.toast__action {
++	background: rgba(255, 255, 255, 0.14);
++	border: 1px solid rgba(255, 255, 255, 0.28);
++	color: #fff;
++	font-family: inherit;
++	font-size: 0.78rem;
++	font-weight: 700;
++	padding: 4px 12px;
++	border-radius: 999px;
++	cursor: pointer;
++	margin-left: 8px;
++	flex-shrink: 0;
++	transition: background 140ms ease, transform 140ms ease;
++}
++
++.toast__action:hover {
++	background: rgba(255, 255, 255, 0.24);
++	transform: scale(1.04);
++}
++
++/* Playlist drag & drop */
++.download-card--dragging {
++	opacity: 0.45;
++	transform: scale(0.99);
++}
++
++.download-card--drop-target {
++	border-color: var(--accent);
++	box-shadow: 0 0 0 2px rgba(124, 58, 237, 0.25);
++}
++
++.download-card {
++	transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
++}
++
++/* Count-up subtle pulse on change */
++.usage-card__value--bump {
++	animation: value-bump 400ms ease;
++}
++
++@keyframes value-bump {
++	0%   { transform: scale(1); }
++	40%  { transform: scale(1.12); }
++	100% { transform: scale(1); }
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index cd604d0..06e584c 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -50,6 +50,8 @@ import TranscriptsPage from './pages/Transcripts';
+ import CommandPalette from './components/CommandPalette';
+ import DownloadDock from './components/DownloadDock';
+ import ShortcutsModal from './components/ShortcutsModal';
++import ConfettiBurst from './components/ConfettiBurst';
++import Skeleton from './components/Skeleton';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -541,13 +543,25 @@ function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMod
+   );
+ }
+ 
+-function ToastStack({ toasts }) {
++function ToastStack({ toasts, onDismiss }) {
+   return (
+     <div className="toast-stack" aria-live="polite" aria-atomic="true">
+       {toasts.map((toast) => (
+         <div key={toast.id} className={`toast toast--${toast.type}`}>
+           <span className="toast__dot" />
+           <span>{toast.message}</span>
++          {toast.action ? (
++            <button
++              className="toast__action"
++              type="button"
++              onClick={() => {
++                toast.action.onClick();
++                onDismiss(toast.id);
++              }}
++            >
++              {toast.action.label}
++            </button>
++          ) : null}
+         </div>
+       ))}
+     </div>
+@@ -2422,7 +2436,7 @@ function HistoryPage({ downloads, onDeleteDownload, onRetryDownload, onCancelDow
+   );
+ }
+ 
+-function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist }) {
++function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist, filesReady }) {
+   const [query, setQuery] = useState('');
+   const [selectedFile, setSelectedFile] = useState(null);
+   const [suppressedPreviewFilename, setSuppressedPreviewFilename] = useState('');
+@@ -2811,7 +2825,20 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+       ) : null}
+ 
+       <section className="panel panel--list">
+-        {filtered.length === 0 ? (
++        {!filesReady && filtered.length === 0 ? (
++          <div className="library-grid" aria-busy="true">
++            {[0, 1, 2, 3, 4, 5].map((i) => (
++              <div key={i} className="skeleton-card">
++                <Skeleton className="skeleton-thumb" />
++                <div className="skeleton-lines">
++                  <Skeleton />
++                  <Skeleton />
++                  <Skeleton />
++                </div>
++              </div>
++            ))}
++          </div>
++        ) : filtered.length === 0 ? (
+           <div className="empty-state">
+             <LibraryBig size={32} />
+             <p>Your library is empty.</p>
+@@ -2842,6 +2869,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcriptCount }) {
+   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length;
+   const themeIsDark = theme === 'dark';
++  const animatedBytes = useCountUp(storageBytes ?? 0);
+ 
+   return (
+     <aside className="sidebar">
+@@ -2915,18 +2943,47 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcr
+         </button>
+         <div className="usage-card">
+           <div className="usage-card__label">Storage</div>
+-          <div className="usage-card__value">{storageBytes === null ? 'Loading...' : formatBytes(storageBytes)}</div>
++          <div className="usage-card__value">
++            {storageBytes === null ? 'Loading...' : formatBytes(Math.round(animatedBytes))}
++          </div>
+         </div>
+       </div>
+     </aside>
+   );
+ }
+ 
++function useCountUp(target, duration = 700) {
++  const [value, setValue] = useState(target);
++  const prevRef = useRef(target);
++  useEffect(() => {
++    const from = prevRef.current;
++    const to = Number(target) || 0;
++    if (from === to) return undefined;
++    const start = performance.now();
++    let raf;
++    const tick = (now) => {
++      const t = Math.min(1, (now - start) / duration);
++      const eased = 1 - Math.pow(1 - t, 3);
++      setValue(from + (to - from) * eased);
++      if (t < 1) {
++        raf = requestAnimationFrame(tick);
++      } else {
++        prevRef.current = to;
++      }
++    };
++    raf = requestAnimationFrame(tick);
++    return () => cancelAnimationFrame(raf);
++  }, [target, duration]);
++  return value;
++}
++
+ export default function App() {
+   const [downloads, setDownloads] = useState([]);
+   const [files, setFiles] = useState([]);
++  const [filesReady, setFilesReady] = useState(false);
+   const [toasts, setToasts] = useState([]);
+   const [downloadNotification, setDownloadNotification] = useState(null);
++  const [celebrateId, setCelebrateId] = useState(0);
+   const [accessPassword, setAccessPassword] = useState('');
+   const [accessError, setAccessError] = useState('');
+   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
+@@ -2958,9 +3015,9 @@ export default function App() {
+   // use module-level `isMobileDevice` defined above so components declared earlier can reference it
+   const [currentTaskId, setCurrentTaskId] = useState(null);
+ 
+-  const pushToast = useCallback((message, type = 'info', duration = 3600) => {
++  const pushToast = useCallback((message, type = 'info', duration = 3600, action = null) => {
+     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+-    setToasts((current) => [...current, { id, message, type }].slice(-4));
++    setToasts((current) => [...current, { id, message, type, action }].slice(-4));
+     const timer = window.setTimeout(() => {
+       setToasts((current) => current.filter((toast) => toast.id !== id));
+     }, duration);
+@@ -3004,6 +3061,7 @@ export default function App() {
+     try {
+       const response = await api.get('/files');
+       setFiles(Array.isArray(response.data?.files) ? response.data.files : []);
++      setFilesReady(true);
+     } catch {
+       // polling should stay quiet on transient failures
+     }
+@@ -3075,6 +3133,8 @@ export default function App() {
+       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
+         const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
+         if (isRecentlyCompleted) {
++          // Celebration confetti for each freshly completed download.
++          setCelebrateId((id) => id + 1);
+           const isTemporaryInstagramDownload = String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/');
+           pushToast(
+             isTemporaryInstagramDownload ? 'Instagram post saved temporarily' : 'Video saved to your Library',
+@@ -3408,7 +3468,7 @@ export default function App() {
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+-          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
++          <Route path="/library" element={<LibraryPage files={files} filesReady={filesReady} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+           <Route path="/transcripts" element={<TranscriptsPage onNotify={pushToast} onTranscriptsChanged={refreshTranscriptCount} />} />
+           <Route path="/photos" element={<PhotosPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onNotify={pushToast} />} />
+@@ -3440,7 +3500,10 @@ export default function App() {
+           </div>
+         </>
+       ) : null}
+-      <ToastStack toasts={toasts} />
++      <ToastStack
++        toasts={toasts}
++        onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}
++      />
+ 
+       {playlistPickerRequest ? (
+         <PlaylistPicker
+@@ -3470,6 +3533,7 @@ export default function App() {
+       />
+       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+       <DownloadDock downloads={downloads} onCancel={cancelDownload} />
++      <ConfettiBurst burstId={celebrateId} />
+ 
+       {showScrollTop ? (
+         <button className="scroll-top-btn" type="button" onClick={scrollMainToTop} title="Scroll to top" aria-label="Scroll to top">
+diff --git a/frontend/src/components/ConfettiBurst.jsx b/frontend/src/components/ConfettiBurst.jsx
+new file mode 100644
+index 0000000..c43acff
+--- /dev/null
++++ b/frontend/src/components/ConfettiBurst.jsx
+@@ -0,0 +1,57 @@
++import { useEffect, useRef, useState } from 'react';
++
++const COLORS = ['#8b5cf6', '#22d3ee', '#34d399', '#f472b6', '#fbbf24', '#6366f1'];
++
++/**
++ * A small celebratory confetti burst, fired whenever `burstId` changes.
++ * Renders ~26 particles that fly up/out from the bottom of the screen and fade.
++ */
++export default function ConfettiBurst({ burstId = 0 }) {
++  const [particles, setParticles] = useState([]);
++  const timerRef = useRef(null);
++
++  useEffect(() => {
++    if (!burstId) return undefined;
++    const pieces = Array.from({ length: 26 }, (_, i) => {
++      const angle = Math.PI * (0.12 + 0.76 * (i / 25)) + (Math.random() - 0.5) * 0.2;
++      const distance = 120 + Math.random() * 320;
++      const dx = Math.cos(angle) * distance;
++      const dy = -(Math.sin(angle) * distance) - 60;
++      return {
++        id: `${burstId}-${i}-${Math.random().toString(36).slice(2)}`,
++        left: 18 + Math.random() * 64, // near the dock (bottom-right area)
++        dx,
++        dy,
++        rot: (Math.random() - 0.5) * 900,
++        dur: 0.9 + Math.random() * 0.6,
++        color: COLORS[i % COLORS.length],
++      };
++    });
++    setParticles(pieces);
++    timerRef.current = window.setTimeout(() => setParticles([]), 1800);
++    return () => {
++      if (timerRef.current) window.clearTimeout(timerRef.current);
++    };
++  }, [burstId]);
++
++  if (!particles.length) return null;
++
++  return (
++    <div className="confetti-burst" aria-hidden="true">
++      {particles.map((p) => (
++        <span
++          key={p.id}
++          className="confetti-piece"
++          style={{
++            left: `${p.left}%`,
++            background: p.color,
++            '--dx': `${p.dx}px`,
++            '--dy': `${p.dy}px`,
++            '--rot': `${p.rot}deg`,
++            '--dur': `${p.dur}s`,
++          }}
++        />
++      ))}
++    </div>
++  );
++}
+diff --git a/frontend/src/components/Skeleton.jsx b/frontend/src/components/Skeleton.jsx
+new file mode 100644
+index 0000000..2ab0538
+--- /dev/null
++++ b/frontend/src/components/Skeleton.jsx
+@@ -0,0 +1,3 @@
++export default function Skeleton({ className = '' }) {
++  return <div className={`skeleton ${className}`} aria-hidden="true" />;
++}
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index 0fe7196..6bf60f2 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -159,6 +159,42 @@ export default function PlaylistPage({ files = [], onNotify }) {
+   const [addNewName, setAddNewName] = useState('');
+   const [isAdding, setIsAdding] = useState(false);
+ 
++  // Drag & drop reordering
++  const suppressClickRef = useRef(false);
++  const [dragIndex, setDragIndex] = useState(null);
++  const [dragOverIndex, setDragOverIndex] = useState(null);
++
++  const handleDragStart = (index) => (event) => {
++    setDragIndex(index);
++    event.dataTransfer.effectAllowed = 'move';
++    event.dataTransfer.setData('text/plain', String(index));
++  };
++
++  const handleDragOver = (index) => (event) => {
++    event.preventDefault();
++    if (dragIndex !== null && dragOverIndex !== index) setDragOverIndex(index);
++  };
++
++  const handleDrop = (index) => async (event) => {
++    event.preventDefault();
++    const from = dragIndex;
++    setDragIndex(null);
++    setDragOverIndex(null);
++    if (from === null || from === index || from < 0 || from >= playlist.length) return;
++    // The browser fires a click after drop — suppress it so dropping doesn't start playback.
++    suppressClickRef.current = true;
++    const next = [...playlist];
++    const [moved] = next.splice(from, 1);
++    next.splice(index, 0, moved);
++    setCurrentIndex(0);
++    saveOrder(next);
++  };
++
++  const handleDragEnd = () => {
++    setDragIndex(null);
++    setDragOverIndex(null);
++  };
++
+   // Player state
+   const [currentIndex, setCurrentIndex] = useState(0);
+   const [isPlaying, setIsPlaying] = useState(false);
+@@ -873,16 +909,27 @@ export default function PlaylistPage({ files = [], onNotify }) {
+             {playlistFiles.map((file, index) => (
+               <article
+                 key={`${file.filename}-${index}`}
+-                className={`download-card ${index === currentIndex ? 'download-card--active' : ''}`}
++                className={`download-card ${index === currentIndex ? 'download-card--active' : ''} ${dragIndex === index ? 'download-card--dragging' : ''} ${dragOverIndex === index ? 'download-card--drop-target' : ''}`}
+                 role="button"
+                 tabIndex={0}
+-                onClick={() => playIndex(index)}
++                draggable
++                onClick={() => {
++                  if (suppressClickRef.current) {
++                    suppressClickRef.current = false;
++                    return;
++                  }
++                  playIndex(index);
++                }}
+                 onKeyDown={(event) => {
+                   if (event.key === 'Enter' || event.key === ' ') {
+                     event.preventDefault();
+                     playIndex(index);
+                   }
+                 }}
++                onDragStart={handleDragStart(index)}
++                onDragOver={handleDragOver(index)}
++                onDrop={handleDrop(index)}
++                onDragEnd={handleDragEnd}
+               >
+                 <PlaylistThumb file={file} />
+                 <div className="download-card__body">
+diff --git a/frontend/src/pages/Transcripts.jsx b/frontend/src/pages/Transcripts.jsx
+index d176cd8..a202a0a 100644
+--- a/frontend/src/pages/Transcripts.jsx
++++ b/frontend/src/pages/Transcripts.jsx
+@@ -14,6 +14,7 @@ import {
+   X,
+ } from 'lucide-react';
+ import { api } from '../lib/api';
++import Skeleton from '../components/Skeleton';
+ 
+ const folderLabel = (folder = '') => (folder && folder.trim() ? folder.trim() : 'General');
+ 
+@@ -55,8 +56,8 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+   const [copyAllStatus, setCopyAllStatus] = useState(false);
+   const [confirmClearAll, setConfirmClearAll] = useState(false);
+ 
+-  const notify = useCallback((message, type = 'info') => {
+-    if (onNotify) onNotify(message, type);
++  const notify = useCallback((message, type = 'info', duration = 3600, action = null) => {
++    if (onNotify) onNotify(message, type, duration, action);
+   }, [onNotify]);
+ 
+   const loadItems = useCallback(async () => {
+@@ -213,12 +214,34 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+   };
+ 
+   const handleDelete = async (id) => {
++    const item = items.find((entry) => entry.id === id);
+     try {
+       await api.delete(`/transcript-saver/${id}`);
+       if (expandedId === id) setExpandedId(null);
+       if (editingId === id) setEditingId(null);
+       await refresh();
+-      notify('Transcript deleted', 'info');
++      // Offer undo while the toast is visible.
++      if (item) {
++        notify('Transcript deleted', 'info', 6000, {
++          label: 'Undo',
++          onClick: async () => {
++            try {
++              await api.post('/transcript-saver', {
++                title: item.title || 'Transcript',
++                text: item.text || '',
++                url: item.url || '',
++                folder: item.folder || '',
++              });
++              await refresh();
++              notify('Transcript restored', 'success');
++            } catch {
++              notify('Could not restore transcript', 'error');
++            }
++          },
++        });
++      } else {
++        notify('Transcript deleted', 'info');
++      }
+     } catch (err) {
+       notify(err?.response?.data?.detail || 'Unable to delete transcript.', 'error');
+     }
+@@ -370,8 +393,19 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+           <span className="panel__badge">{filtered.length}</span>
+         </div>
+ 
+-        {loading ? (
+-          <div className="empty-state"><p>Loading transcripts…</p></div>
++        {loading && items.length === 0 ? (
++          <div className="stack-list" aria-busy="true">
++            {[0, 1, 2].map((i) => (
++              <div key={i} className="skeleton-card">
++                <Skeleton className="skeleton-thumb" />
++                <div className="skeleton-lines">
++                  <Skeleton />
++                  <Skeleton />
++                  <Skeleton />
++                </div>
++              </div>
++            ))}
++          </div>
+         ) : items.length === 0 ? (
+           <div className="empty-state">
+             <p>
