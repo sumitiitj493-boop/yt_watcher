@@ -1,0 +1,1671 @@
+diff --git a/PLAYLIST_BATCH_FEATURE.md b/PLAYLIST_BATCH_FEATURE.md
+new file mode 100644
+index 0000000..0aa088e
+--- /dev/null
++++ b/PLAYLIST_BATCH_FEATURE.md
+@@ -0,0 +1,91 @@
++# Playlist Batch Download — New Feature
++
++Download any range (or specific videos) of a YouTube playlist with **just the playlist
++link** — no need to paste every video URL. Each video goes through the download queue
++**one by one**, and every finished video is **auto-saved into a playlist you choose**
++(your existing playlists or a brand-new one).
++
++---
++
++## How to use it (Download page)
++
++1. Open the **Download** page in the app.
++2. Scroll to the **"Download a Range from a Playlist"** panel (at the bottom).
++3. Paste **one playlist link**, e.g. `https://www.youtube.com/playlist?list=...`
++   → click **Load playlist**. The app lists every video with its number, title and length.
++4. Pick what to download:
++   - **Range** → enter `From #` and `To #` → **Add range**
++   - **Specific numbers** → type `1, 3, 5-8` → **Add**
++   - Or just **tick/untick** any videos in the list
++5. Choose **quality**, **format**, and under **"Auto-save into which playlist?"** pick
++   one of your existing playlists (or **Create new playlist…**).
++6. Keep **"Download one by one"** checked to wait for each video before starting the next.
++   (Uncheck it to push everything into the queue at once.)
++7. Click **Download N videos**.
++
++The batch progress card shows every video's status (Waiting → Queued → Downloading →
++Done → *In "My Playlist"*), overall progress, cancel / retry-failed / new-batch buttons,
++and refreshes your Library automatically as files land.
++
++---
++
++## New backend endpoints
++
++| Method | Endpoint                          | Purpose                                             |
++| ------ | --------------------------------- | --------------------------------------------------- |
++| POST   | `/api/playlist/entries`           | Resolve all videos of a playlist from a single URL  |
++| POST   | `/api/playlist/download`          | Queue selected indices as a batch (sequential or parallel) |
++| GET    | `/api/playlist/batches`           | List recent batches                                 |
++| GET    | `/api/playlist/batches/{id}`      | Live status of one batch (per-video progress)       |
++| POST   | `/api/playlist/batches/{id}/cancel` | Cancel queued/running tasks in a batch             |
++| POST   | `/api/playlist/batches/{id}/retry` | Re-queue the failed/cancelled videos               |
++
++`POST /api/playlist/download` body:
++
++```json
++{
++  "url": "https://www.youtube.com/playlist?list=...",
++  "indices": [1, 2, 3],
++  "quality": "1080",
++  "format": "mp4",
++  "target_playlist_id": 1,
++  "sequential": true
++}
++```
++
++`target_playlist_id` is any local playlist id from `GET /api/playlists` (or `null` to skip auto-save).
++
++---
++
++## Files changed
++
++**Backend**
++- `backend/services/playlist_batch.py` *(new)* — playlist resolution, batch store,
++  per-batch supervisor, auto-save hook.
++- `backend/routes/playlist_batch.py` *(new)* — API endpoints.
++- `backend/models.py` — `PlaylistEntriesRequest`, `PlaylistDownloadRequest`.
++- `backend/main.py` — register the new router.
++
++**Frontend**
++- `frontend/src/App.jsx` — the batch panel UI + handlers + live polling.
++- `frontend/src/App.css` — panel styles.
++- `frontend/vite.config.js` — `allowedHosts: true` so preview/tunnel hosts work in dev.
++
++**Test**
++- `testing/test_playlist_batch_autosave.py` *(new)* — in-process end-to-end test of the
++  auto-save path (run from the project root: `python testing/test_playlist_batch_autosave.py`).
++
++---
++
++## Notes & limits
++
++- Only the playlist **link** is needed; the backend resolves the video list itself.
++  Unavailable/private entries are skipped but don't break the rest.
++- Batches are stored **in memory** (same as the download queue), so restarting the
++  backend clears active batch tracking — in-flight downloads themselves are still safe
++  (they persist in the download history).
++- Videos that fail (e.g. members-only without cookies) are marked **Failed**; use
++  **Retry failed** after fixing the cause (e.g. adding `youtube_cookies.txt`).
++- Each downloaded video becomes a normal entry in your **Library** and download
++  **History** too — it is only *additionally* linked into the chosen playlist.
++- Large playlists are fetched in "flat" mode, so loading hundreds of videos is fast.
+diff --git a/backend/main.py b/backend/main.py
+index d231c98..245d662 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from starlette.middleware.base import BaseHTTPMiddleware
+ from starlette.responses import JSONResponse
+ 
+-from routes import about, download, library, stream
++from routes import about, download, library, playlist_batch, stream
+ from services.database import init_db
+ from services.downloader import resume_pending_downloads
+ 
+@@ -137,6 +137,7 @@ app.add_middleware(PasswordProtectionMiddleware)
+ app.include_router(download.router, prefix="/api")
+ app.include_router(about.router, prefix="/api")
+ app.include_router(library.router, prefix="/api")
++app.include_router(playlist_batch.router, prefix="/api")
+ app.include_router(stream.router, prefix="/api")
+ 
+ 
+diff --git a/backend/models.py b/backend/models.py
+index a9a3054..bceb908 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -29,6 +29,42 @@ class MetadataRequest(BaseModel):
+     url: HttpUrl
+ 
+ 
++class PlaylistEntriesRequest(BaseModel):
++    """Request the full entry list of a playlist from a single playlist URL."""
++    url: HttpUrl
++
++
++class PlaylistDownloadRequest(BaseModel):
++    """Queue selected videos from a playlist as a batch download.
++
++    ``indices`` are 1-based positions in the playlist (e.g. [3, 4, 5] for
++    videos 3 to 5, or [1, 3, 7] for specific videos). The user only ever
++    pastes the playlist link — the backend resolves each video itself.
++    """
++    url: HttpUrl
++    indices: list[int] = Field(default_factory=list)
++    quality: str = Field(default="best")
++    format: str = Field(default="mp4")
++    target_playlist_id: int | None = Field(default=None)
++    sequential: bool = Field(default=True)
++
++    @field_validator("format")
++    @classmethod
++    def validate_format(cls, value: str) -> str:
++        normalized = value.strip().lower()
++        if normalized not in ALLOWED_FORMATS:
++            raise ValueError("Unsupported format")
++        return normalized
++
++    @field_validator("quality")
++    @classmethod
++    def validate_quality(cls, value: str) -> str:
++        normalized = value.strip().lower().replace("p", "")
++        if normalized not in ALLOWED_QUALITIES:
++            raise ValueError("Unsupported quality")
++        return normalized
++
++
+ class TranscriptUrlRequest(BaseModel):
+     url: HttpUrl
+     force: bool = Field(default=False)
+diff --git a/backend/routes/playlist_batch.py b/backend/routes/playlist_batch.py
+new file mode 100644
+index 0000000..5082dc6
+--- /dev/null
++++ b/backend/routes/playlist_batch.py
+@@ -0,0 +1,84 @@
++"""Playlist batch download endpoints.
++
++A single playlist link is enough: the backend resolves the video list,
++enqueues each selected video as its own download task, and auto-saves
++finished files into a user-chosen local playlist.
++"""
++
++import asyncio
++
++from fastapi import APIRouter, HTTPException
++
++from models import PlaylistDownloadRequest, PlaylistEntriesRequest
++from services.playlist_batch import (
++    cancel_batch,
++    create_batch,
++    get_batch,
++    list_batches,
++    list_playlist_entries_sync,
++    retry_batch,
++)
++from services.url_guard import validate_public_url
++
++router = APIRouter()
++
++
++@router.post("/playlist/entries")
++async def playlist_entries(request: PlaylistEntriesRequest):
++    """List every video in a playlist (single URL, no per-video links needed)."""
++    try:
++        safe_url = await validate_public_url(str(request.url))
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    try:
++        return await asyncio.to_thread(list_playlist_entries_sync, safe_url)
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail=f"Unable to read playlist: {exc}")
++
++
++@router.post("/playlist/download")
++async def playlist_download(request: PlaylistDownloadRequest):
++    """Enqueue the selected range/specific videos as a batch download."""
++    try:
++        batch = await create_batch(
++            str(request.url),
++            request.indices,
++            request.quality,
++            request.format,
++            request.target_playlist_id,
++            request.sequential,
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    return {
++        "message": "Playlist batch queued",
++        "batch_id": batch["id"],
++        "task_count": batch["total_count"],
++    }
++
++
++@router.get("/playlist/batches")
++async def playlist_batches_list():
++    return {"batches": list_batches()}
++
++
++@router.get("/playlist/batches/{batch_id}")
++async def playlist_batch_status(batch_id: str):
++    batch = get_batch(batch_id)
++    if not batch:
++        raise HTTPException(status_code=404, detail="Batch not found")
++    return batch
++
++
++@router.post("/playlist/batches/{batch_id}/cancel")
++async def playlist_batch_cancel(batch_id: str):
++    if not cancel_batch(batch_id):
++        raise HTTPException(status_code=404, detail="Batch not found")
++    return {"message": "Cancel requested"}
++
++
++@router.post("/playlist/batches/{batch_id}/retry")
++async def playlist_batch_retry(batch_id: str):
++    if not await retry_batch(batch_id):
++        raise HTTPException(status_code=404, detail="Batch not found")
++    return {"message": "Retry queued"}
+diff --git a/backend/services/playlist_batch.py b/backend/services/playlist_batch.py
+new file mode 100644
+index 0000000..f86c35d
+--- /dev/null
++++ b/backend/services/playlist_batch.py
+@@ -0,0 +1,460 @@
++"""Playlist batch downloads.
++
++When the user pastes a single playlist link, this module:
++
++  1. Resolves the full list of videos in the playlist (no per-video URLs needed).
++  2. Lets the caller pick a range / specific indices.
++  3. Queues each selected video as its own download-queue task
++     (one-by-one / sequential by default, optional parallel).
++  4. Automatically adds every successfully downloaded file into a
++     user-chosen local playlist ("My Playlist", "Workout Mix", ...).
++
++Batch state lives in memory (same design as ``download_tasks``) and is
++reconciled against the global download queue by a per-batch supervisor task.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Any
++
++import yt_dlp
++
++from services.database import add_playlist_item, list_playlists
++from services.downloader import (
++    ACTIVE_STATUSES,
++    TERMINAL_STATUSES,
++    download_tasks,
++    initiate_download,
++    request_cancel,
++)
++from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, apply_reliable_ytdlp_options
++
++_MAX_PLAYLIST_ENTRIES = 5000
++_POLL_INTERVAL_SECONDS = 1.0
++
++_LOCK = threading.RLock()
++_BATCHES: dict[str, dict] = {}
++
++
++def _duration_label(seconds: int | None) -> str:
++    if not seconds:
++        return ""
++    seconds = int(seconds)
++    hours = seconds // 3600
++    minutes = (seconds % 3600) // 60
++    secs = seconds % 60
++    if hours:
++        return f"{hours}:{minutes:02d}:{secs:02d}"
++    return f"{minutes}:{secs:02d}"
++
++
++def _best_thumb(entry: dict) -> str:
++    thumbnails = entry.get("thumbnails") or []
++    if thumbnails:
++        best = sorted(
++            thumbnails,
++            key=lambda item: (item.get("width") or 0) * (item.get("height") or 0),
++        )[-1]
++        return best.get("url") or entry.get("thumbnail") or ""
++    return entry.get("thumbnail") or ""
++
++
++def list_playlist_entries_sync(url: str) -> dict[str, Any]:
++    """Resolve every video in a playlist from a single playlist URL.
++
++    Uses yt-dlp's flat extraction, which is fast even for long playlists and
++    does not download any media. Unavailable/private entries are skipped but
++    do not break the rest of the list.
++    """
++    ydl_opts = {
++        "quiet": True,
++        "skip_download": True,
++        "extract_flat": "in_playlist",
++        "ignoreerrors": True,
++        "playlistend": _MAX_PLAYLIST_ENTRIES,
++        "nocheckcertificate": False,
++        "geo_bypass": True,
++        "http_headers": PUBLIC_HTTP_HEADERS,
++    }
++    apply_reliable_ytdlp_options(ydl_opts, url)
++
++    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
++        info = ydl.extract_info(url, download=False)
++
++    entries = info.get("entries") if isinstance(info, dict) else None
++    if not entries:
++        return {"is_playlist": False, "playlist_title": "", "count": 0, "entries": []}
++
++    result: list[dict] = []
++    for index, entry in enumerate(entries or [], start=1):
++        if not entry or not isinstance(entry, dict):
++            continue
++        video_id = entry.get("id")
++        title = entry.get("title")
++        if not video_id or not title:
++            continue
++        result.append({
++            "index": index,
++            "id": video_id,
++            "title": title,
++            "duration": entry.get("duration"),
++            "duration_label": _duration_label(entry.get("duration")),
++            "thumbnail": _best_thumb(entry),
++            "url": entry.get("webpage_url")
++            or entry.get("url")
++            or f"https://www.youtube.com/watch?v={video_id}",
++        })
++
++    return {
++        "is_playlist": True,
++        "url": url,
++        "playlist_title": info.get("title") or "Playlist",
++        "uploader": info.get("uploader") or info.get("channel") or "",
++        "count": len(result),
++        "entries": result,
++    }
++
++
++# --------------------------------------------------------------------------
++# Batch store
++# --------------------------------------------------------------------------
++def _public_batch(batch: dict) -> dict:
++    tasks = []
++    for item in batch.get("tasks", []):
++        tasks.append({
++            "index": item.get("index"),
++            "id": item.get("id"),
++            "title": item.get("title"),
++            "duration_label": item.get("duration_label") or "",
++            "status": item.get("status"),
++            "task_id": item.get("task_id"),
++            "percent": item.get("percent"),
++            "progress": item.get("progress"),
++            "filename": item.get("filename"),
++            "error": item.get("error"),
++            "added": item.get("added", False),
++            "auto_add_error": item.get("auto_add_error"),
++        })
++    return {
++        "id": batch.get("id"),
++        "url": batch.get("url"),
++        "playlist_title": batch.get("playlist_title"),
++        "quality": batch.get("quality"),
++        "format": batch.get("format"),
++        "target_playlist_id": batch.get("target_playlist_id"),
++        "target_playlist_name": batch.get("target_playlist_name") or "",
++        "sequential": batch.get("sequential", True),
++        "created_at": batch.get("created_at"),
++        "phase": batch.get("phase"),
++        "total_count": batch.get("total_count", 0),
++        "done_count": batch.get("done_count", 0),
++        "completed_count": batch.get("completed_count", 0),
++        "failed_count": batch.get("failed_count", 0),
++        "added_count": batch.get("added_count", 0),
++        "tasks": tasks,
++    }
++
++
++def get_batch(batch_id: str) -> dict | None:
++    with _LOCK:
++        batch = _BATCHES.get(batch_id)
++        return _public_batch(batch) if batch else None
++
++
++def list_batches() -> list[dict]:
++    with _LOCK:
++        ordered = sorted(
++            _BATCHES.values(),
++            key=lambda item: item.get("created_at", 0),
++            reverse=True,
++        )
++        return [_public_batch(batch) for batch in ordered]
++
++
++def _update_phase(batch: dict) -> None:
++    statuses = [item.get("status", "planned") for item in batch.get("tasks", [])]
++    total = len(statuses)
++    done = sum(1 for status in statuses if status in TERMINAL_STATUSES)
++    completed = sum(1 for status in statuses if status == "completed")
++    failed = sum(1 for status in statuses if status in ("error", "cancelled"))
++
++    batch["total_count"] = total
++    batch["done_count"] = done
++    batch["completed_count"] = completed
++    batch["failed_count"] = failed
++
++    if batch.get("cancel_requested"):
++        batch["phase"] = "cancelled" if done == total else "cancelling"
++    elif done == total:
++        batch["phase"] = "completed" if failed == 0 else "partial"
++    else:
++        batch["phase"] = "running"
++
++
++def _add_to_target_playlist(batch: dict, item: dict, filename: str) -> None:
++    """Auto-save a finished download into the chosen local playlist."""
++    playlist_id = batch.get("target_playlist_id")
++    if not playlist_id or not filename or item.get("added"):
++        return
++    try:
++        add_playlist_item(playlist_id, filename)
++        item["added"] = True
++        batch["added_count"] = batch.get("added_count", 0) + 1
++    except Exception as exc:  # noqa: BLE001 -- surface as a friendly note
++        item["auto_add_error"] = f"Saved to disk but could not be added to the playlist: {exc}"
++
++
++async def _enqueue_one(batch: dict, item: dict) -> None:
++    try:
++        task_id = await initiate_download(item["url"], batch["quality"], batch["format"])
++    except Exception as exc:  # noqa: BLE001
++        item["status"] = "error"
++        item["error"] = str(exc)
++        return
++    item["task_id"] = task_id
++    item["status"] = download_tasks.get(task_id, {}).get("status", "queued")
++    with _LOCK:
++        batch["enqueued_count"] = batch.get("enqueued_count", 0) + 1
++
++
++def _reconcile(batch: dict) -> dict | None:
++    """Sync one batch against the global download queue.
++
++    Returns the next item that should be enqueued (sequential batches), or
++    ``None``. Kept as a plain function so it is easy to unit test.
++    """
++    to_enqueue = None
++
++    # 1) Sync task states with the global queue.
++    for item in batch.get("tasks", []):
++        task_id = item.get("task_id")
++        task = download_tasks.get(task_id) if task_id else None
++        if task is None:
++            # Only tasks that WERE enqueued should be flagged if the
++            # queue record vanished. Planned items (sequential batches
++            # that haven't started yet) simply have no task_id yet.
++            if item.get("task_id") and item.get("status") in ACTIVE_STATUSES:
++                item["status"] = "error"
++                item["error"] = item.get("error") or "Download task is no longer available"
++            continue
++        item["status"] = task.get("status", item["status"])
++        item["percent"] = task.get("percent", "")
++        item["progress"] = task.get("progress")
++        if task.get("status") == "completed":
++            filename = Path(str(task.get("filename") or "")).name
++            if filename:
++                item["filename"] = filename
++            _add_to_target_playlist(batch, item, filename)
++        elif task.get("status") == "error":
++            item["error"] = task.get("error") or task.get("last_error")
++        elif task.get("status") == "cancelled":
++            item["error"] = item.get("error") or "Cancelled"
++
++    # 2) Sequential batches: start the next video only once nothing from
++    #    this batch is still downloading (true one-by-one behaviour).
++    if batch.get("sequential") and not batch.get("cancel_requested"):
++        next_index = batch.get("next_to_enqueue", 0)
++        if next_index < len(batch.get("tasks", [])):
++            any_active = any(
++                download_tasks.get(item.get("task_id"), {}).get("status") in ACTIVE_STATUSES
++                for item in batch.get("tasks", [])
++                if item.get("task_id")
++            )
++            if not any_active:
++                candidate = batch["tasks"][next_index]
++                if not candidate.get("task_id"):
++                    to_enqueue = candidate
++
++    _update_phase(batch)
++    return to_enqueue
++
++
++async def _supervise_batch(batch_id: str) -> None:
++    """Periodically reconcile batch tasks against the global download queue."""
++    while True:
++        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
++
++        with _LOCK:
++            batch = _BATCHES.get(batch_id)
++            if batch is None:
++                return
++            to_enqueue = _reconcile(batch)
++            finished = batch.get("phase") in ("completed", "partial", "cancelled")
++
++        if to_enqueue is not None:
++            await _enqueue_one(batch, to_enqueue)
++            with _LOCK:
++                current = _BATCHES.get(batch_id)
++                if current is not None:
++                    current["next_to_enqueue"] = current.get("next_to_enqueue", 0) + 1
++
++        if finished:
++            break
++
++    with _LOCK:
++        current = _BATCHES.get(batch_id)
++        if current is not None:
++            current["supervisor_active"] = False
++            # If a retry reset the batch while we were finishing, pick it up.
++            if current.get("phase") == "running" and not current.get("done"):
++                asyncio.create_task(_supervise_batch(batch_id))
++
++
++async def _ensure_supervisor(batch_id: str) -> None:
++    with _LOCK:
++        batch = _BATCHES.get(batch_id)
++        if not batch or batch.get("supervisor_active"):
++            return
++        batch["supervisor_active"] = True
++    asyncio.create_task(_supervise_batch(batch_id))
++
++
++async def create_batch(
++    url: str,
++    indices: list[int],
++    quality: str = "best",
++    format_ext: str = "mp4",
++    target_playlist_id: int | None = None,
++    sequential: bool = True,
++) -> dict:
++    """Create a batch download from a single playlist URL and enqueue it."""
++    from services.url_guard import validate_public_url
++
++    safe_url = await validate_public_url(str(url))
++
++    if target_playlist_id is not None and not any(
++        item.get("id") == target_playlist_id for item in list_playlists()
++    ):
++        raise ValueError("Target playlist not found")
++
++    data = await asyncio.to_thread(list_playlist_entries_sync, safe_url)
++    if not data.get("is_playlist"):
++        raise ValueError(
++            "This link is not a playlist. Paste a playlist URL "
++            "(e.g. https://www.youtube.com/playlist?list=...)."
++        )
++
++    entries_by_index = {entry["index"]: entry for entry in data.get("entries", [])}
++    clean_indices = sorted({int(index) for index in indices if int(index) in entries_by_index})
++    if not clean_indices:
++        raise ValueError("No valid videos selected from the playlist")
++
++    target_name = ""
++    if target_playlist_id is not None:
++        target_name = next(
++            (item.get("name", "") for item in list_playlists() if item.get("id") == target_playlist_id),
++            "",
++        )
++
++    batch_id = str(uuid.uuid4())
++    tasks = []
++    for index in clean_indices:
++        entry = entries_by_index[index]
++        tasks.append({
++            "index": index,
++            "id": entry["id"],
++            "title": entry["title"],
++            "duration_label": entry.get("duration_label") or "",
++            "url": entry["url"],
++            "task_id": None,
++            "status": "planned",
++            "percent": "",
++            "progress": None,
++            "filename": None,
++            "error": None,
++            "added": False,
++        })
++
++    batch = {
++        "id": batch_id,
++        "url": safe_url,
++        "playlist_title": data.get("playlist_title") or "Playlist",
++        "quality": str(quality).strip().lower(),
++        "format": str(format_ext).strip().lower(),
++        "target_playlist_id": target_playlist_id,
++        "target_playlist_name": target_name,
++        "sequential": bool(sequential),
++        "created_at": time.time(),
++        "tasks": tasks,
++        "total_count": len(tasks),
++        "done_count": 0,
++        "completed_count": 0,
++        "failed_count": 0,
++        "added_count": 0,
++        "enqueued_count": 0,
++        "next_to_enqueue": 0,
++        "phase": "running",
++        "cancel_requested": False,
++        "done": False,
++        "supervisor_active": False,
++    }
++
++    with _LOCK:
++        _BATCHES[batch_id] = batch
++
++    # Queue the work. Sequential mode starts only the first video; the
++    # supervisor chains the rest. Parallel mode enqueues everything at once
++    # and the global queue dispatcher throttles concurrency.
++    if sequential:
++        if tasks:
++            await _enqueue_one(batch, tasks[0])
++            with _LOCK:
++                _BATCHES[batch_id]["next_to_enqueue"] = 1
++    else:
++        for item in tasks:
++            await _enqueue_one(batch, item)
++
++    await _ensure_supervisor(batch_id)
++    return _BATCHES[batch_id]
++
++
++def cancel_batch(batch_id: str) -> bool:
++    """Cancel every queued/running task in a batch (planned ones never start)."""
++    with _LOCK:
++        batch = _BATCHES.get(batch_id)
++        if not batch:
++            return False
++        if batch.get("phase") in ("completed", "partial", "cancelled"):
++            return True
++        batch["cancel_requested"] = True
++        batch["phase"] = "cancelling"
++        for item in batch.get("tasks", []):
++            if item.get("status") in ("planned", "pending", "queued"):
++                item["status"] = "cancelled"
++                item["error"] = "Cancelled by user"
++            task_id = item.get("task_id")
++            if task_id and download_tasks.get(task_id, {}).get("status") in ACTIVE_STATUSES:
++                request_cancel(task_id)
++    return True
++
++
++async def retry_batch(batch_id: str) -> bool:
++    """Re-queue the failed/cancelled items of a finished or partial batch."""
++    with _LOCK:
++        batch = _BATCHES.get(batch_id)
++        if not batch:
++            return False
++        for item in batch.get("tasks", []):
++            if item.get("status") in ("error", "cancelled"):
++                item["status"] = "planned"
++                item["task_id"] = None
++                item["error"] = None
++                item["percent"] = ""
++                item["progress"] = None
++                item["added"] = False
++                item.pop("auto_add_error", None)
++        first_open = next(
++            (index for index, item in enumerate(batch["tasks"]) if item.get("status") != "completed"),
++            0,
++        )
++        batch["next_to_enqueue"] = first_open
++        batch["cancel_requested"] = False
++        batch["phase"] = "running"
++        batch["done"] = False
++    await _ensure_supervisor(batch_id)
++    return True
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 4d60590..8356bcb 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3655,3 +3655,260 @@ body[data-theme='dark'] .main-stage {
+ 	.photo-lightbox__nav--prev { left: 8px; }
+ 	.photo-lightbox__nav--next { right: 8px; }
+ }
++
++/* ==========================================================================
++   Playlist batch download (range/specific videos from one playlist link)
++   ========================================================================== */
++.playlist-batch-panel .panel__header {
++	margin-bottom: 18px;
++}
++
++.playlist-batch-url-row {
++	display: flex;
++	gap: 10px;
++}
++
++.playlist-batch-url-row .input {
++	flex: 1;
++}
++
++.playlist-batch-body {
++	margin-top: 16px;
++	display: grid;
++	gap: 14px;
++}
++
++.playlist-batch-summary {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.playlist-batch-summary__text {
++	display: flex;
++	flex-direction: column;
++	gap: 2px;
++	min-width: 0;
++}
++
++.playlist-batch-summary__meta {
++	color: var(--text-muted);
++	font-size: 0.86rem;
++}
++
++.playlist-batch-pick {
++	display: flex;
++	flex-wrap: wrap;
++	gap: 10px;
++	align-items: center;
++}
++
++.playlist-batch-pick__range,
++.playlist-batch-pick__typed,
++.playlist-batch-pick__actions {
++	display: flex;
++	align-items: center;
++	gap: 8px;
++}
++
++.input--num {
++	width: 92px;
++}
++
++.playlist-batch-list {
++	display: grid;
++	gap: 8px;
++	max-height: 320px;
++	overflow-y: auto;
++	padding-right: 4px;
++}
++
++.playlist-batch-row {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++	padding: 6px 10px;
++	border-radius: 14px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	cursor: pointer;
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.playlist-batch-row:hover {
++	border-color: var(--accent-strong);
++}
++
++.playlist-batch-row--checked {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.1);
++}
++
++.playlist-batch-row input[type='checkbox'] {
++	accent-color: var(--accent);
++	flex-shrink: 0;
++}
++
++.playlist-batch-row__index {
++	font-size: 0.78rem;
++	font-weight: 700;
++	color: var(--text-muted);
++	background: rgba(255, 255, 255, 0.06);
++	border: 1px solid var(--border);
++	border-radius: 999px;
++	padding: 2px 8px;
++	white-space: nowrap;
++	flex-shrink: 0;
++}
++
++.playlist-batch-row .media-thumb {
++	width: 88px;
++	height: 50px;
++	object-fit: cover;
++	border-radius: 10px;
++	flex-shrink: 0;
++	background: var(--surface-muted);
++}
++
++.playlist-batch-row__title {
++	flex: 1;
++	min-width: 0;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.playlist-batch-row__duration {
++	color: var(--text-muted);
++	font-size: 0.82rem;
++	white-space: nowrap;
++	flex-shrink: 0;
++}
++
++.playlist-batch-actions {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 12px;
++	flex-wrap: wrap;
++}
++
++.playlist-batch-seq {
++	display: inline-flex;
++	align-items: center;
++	gap: 8px;
++	color: var(--text-muted);
++	font-size: 0.9rem;
++	cursor: pointer;
++}
++
++.playlist-batch-seq input {
++	accent-color: var(--accent);
++}
++
++/* Batch progress card */
++.playlist-batch-progress {
++	margin-top: 18px;
++	padding-top: 18px;
++	border-top: 1px dashed var(--border);
++	display: grid;
++	gap: 12px;
++}
++
++.playlist-batch-progress__actions {
++	display: flex;
++	gap: 8px;
++	flex-wrap: wrap;
++}
++
++.playlist-batch-stats {
++	display: flex;
++	gap: 16px;
++	flex-wrap: wrap;
++	color: var(--text-muted);
++	font-size: 0.86rem;
++}
++
++.playlist-batch-tasks {
++	display: grid;
++	gap: 6px;
++	max-height: 340px;
++	overflow-y: auto;
++	padding-right: 4px;
++}
++
++.playlist-batch-task {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	padding: 8px 12px;
++	border-radius: 12px;
++	border: 1px solid var(--border);
++	background: var(--surface-muted);
++	flex-wrap: wrap;
++}
++
++.playlist-batch-task--completed {
++	border-color: rgba(34, 197, 94, 0.45);
++	background: rgba(34, 197, 94, 0.07);
++}
++
++.playlist-batch-task--error,
++.playlist-batch-task--cancelled {
++	border-color: rgba(239, 68, 68, 0.45);
++	background: rgba(239, 68, 68, 0.07);
++}
++
++.playlist-batch-task--downloading,
++.playlist-batch-task--starting,
++.playlist-batch-task--processing {
++	border-color: var(--accent);
++}
++
++.playlist-batch-task__index {
++	font-size: 0.76rem;
++	font-weight: 700;
++	color: var(--text-muted);
++	white-space: nowrap;
++	flex-shrink: 0;
++}
++
++.playlist-batch-task__title {
++	flex: 1;
++	min-width: 0;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++	font-size: 0.9rem;
++}
++
++.playlist-batch-task__flag {
++	display: inline-flex;
++	align-items: center;
++	gap: 5px;
++	color: var(--text-muted);
++	font-size: 0.8rem;
++	white-space: nowrap;
++	flex-shrink: 0;
++}
++
++.playlist-batch-task--completed .playlist-batch-task__flag {
++	color: #34d399;
++}
++
++.playlist-batch-task__flag--error {
++	color: #f87171;
++}
++
++.playlist-batch-task__err {
++	display: block;
++	flex-basis: 100%;
++	font-size: 0.76rem;
++	color: #f87171;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++	max-width: 100%;
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 6b7a1fe..027b67f 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -31,6 +31,10 @@ import {
+   Music2,
+   Plus,
+   SunMedium,
++  ListVideo,
++  ListOrdered,
++  CheckCircle2,
++  XCircle,
+ } from 'lucide-react';
+ 
+ import './App.css';
+@@ -39,7 +43,7 @@ import PlaylistPage from './pages/Playlist';
+ import PlaylistPicker from './components/PlaylistPicker';
+ import LibraryPicker from './components/LibraryPicker';
+ import AudioExtractorPage from './pages/AudioExtractor';
+-import PhotosPage from './pages/Photos';
++import PhotosPage from './pages/photos';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -731,6 +735,27 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [transcriptError, setTranscriptError] = useState('');
+   const [transcriptCopyStatus, setTranscriptCopyStatus] = useState('Copy Transcript');
+   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
++
++  // Playlist batch download (range/specific videos from one playlist link)
++  const [playlistUrl, setPlaylistUrl] = useState('');
++  const [playlistMeta, setPlaylistMeta] = useState(null);       // { is_playlist, url, playlist_title, count, entries[] }
++  const [playlistLoading, setPlaylistLoading] = useState(false);
++  const [playlistError, setPlaylistError] = useState('');
++  const [selectedIndices, setSelectedIndices] = useState(() => new Set());
++  const [rangeFrom, setRangeFrom] = useState('');
++  const [rangeTo, setRangeTo] = useState('');
++  const [typedSelection, setTypedSelection] = useState('');
++  const [plQuality, setPlQuality] = useState('1080');
++  const [plFormat, setPlFormat] = useState('mp4');
++  const [plPlaylists, setPlPlaylists] = useState([]);
++  const [plTarget, setPlTarget] = useState('');                 // '' = none, playlist id, or 'new'
++  const [plNewName, setPlNewName] = useState('');
++  const [plSequential, setPlSequential] = useState(true);
++  const [batchId, setBatchId] = useState(null);
++  const [batch, setBatch] = useState(null);
++  const [batchStarting, setBatchStarting] = useState(false);
++  const batchCompletedRef = useRef(0);
++  const stopPollingRef = useRef(false);
+   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
+   const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
+   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
+@@ -759,6 +784,245 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     }
+   }, [location, onStartDownload]);
+ 
++  // --- Playlist batch download handlers ---------------------------------
++  const batchTaskStatusLabel = (status) => {
++    const map = {
++      planned: 'Waiting',
++      pending: 'Queued',
++      queued: 'Queued',
++      starting: 'Starting',
++      downloading: 'Downloading',
++      processing: 'Processing',
++      completed: 'Done',
++      error: 'Failed',
++      cancelled: 'Cancelled',
++    };
++    return map[status] || status || '—';
++  };
++
++  useEffect(() => {
++    api.get('/playlists')
++      .then((res) => {
++        const list = Array.isArray(res.data?.playlists) ? res.data.playlists : [];
++        setPlPlaylists(list);
++        setPlTarget((current) => current || (list[0] ? String(list[0].id) : 'new'));
++      })
++      .catch(() => {
++        // Playlist list is optional; the batch can still run without it.
++      });
++  }, []);
++
++  const handleLoadPlaylist = async () => {
++    const trimmed = playlistUrl.trim();
++    if (!trimmed || playlistLoading) return;
++    setPlaylistLoading(true);
++    setPlaylistError('');
++    setPlaylistMeta(null);
++    setSelectedIndices(new Set());
++    try {
++      const res = await api.post('/playlist/entries', { url: trimmed });
++      const data = res.data || {};
++      if (!data.is_playlist) {
++        setPlaylistError('That link is not a playlist. Paste a playlist URL like https://www.youtube.com/playlist?list=...');
++        return;
++      }
++      setPlaylistMeta(data);
++      notify(`Playlist loaded: ${data.count} video${data.count === 1 ? '' : 's'}`, 'success');
++    } catch (err) {
++      setPlaylistError(safeFetchError(err, 'Unable to load playlist.'));
++    } finally {
++      setPlaylistLoading(false);
++    }
++  };
++
++  const toggleIndex = (index) => {
++    setSelectedIndices((current) => {
++      const next = new Set(current);
++      if (next.has(index)) next.delete(index);
++      else next.add(index);
++      return next;
++    });
++  };
++
++  const selectAllPlaylist = () => {
++    if (!playlistMeta?.entries?.length) return;
++    setSelectedIndices(new Set(playlistMeta.entries.map((entry) => entry.index)));
++  };
++
++  const clearPlaylistSelection = () => setSelectedIndices(new Set());
++
++  const applyRangeSelection = () => {
++    const from = parseInt(rangeFrom, 10);
++    const to = parseInt(rangeTo, 10);
++    if (!playlistMeta?.entries?.length || !Number.isFinite(from) || !Number.isFinite(to)) {
++      notify('Enter both a "From" and a "To" video number', 'error');
++      return;
++    }
++    const low = Math.min(from, to);
++    const high = Math.max(from, to);
++    const valid = playlistMeta.entries.filter((entry) => entry.index >= low && entry.index <= high);
++    if (!valid.length) {
++      notify(`No videos between #${low} and #${high}`, 'error');
++      return;
++    }
++    setSelectedIndices((current) => {
++      const next = new Set(current);
++      valid.forEach((entry) => next.add(entry.index));
++      return next;
++    });
++    notify(`Added ${valid.length} video${valid.length === 1 ? '' : 's'} (#${low}–#${high})`, 'success');
++  };
++
++  const applyTypedSelection = () => {
++    const text = typedSelection.trim();
++    if (!text) return;
++    const wanted = new Set();
++    const parts = text.split(/[,;\s]+/).filter(Boolean);
++    for (const part of parts) {
++      const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
++      if (range) {
++        const a = parseInt(range[1], 10);
++        const b = parseInt(range[2], 10);
++        for (let i = Math.min(a, b); i <= Math.max(a, b); i += 1) wanted.add(i);
++      } else if (/^\d+$/.test(part)) {
++        wanted.add(parseInt(part, 10));
++      }
++    }
++    if (!wanted.size) {
++      notify('Type numbers like: 1, 3, 5-8', 'error');
++      return;
++    }
++    const valid = (playlistMeta?.entries || []).filter((entry) => wanted.has(entry.index));
++    if (!valid.length) {
++      notify('None of those numbers match videos in this playlist', 'error');
++      return;
++    }
++    setSelectedIndices((current) => {
++      const next = new Set(current);
++      valid.forEach((entry) => next.add(entry.index));
++      return next;
++    });
++    setTypedSelection('');
++    notify(`Added ${valid.length} more video${valid.length === 1 ? '' : 's'}`, 'success');
++  };
++
++  const handleStartPlaylistBatch = async () => {
++    if (!playlistMeta || selectedIndices.size === 0 || batchStarting || batchId) return;
++
++    let targetId = null;
++    if (plTarget === 'new') {
++      const name = plNewName.trim();
++      if (!name) {
++        notify('Enter a name for the new playlist', 'error');
++        return;
++      }
++      try {
++        const created = await api.post('/playlists', { name });
++        targetId = created.data?.playlist?.id || null;
++        setPlPlaylists((current) => [...current, created.data?.playlist].filter(Boolean));
++        notify(`Playlist "${name}" created`, 'success');
++      } catch (err) {
++        notify(safeFetchError(err, 'Unable to create playlist.'), 'error');
++        return;
++      }
++    } else if (plTarget) {
++      targetId = Number(plTarget);
++    }
++
++    setBatchStarting(true);
++    try {
++      const res = await api.post('/playlist/download', {
++        url: playlistMeta.url || playlistUrl.trim(),
++        indices: [...selectedIndices].sort((a, b) => a - b),
++        quality: plQuality,
++        format: plFormat,
++        target_playlist_id: targetId,
++        sequential: plSequential,
++      });
++      batchCompletedRef.current = 0;
++      stopPollingRef.current = false;
++      setBatchId(res.data.batch_id);
++      setBatch(null);
++      notify(
++        `Batch started — ${res.data.task_count} video${res.data.task_count === 1 ? '' : 's'} queued`
++        + (plSequential ? ' one by one' : '') + '.',
++        'success',
++      );
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to start playlist download.'), 'error');
++    } finally {
++      setBatchStarting(false);
++    }
++  };
++
++  const handleCancelBatch = async () => {
++    if (!batchId) return;
++    try {
++      await api.post(`/playlist/batches/${batchId}/cancel`);
++      notify('Cancelling remaining downloads…', 'info');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to cancel batch.'), 'error');
++    }
++  };
++
++  const handleRetryBatch = async () => {
++    if (!batchId) return;
++    try {
++      await api.post(`/playlist/batches/${batchId}/retry`);
++      stopPollingRef.current = false;
++      notify('Re-queueing the failed videos…', 'info');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to retry batch.'), 'error');
++    }
++  };
++
++  const resetPlaylistBatch = () => {
++    setBatchId(null);
++    setBatch(null);
++    stopPollingRef.current = false;
++    batchCompletedRef.current = 0;
++    setSelectedIndices(new Set());
++    setPlaylistMeta(null);
++    setPlaylistError('');
++    setPlaylistUrl('');
++    setRangeFrom('');
++    setRangeTo('');
++    setTypedSelection('');
++  };
++
++  useEffect(() => {
++    if (!batchId) return undefined;
++    let active = true;
++    let timer = null;
++    const poll = async () => {
++      if (stopPollingRef.current || !active) return;
++      try {
++        const res = await api.get(`/playlist/batches/${batchId}`);
++        if (!active) return;
++        const data = res.data || {};
++        setBatch(data);
++        if ((data.completed_count || 0) > batchCompletedRef.current) {
++          batchCompletedRef.current = data.completed_count;
++          if (onLibraryChanged) onLibraryChanged();
++        }
++        if (['completed', 'partial', 'cancelled'].includes(data.phase)) {
++          stopPollingRef.current = true;
++          setBatch((prev) => (prev ? { ...prev, finished: true } : prev));
++        } else {
++          timer = window.setTimeout(poll, 1500);
++        }
++      } catch {
++        if (!active) return;
++        timer = window.setTimeout(poll, 3000);
++      }
++    };
++    poll();
++    return () => {
++      active = false;
++      if (timer) window.clearTimeout(timer);
++    };
++  }, [batchId, onLibraryChanged]);
++
+   const handleFetchMetadata = async () => {
+     const trimmed = url.trim();
+     if (!trimmed || metadataLoading) return;
+@@ -1341,6 +1605,279 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+           </div>
+         )}
+       </section>
++
++      {/* --- Playlist batch download: range/specific videos from one link --- */}
++      <section className="panel panel--form playlist-batch-panel">
++        <div className="panel__header panel__header--stacked">
++          <div>
++            <div className="section-eyebrow section-eyebrow--soft">Playlist batch download</div>
++            <h2 className="panel__title">Download a Range from a Playlist</h2>
++            <p className="panel__subtitle">
++              Paste ONE playlist link — pick a range or tick specific videos. They download one by one into the
++              queue, and every finished video is saved automatically into a playlist you choose.
++            </p>
++          </div>
++          <span className="panel__badge panel__badge--soft">Batch</span>
++        </div>
++
++        <form
++          className="download-form"
++          onSubmit={(event) => {
++            event.preventDefault();
++            handleLoadPlaylist();
++          }}
++        >
++          <div className="field field--full">
++            <label className="field__label" htmlFor="playlist-batch-url">PLAYLIST LINK (ONLY THE LINK — NOT EACH VIDEO)</label>
++            <div className="playlist-batch-url-row">
++              <input
++                id="playlist-batch-url"
++                className="input"
++                value={playlistUrl}
++                onChange={(event) => {
++                  setPlaylistUrl(event.target.value);
++                  setPlaylistError('');
++                }}
++                placeholder="https://www.youtube.com/playlist?list=..."
++                autoComplete="off"
++                spellCheck="false"
++              />
++              <button className="ghost-button" type="submit" disabled={playlistLoading || !playlistUrl.trim()}>
++                {playlistLoading ? <Loader2 className="spin" size={16} /> : <ListVideo size={16} />}
++                {playlistLoading ? 'Loading…' : 'Load playlist'}
++              </button>
++            </div>
++            {playlistError ? <p className="download-card__error">{playlistError}</p> : null}
++          </div>
++        </form>
++
++        {playlistMeta?.is_playlist ? (
++          <div className="playlist-batch-body">
++            <div className="playlist-batch-summary">
++              <div className="playlist-batch-summary__text">
++                <strong>{playlistMeta.playlist_title}</strong>
++                <span className="playlist-batch-summary__meta">
++                  {playlistMeta.count} video{playlistMeta.count === 1 ? '' : 's'} found
++                  {playlistMeta.uploader ? ` · ${playlistMeta.uploader}` : ''}
++                </span>
++              </div>
++              <span className="status-pill status-pill--processing">{selectedIndices.size} selected</span>
++            </div>
++
++            <div className="playlist-batch-pick">
++              <div className="playlist-batch-pick__range">
++                <input
++                  className="input input--num"
++                  value={rangeFrom}
++                  onChange={(event) => setRangeFrom(event.target.value)}
++                  placeholder="From #"
++                  inputMode="numeric"
++                />
++                <span>to</span>
++                <input
++                  className="input input--num"
++                  value={rangeTo}
++                  onChange={(event) => setRangeTo(event.target.value)}
++                  placeholder="To #"
++                  inputMode="numeric"
++                />
++                <button className="ghost-button ghost-button--small" type="button" onClick={applyRangeSelection}>
++                  <ListOrdered size={14} /> Add range
++                </button>
++              </div>
++              <div className="playlist-batch-pick__typed">
++                <input
++                  className="input"
++                  value={typedSelection}
++                  onChange={(event) => setTypedSelection(event.target.value)}
++                  onKeyDown={(event) => {
++                    if (event.key === 'Enter') applyTypedSelection();
++                  }}
++                  placeholder="Or type specific numbers: 1, 3, 5-8"
++                />
++                <button className="ghost-button ghost-button--small" type="button" onClick={applyTypedSelection}>Add</button>
++              </div>
++              <div className="playlist-batch-pick__actions">
++                <button className="ghost-button ghost-button--small" type="button" onClick={selectAllPlaylist} disabled={!playlistMeta.entries.length}>
++                  All
++                </button>
++                <button className="ghost-button ghost-button--small" type="button" onClick={clearPlaylistSelection} disabled={!selectedIndices.size}>
++                  Clear
++                </button>
++              </div>
++            </div>
++
++            <div className="playlist-batch-list">
++              {playlistMeta.entries.map((entry) => {
++                const checked = selectedIndices.has(entry.index);
++                return (
++                  <label
++                    key={entry.id}
++                    className={`playlist-batch-row ${checked ? 'playlist-batch-row--checked' : ''}`}
++                  >
++                    <input type="checkbox" checked={checked} onChange={() => toggleIndex(entry.index)} />
++                    <span className="playlist-batch-row__index">#{entry.index}</span>
++                    <MediaThumb videoId={entry.id} title={entry.title} />
++                    <span className="playlist-batch-row__title" title={entry.title}>{entry.title}</span>
++                    {entry.duration_label ? <span className="playlist-batch-row__duration">{entry.duration_label}</span> : null}
++                  </label>
++                );
++              })}
++            </div>
++
++            <div className="form-grid">
++              <div className="field">
++                <label className="field__label" htmlFor="plb-quality">QUALITY</label>
++                <select id="plb-quality" className="select" value={plQuality} onChange={(event) => setPlQuality(event.target.value)}>
++                  {QUALITY_OPTIONS.map((option) => (
++                    <option key={option} value={option}>{qualityLabel(option)}</option>
++                  ))}
++                </select>
++              </div>
++              <div className="field">
++                <label className="field__label" htmlFor="plb-format">FORMAT</label>
++                <select id="plb-format" className="select" value={plFormat} onChange={(event) => setPlFormat(event.target.value)}>
++                  {FORMAT_OPTIONS.map((option) => (
++                    <option key={option} value={option}>{option.toUpperCase()}</option>
++                  ))}
++                </select>
++              </div>
++              <div className="field">
++                <label className="field__label" htmlFor="plb-target">AUTO-SAVE INTO WHICH PLAYLIST?</label>
++                <select id="plb-target" className="select" value={plTarget} onChange={(event) => setPlTarget(event.target.value)}>
++                  <option value="">None (just download)</option>
++                  {plPlaylists.map((playlist) => (
++                    <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
++                  ))}
++                  <option value="new">＋ Create new playlist…</option>
++                </select>
++              </div>
++              {plTarget === 'new' ? (
++                <div className="field">
++                  <label className="field__label" htmlFor="plb-new-name">NEW PLAYLIST NAME</label>
++                  <input
++                    id="plb-new-name"
++                    className="input"
++                    value={plNewName}
++                    onChange={(event) => setPlNewName(event.target.value)}
++                    placeholder="e.g. Study, Workout Mix, Road Trip…"
++                    maxLength={120}
++                  />
++                </div>
++              ) : null}
++            </div>
++
++            <div className="playlist-batch-actions">
++              <label className="playlist-batch-seq">
++                <input type="checkbox" checked={plSequential} onChange={(event) => setPlSequential(event.target.checked)} />
++                <span>Download one by one (wait for each video to finish before the next)</span>
++              </label>
++              <button
++                className="primary-button"
++                type="button"
++                onClick={handleStartPlaylistBatch}
++                disabled={selectedIndices.size === 0 || batchStarting || !!batchId}
++              >
++                {batchStarting ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
++                {batchStarting
++                  ? 'Starting…'
++                  : `Download ${selectedIndices.size} video${selectedIndices.size === 1 ? '' : 's'}`}
++              </button>
++            </div>
++          </div>
++        ) : null}
++
++        {batchId ? (
++          <div className="playlist-batch-progress">
++            <div className="download-card__title-row">
++              <div>
++                <h3 className="panel__title panel__title--tight">
++                  {batch?.phase === 'completed'
++                    ? 'Batch complete ✓'
++                    : batch?.phase === 'partial'
++                      ? 'Batch finished — some videos failed'
++                      : batch?.phase === 'cancelled'
++                        ? 'Batch cancelled'
++                        : 'Downloading playlist…'}
++                </h3>
++                <p className="panel__subtitle">
++                  {batch
++                    ? `${batch.completed_count} of ${batch.total_count} done`
++                      + (batch.added_count ? ` · ${batch.added_count} added to "${batch.target_playlist_name || 'playlist'}"` : '')
++                      + (batch.failed_count ? ` · ${batch.failed_count} failed` : '')
++                    : 'Starting…'}
++                </p>
++              </div>
++              {batch ? (
++                <div className="playlist-batch-progress__actions">
++                  {['running', 'cancelling'].includes(batch.phase) ? (
++                    <button className="ghost-button" type="button" onClick={handleCancelBatch}>
++                      <X size={16} /> Cancel batch
++                    </button>
++                  ) : null}
++                  {batch.failed_count > 0 && ['completed', 'partial'].includes(batch.phase) ? (
++                    <button className="ghost-button" type="button" onClick={handleRetryBatch}>
++                      <RefreshCw size={16} /> Retry failed
++                    </button>
++                  ) : null}
++                  {batch.finished || ['completed', 'partial', 'cancelled'].includes(batch.phase) ? (
++                    <button className="ghost-button" type="button" onClick={resetPlaylistBatch}>
++                      <Plus size={16} /> New batch
++                    </button>
++                  ) : null}
++                </div>
++              ) : null}
++            </div>
++
++            {batch ? (
++              <>
++                <ProgressBar value={batch.total_count ? (batch.done_count / batch.total_count) * 100 : 0} />
++                <div className="playlist-batch-stats">
++                  <span>{batch.done_count}/{batch.total_count} finished</span>
++                  <span>{batch.added_count} added to playlist</span>
++                  <span>{batch.failed_count} failed</span>
++                </div>
++                <div className="playlist-batch-tasks">
++                  {batch.tasks.map((task) => (
++                    <div
++                      key={`${task.index}-${task.id}`}
++                      className={`playlist-batch-task playlist-batch-task--${task.status}`}
++                    >
++                      <span className="playlist-batch-task__index">#{task.index}</span>
++                      <span className="playlist-batch-task__title" title={task.title}>{task.title}</span>
++                      {task.status === 'completed' ? (
++                        <span className="playlist-batch-task__flag">
++                          <CheckCircle2 size={14} />
++                          {task.added ? `In "${batch.target_playlist_name || 'playlist'}"` : 'Downloaded'}
++                        </span>
++                      ) : task.status === 'error' || task.status === 'cancelled' ? (
++                        <span className="playlist-batch-task__flag playlist-batch-task__flag--error">
++                          <XCircle size={14} />
++                          {task.status === 'cancelled' ? 'Cancelled' : 'Failed'}
++                        </span>
++                      ) : (
++                        <span className="playlist-batch-task__flag">
++                          <Loader2 className="spin" size={14} /> {batchTaskStatusLabel(task.status)}
++                        </span>
++                      )}
++                      {(task.error && task.status === 'error') || task.auto_add_error ? (
++                        <span className="playlist-batch-task__err" title={task.error || task.auto_add_error}>
++                          {task.error || task.auto_add_error}
++                        </span>
++                      ) : null}
++                    </div>
++                  ))}
++                </div>
++              </>
++            ) : (
++              <div className="empty-state empty-state--compact">
++                <p>Waiting for the backend to start the queue…</p>
++              </div>
++            )}
++          </div>
++        ) : null}
++      </section>
++
+     </div>
+   );
+ }
+@@ -1716,6 +2253,7 @@ function WhisperTranscriptionPage({ onNotify, files = [] }) {
+           </div>
+         ) : null}
+       </section>
++
+     </div>
+   );
+ }
+diff --git a/frontend/vite.config.js b/frontend/vite.config.js
+index 82585ae..528e51a 100644
+--- a/frontend/vite.config.js
++++ b/frontend/vite.config.js
+@@ -8,6 +8,8 @@ export default defineConfig({
+     host: '0.0.0.0',
+     port: 8080,
+     strictPort: true,
++    // Allow preview/tunnel hosts (e.g. *.e2b.app) to reach the dev server.
++    allowedHosts: true,
+     proxy: {
+       '/api': {
+         target: 'http://localhost:8000',
+diff --git a/testing/test_playlist_batch_autosave.py b/testing/test_playlist_batch_autosave.py
+new file mode 100644
+index 0000000..29543ab
+--- /dev/null
++++ b/testing/test_playlist_batch_autosave.py
+@@ -0,0 +1,80 @@
++"""In-process end-to-end test of playlist batch auto-save.
++
++Runs inside the backend's own process so ``download_tasks`` mutations are real.
++The sandbox cannot download YouTube media (datacenter bot check), so we let the
++first queued video fail naturally, then simulate a successful download by
++patching its queue record to 'completed' with a dummy file, and confirm the
++batch supervisor auto-adds it to the chosen local playlist.
++"""
++"""In-process end-to-end test of playlist batch auto-save.
++
++Runs inside the backend's own process so ``download_tasks`` mutations are real.
++The sandbox cannot download YouTube media (datacenter bot check), so we let the
++first queued video fail naturally, then simulate a successful download by
++patching its queue record to 'completed' with a dummy file, and confirm the
++batch supervisor auto-adds it to the chosen local playlist.
++
++Run from the project root:  python testing/test_playlist_batch_autosave.py
++"""
++import asyncio
++import sys
++import time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
++
++from services.database import create_playlist, get_playlist_items, list_playlists
++from services.downloader import download_tasks
++from services.files import DOWNLOAD_DIR
++from services.playlist_batch import create_batch, _reconcile
++
++PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL590L5WQmH8fJ54F369BLDSqIwcs-TCfs"
++
++
++async def wait_terminal(batch, index, timeout=60):
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        _reconcile(batch)
++        item = next(t for t in batch["tasks"] if t["index"] == index)
++        if item["status"] in ("completed", "error", "cancelled"):
++            return item
++        await asyncio.sleep(1)
++    raise TimeoutError("task did not reach a terminal state")
++
++
++async def main():
++    target = next((p for p in list_playlists() if p["name"] == "Test Batch Playlist"), None)
++    if not target:
++        target = create_playlist("Test Batch Playlist")
++    print("target playlist:", target["id"], target["name"])
++
++    batch = await create_batch(PLAYLIST_URL, [1, 2], "360", "mp4", target["id"], True)
++    print("batch:", batch["id"], "| tasks:", len(batch["tasks"]))
++
++    # Video 1 will fail (YouTube bot check on this sandbox IP) — fine.
++    v1 = await wait_terminal(batch, 1)
++    print("v1 natural status:", v1["status"], "(expected error on sandbox)")
++
++    # Simulate video 1 finishing successfully.
++    dummy = DOWNLOAD_DIR / "Test Video A (KIViy7L_lo8).mp4"
++    dummy.write_bytes(b"fake media bytes" * 100)
++    download_tasks[v1["task_id"]].update(status="completed", filename=str(dummy))
++    print("simulated completion ->", dummy.name)
++
++    # Let the supervisor logic pick it up.
++    _reconcile(batch)
++    v1 = next(t for t in batch["tasks"] if t["index"] == 1)
++    print("after reconcile -> v1:", v1["status"], "| added:", v1.get("added"),
++          "| filename:", v1.get("filename"))
++    print("batch -> done:", batch["done_count"], "completed:", batch["completed_count"],
++          "added:", batch["added_count"], "phase:", batch["phase"])
++
++    items = get_playlist_items(target["id"])
++    print("playlist items:", items)
++    ok = dummy.name in items and v1.get("added") is True
++    print("AUTO-SAVE TEST:", "PASS" if ok else "FAIL")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(asyncio.run(main()))

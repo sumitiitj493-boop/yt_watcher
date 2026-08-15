@@ -1,0 +1,1291 @@
+diff --git a/TRANSCRIPT_SAVER_FEATURE.md b/TRANSCRIPT_SAVER_FEATURE.md
+new file mode 100644
+index 0000000..c3aa8f6
+--- /dev/null
++++ b/TRANSCRIPT_SAVER_FEATURE.md
+@@ -0,0 +1,96 @@
++# Transcript Saver + Batch Auto-Transcripts — New Feature
++
++Two additions that make lecture transcripts permanent and automatic:
++
++1. **Transcript Saver** — a new section on the Download page where transcripts are
++   stored **forever** (in the app's SQLite database). They survive video deletion,
++   cache clears and page reloads — you never need to re-paste a YouTube link or
++   re-fetch captions again.
++2. **Auto-transcripts in playlist batch downloads** — in the "Download a Range from
++   a Playlist" panel you can tick **"Also fetch YouTube auto transcript for each
++   video (saved to Transcript Saver)"**. While the videos download, the backend
++   fetches each video's YouTube auto transcript **in parallel** (up to 3 at a time)
++   and saves it into the Transcript Saver automatically.
++
++---
++
++## How to use it
++
++### Transcript Saver (Download page)
++- **Paste a transcript:** type a title (e.g. "Lecture 4 – Calculus"), optionally a
++  YouTube link, paste the text, click **Save transcript**.
++- **Fetch from YouTube:** paste any YouTube link in the "or fetch from YouTube" box
++  and click **Fetch & save** — captions are fetched and saved in one click.
++- **Save any fetched transcript:** in the existing **URL Transcript** panel, after
++  fetching a transcript click **Save to Saver**.
++- **Manage:** every saved transcript has **Copy**, **Edit** (pencil) and **Delete**
++  (trash) buttons. Expand with the arrow to read the full text.
++- **Clear all:** the **Clear all** button (click twice to confirm) empties the whole
++  saver. Deleting a video or reloading the page never removes these transcripts.
++
++> Tip: pasting a YouTube link with the transcript auto-detects the video id, so
++> re-saving the same lecture updates that row instead of duplicating it.
++
++### Playlist batch downloads
++1. In **"Download a Range from a Playlist"**, paste the playlist link and pick your
++   range / specific videos (as before).
++2. Tick **"Also fetch YouTube auto transcript for each video"**.
++3. Click **Download N videos**.
++4. Downloads and transcript fetches run **at the same time**. Each video row in the
++   progress card shows a transcript flag:
++   - **Transcript saved** (green) — available and stored in the Transcript Saver
++   - **No transcript** — YouTube has no captions for that video
++   - **Fetching transcript… / Transcript queued** — in progress
++   - **Transcript error** — something went wrong (hover for details)
++5. The header shows live counts, e.g. `2/5 transcripts saved`.
++
++---
++
++## New backend endpoints
++
++| Method | Endpoint | Purpose |
++| ------ | -------- | ------- |
++| GET    | `/api/transcript-saver` | List all saved transcripts |
++| POST   | `/api/transcript-saver` | Save a pasted transcript (upserts by video id/url) |
++| POST   | `/api/transcript-saver/fetch` | Fetch a YouTube auto transcript and save it |
++| GET    | `/api/transcript-saver/{id}` | Get one transcript |
++| PATCH  | `/api/transcript-saver/{id}` | Update title/text/url |
++| DELETE | `/api/transcript-saver/{id}` | Delete one transcript |
++| DELETE | `/api/transcript-saver` | **Clear all** transcripts |
++
++`POST /api/playlist/download` now also accepts `"fetch_transcripts": true`.
++
++Saved transcripts live in the SQLite table `saved_transcripts`
++(`video_id, title, url, text, source, created_at, updated_at`).
++
++---
++
++## Files changed (this feature only)
++
++**Backend**
++- `backend/routes/transcript_saver.py` *(new)* — Transcript Saver API.
++- `backend/services/database.py` — `saved_transcripts` table + CRUD functions.
++- `backend/services/playlist_batch.py` — parallel transcript fetching for batches.
++- `backend/routes/playlist_batch.py` — passes `fetch_transcripts` through.
++- `backend/models.py` — new request models + `fetch_transcripts` field.
++- `backend/main.py` — registers the new router.
++
++**Frontend**
++- `frontend/src/App.jsx` — Transcript Saver panel, batch transcript checkbox +
++  per-video transcript flags, "Save to Saver" button in the URL Transcript panel.
++- `frontend/src/App.css` — styles for the saver and transcript flags.
++
++**Docs**
++- `TRANSCRIPT_SAVER_FEATURE.md` *(this file)*.
++
++---
++
++## Notes
++- This feature is an **add-on to the playlist batch feature** (v1). Apply the v1
++  patch first, then this one.
++- Transcript text is stored in the DB, so it is independent of the downloads folder
++  and survives `Clear library`, video deletion and app restarts.
++- Transcript fetching is capped at 3 concurrent requests so a big batch won't hammer
++  YouTube; downloads are unaffected (separate queue).
++- If a video has no YouTube captions, the row shows **No transcript** — you can still
++  paste one manually into the saver.
+diff --git a/backend/main.py b/backend/main.py
+index 245d662..3d2b8da 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from starlette.middleware.base import BaseHTTPMiddleware
+ from starlette.responses import JSONResponse
+ 
+-from routes import about, download, library, playlist_batch, stream
++from routes import about, download, library, playlist_batch, stream, transcript_saver
+ from services.database import init_db
+ from services.downloader import resume_pending_downloads
+ 
+@@ -138,6 +138,7 @@ app.include_router(download.router, prefix="/api")
+ app.include_router(about.router, prefix="/api")
+ app.include_router(library.router, prefix="/api")
+ app.include_router(playlist_batch.router, prefix="/api")
++app.include_router(transcript_saver.router, prefix="/api")
+ app.include_router(stream.router, prefix="/api")
+ 
+ 
+diff --git a/backend/models.py b/backend/models.py
+index bceb908..ac81866 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -47,6 +47,7 @@ class PlaylistDownloadRequest(BaseModel):
+     format: str = Field(default="mp4")
+     target_playlist_id: int | None = Field(default=None)
+     sequential: bool = Field(default=True)
++    fetch_transcripts: bool = Field(default=False)
+ 
+     @field_validator("format")
+     @classmethod
+@@ -76,6 +77,19 @@ class WhisperLibraryRequest(BaseModel):
+     force: bool = Field(default=False)
+ 
+ 
++class TranscriptSaverCreateRequest(BaseModel):
++    """Manually save (or update) a transcript in the Transcript Saver."""
++    title: str = Field(min_length=1, max_length=300)
++    text: str = Field(min_length=1, max_length=1_000_000)
++    url: str = Field(default="", max_length=2000)
++
++
++class TranscriptSaverUpdateRequest(BaseModel):
++    title: str | None = Field(default=None, min_length=1, max_length=300)
++    text: str | None = Field(default=None, min_length=1, max_length=1_000_000)
++    url: str | None = Field(default=None, max_length=2000)
++
++
+ class SocialDownloadRequest(BaseModel):
+     url: HttpUrl
+     quality: str = Field(default="best")
+diff --git a/backend/routes/playlist_batch.py b/backend/routes/playlist_batch.py
+index 5082dc6..15d90c7 100644
+--- a/backend/routes/playlist_batch.py
++++ b/backend/routes/playlist_batch.py
+@@ -47,6 +47,7 @@ async def playlist_download(request: PlaylistDownloadRequest):
+             request.format,
+             request.target_playlist_id,
+             request.sequential,
++            request.fetch_transcripts,
+         )
+     except ValueError as exc:
+         raise HTTPException(status_code=400, detail=str(exc))
+diff --git a/backend/routes/transcript_saver.py b/backend/routes/transcript_saver.py
+new file mode 100644
+index 0000000..d9a3353
+--- /dev/null
++++ b/backend/routes/transcript_saver.py
+@@ -0,0 +1,134 @@
++"""Transcript Saver endpoints.
++
++Persistent storage for lecture transcripts. Transcripts saved here survive
++video deletion, cache clears and page reloads — no need to re-paste a YouTube
++link or re-fetch captions every time.
++
++- Save a transcript manually (copy-paste) or fetch it from YouTube in one click.
++- Clear individual entries, or clear all with a single call.
++"""
++
++from urllib.parse import parse_qs, urlparse
++
++from fastapi import APIRouter, HTTPException
++
++from models import MetadataRequest, TranscriptSaverCreateRequest, TranscriptSaverUpdateRequest
++from services.database import (
++    delete_all_saved_transcripts,
++    delete_saved_transcript,
++    get_saved_transcript,
++    list_saved_transcripts,
++    save_saved_transcript,
++    update_saved_transcript,
++)
++from services.transcripts import fetch_url_transcript
++from services.url_guard import validate_public_url
++
++router = APIRouter()
++
++
++def _extract_video_id(url: str) -> str:
++    """Best-effort YouTube video id extraction (no network calls)."""
++    url = str(url or "").strip()
++    if not url:
++        return ""
++    try:
++        parsed = urlparse(url)
++    except Exception:
++        return ""
++    host = (parsed.hostname or "").lower()
++    if host in {"youtu.be", "www.youtu.be"}:
++        return (parsed.path or "").lstrip("/")[:11] or ""
++    if "youtube.com" in host or "youtube-nocookie.com" in host:
++        query_id = (parse_qs(parsed.query).get("v") or [""])[0]
++        if query_id:
++            return query_id[:11]
++        segments = [segment for segment in parsed.path.split("/") if segment]
++        if len(segments) >= 2 and segments[0] in {"shorts", "embed", "live", "v"}:
++            return segments[1][:11]
++    return ""
++
++
++@router.get("/transcript-saver")
++async def transcript_saver_list():
++    return {"transcripts": list_saved_transcripts()}
++
++
++@router.post("/transcript-saver")
++async def transcript_saver_save(payload: TranscriptSaverCreateRequest):
++    """Save a transcript from pasted text (or update an existing one)."""
++    video_id = _extract_video_id(payload.url or "")
++    try:
++        saved = save_saved_transcript(
++            title=payload.title,
++            text=payload.text,
++            url=(payload.url or "").strip(),
++            video_id=video_id or None,
++            source="manual",
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    return {"transcript": saved}
++
++
++@router.post("/transcript-saver/fetch")
++async def transcript_saver_fetch(request: MetadataRequest):
++    """Fetch the YouTube auto transcript for a URL and save it to the saver."""
++    try:
++        safe_url = await validate_public_url(str(request.url))
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++
++    result = await fetch_url_transcript(safe_url)
++    if not result.get("available"):
++        raise HTTPException(
++            status_code=404,
++            detail=result.get("reason") or "No transcript available for this video",
++        )
++
++    video_id = result.get("video_id") or _extract_video_id(safe_url) or None
++    saved = save_saved_transcript(
++        title=(result.get("title") or "").strip() or "YouTube transcript",
++        text=result.get("text") or "",
++        url=safe_url,
++        video_id=video_id,
++        source="youtube",
++    )
++    return {"transcript": saved}
++
++
++@router.get("/transcript-saver/{transcript_id}")
++async def transcript_saver_get(transcript_id: int):
++    row = get_saved_transcript(transcript_id)
++    if not row:
++        raise HTTPException(status_code=404, detail="Transcript not found")
++    return {"transcript": row}
++
++
++@router.patch("/transcript-saver/{transcript_id}")
++async def transcript_saver_update(transcript_id: int, payload: TranscriptSaverUpdateRequest):
++    try:
++        row = update_saved_transcript(
++            transcript_id,
++            title=payload.title,
++            text=payload.text,
++            url=payload.url,
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    if not row:
++        raise HTTPException(status_code=404, detail="Transcript not found")
++    return {"transcript": row}
++
++
++@router.delete("/transcript-saver/{transcript_id}")
++async def transcript_saver_delete(transcript_id: int):
++    if not delete_saved_transcript(transcript_id):
++        raise HTTPException(status_code=404, detail="Transcript not found")
++    return {"message": "Deleted"}
++
++
++@router.delete("/transcript-saver")
++async def transcript_saver_clear_all():
++    deleted = delete_all_saved_transcripts()
++    return {"message": "Cleared", "deleted": deleted}
+diff --git a/backend/services/database.py b/backend/services/database.py
+index f4a9265..56b8b33 100644
+--- a/backend/services/database.py
++++ b/backend/services/database.py
+@@ -164,6 +164,22 @@ def ensure_db_initialized() -> None:
+ 
+                 CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist_position
+                     ON playlist_items(playlist_id, position);
++
++                CREATE TABLE IF NOT EXISTS saved_transcripts (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    video_id TEXT,
++                    title TEXT NOT NULL,
++                    url TEXT NOT NULL DEFAULT '',
++                    text TEXT NOT NULL,
++                    source TEXT NOT NULL DEFAULT 'manual',
++                    created_at REAL NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
++                CREATE INDEX IF NOT EXISTS idx_saved_transcripts_video_id
++                    ON saved_transcripts(video_id);
++                CREATE INDEX IF NOT EXISTS idx_saved_transcripts_updated_at
++                    ON saved_transcripts(updated_at DESC);
+                 """
+             )
+             _ensure_default_playlist(conn)
+@@ -495,5 +511,152 @@ def reorder_playlist(playlist_id: int, filenames: List[str]) -> List[str]:
+     return get_playlist_items(playlist_id)
+ 
+ 
++# --- Transcript Saver (persistent, paste-able transcripts) -----------------
++# Saved transcripts live in the DB so they survive video deletion, cache
++# clears and page reloads. They are keyed by video id when known (so the same
++# lecture's transcript is updated instead of duplicated).
++def _transcript_row_to_dict(row) -> dict:
++    data = dict(row)
++    data["text_length"] = len(data.get("text") or "")
++    data["line_count"] = (data.get("text") or "").count("\n") + 1
++    data["preview"] = " ".join((data.get("text") or "").split())[:140]
++    return data
++
++
++def list_saved_transcripts() -> List[dict]:
++    ensure_db_initialized()
++    with _connect() as conn:
++        rows = conn.execute(
++            """
++            SELECT id, video_id, title, url, text, source, created_at, updated_at
++            FROM saved_transcripts
++            ORDER BY updated_at DESC, id DESC
++            """
++        ).fetchall()
++    return [_transcript_row_to_dict(row) for row in rows]
++
++
++def get_saved_transcript(transcript_id: int) -> Optional[dict]:
++    ensure_db_initialized()
++    with _connect() as conn:
++        row = conn.execute(
++            "SELECT id, video_id, title, url, text, source, created_at, updated_at FROM saved_transcripts WHERE id = ?",
++            (transcript_id,),
++        ).fetchone()
++    return _transcript_row_to_dict(row) if row else None
++
++
++def save_saved_transcript(
++    title: str,
++    text: str,
++    url: str = "",
++    video_id: Optional[str] = None,
++    source: str = "manual",
++) -> dict:
++    """Insert (or update) a saved transcript.
++
++    If ``video_id`` is known, an existing row for that video is updated so the
++    same lecture never creates duplicates. Otherwise a match on ``url`` is
++    tried, then a brand-new row is inserted.
++    """
++    ensure_db_initialized()
++    cleaned_title = title.strip() or "Untitled transcript"
++    cleaned_text = text.strip()
++    if not cleaned_text:
++        raise ValueError("Transcript text cannot be empty")
++    cleaned_url = (url or "").strip()
++    now = time.time()
++
++    with _connect() as conn:
++        existing = None
++        if video_id:
++            existing = conn.execute(
++                "SELECT * FROM saved_transcripts WHERE video_id = ? ORDER BY updated_at DESC LIMIT 1",
++                (video_id,),
++            ).fetchone()
++        if existing is None and cleaned_url:
++            existing = conn.execute(
++                "SELECT * FROM saved_transcripts WHERE url = ? ORDER BY updated_at DESC LIMIT 1",
++                (cleaned_url,),
++            ).fetchone()
++
++        if existing is not None:
++            conn.execute(
++                """
++                UPDATE saved_transcripts
++                SET title = ?, url = ?, text = ?, source = ?, updated_at = ?
++                WHERE id = ?
++                """,
++                (cleaned_title, cleaned_url or (existing["url"] or ""), cleaned_text, source, now, existing["id"]),
++            )
++            row = conn.execute(
++                "SELECT id, video_id, title, url, text, source, created_at, updated_at FROM saved_transcripts WHERE id = ?",
++                (existing["id"],),
++            ).fetchone()
++        else:
++            cursor = conn.execute(
++                """
++                INSERT INTO saved_transcripts (video_id, title, url, text, source, created_at, updated_at)
++                VALUES (?, ?, ?, ?, ?, ?, ?)
++                """,
++                (video_id, cleaned_title, cleaned_url, cleaned_text, source, now, now),
++            )
++            row = conn.execute(
++                "SELECT id, video_id, title, url, text, source, created_at, updated_at FROM saved_transcripts WHERE id = ?",
++                (cursor.lastrowid,),
++            ).fetchone()
++        conn.commit()
++    return _transcript_row_to_dict(row)
++
++
++def update_saved_transcript(
++    transcript_id: int,
++    *,
++    title: Optional[str] = None,
++    text: Optional[str] = None,
++    url: Optional[str] = None,
++) -> Optional[dict]:
++    ensure_db_initialized()
++    with _connect() as conn:
++        current = conn.execute("SELECT * FROM saved_transcripts WHERE id = ?", (transcript_id,)).fetchone()
++        if not current:
++            return None
++        new_title = (title.strip() if title is not None else (current["title"] or "").strip()) or "Untitled transcript"
++        new_text = (text.strip() if text is not None else current["text"]).strip()
++        if not new_text:
++            raise ValueError("Transcript text cannot be empty")
++        new_url = (url.strip() if url is not None else (current["url"] or "")).strip()
++        conn.execute(
++            """
++            UPDATE saved_transcripts
++            SET title = ?, text = ?, url = ?, updated_at = ?
++            WHERE id = ?
++            """,
++            (new_title, new_text, new_url, time.time(), transcript_id),
++        )
++        conn.commit()
++        row = conn.execute(
++            "SELECT id, video_id, title, url, text, source, created_at, updated_at FROM saved_transcripts WHERE id = ?",
++            (transcript_id,),
++        ).fetchone()
++    return _transcript_row_to_dict(row)
++
++
++def delete_saved_transcript(transcript_id: int) -> bool:
++    ensure_db_initialized()
++    with _connect() as conn:
++        cursor = conn.execute("DELETE FROM saved_transcripts WHERE id = ?", (transcript_id,))
++        conn.commit()
++        return cursor.rowcount > 0
++
++
++def delete_all_saved_transcripts() -> int:
++    ensure_db_initialized()
++    with _connect() as conn:
++        cursor = conn.execute("DELETE FROM saved_transcripts")
++        conn.commit()
++        return cursor.rowcount
++
++
+ async def init_db():
+     ensure_db_initialized()
+diff --git a/backend/services/playlist_batch.py b/backend/services/playlist_batch.py
+index f86c35d..1ea0851 100644
+--- a/backend/services/playlist_batch.py
++++ b/backend/services/playlist_batch.py
+@@ -24,7 +24,7 @@ from typing import Any
+ 
+ import yt_dlp
+ 
+-from services.database import add_playlist_item, list_playlists
++from services.database import add_playlist_item, list_playlists, save_saved_transcript
+ from services.downloader import (
+     ACTIVE_STATUSES,
+     TERMINAL_STATUSES,
+@@ -32,10 +32,12 @@ from services.downloader import (
+     initiate_download,
+     request_cancel,
+ )
++from services.transcripts import fetch_url_transcript
+ from services.yt_dlp_options import PUBLIC_HTTP_HEADERS, apply_reliable_ytdlp_options
+ 
+ _MAX_PLAYLIST_ENTRIES = 5000
+ _POLL_INTERVAL_SECONDS = 1.0
++_TRANSCRIPT_FETCH_CONCURRENCY = 3
+ 
+ _LOCK = threading.RLock()
+ _BATCHES: dict[str, dict] = {}
+@@ -139,6 +141,9 @@ def _public_batch(batch: dict) -> dict:
+             "error": item.get("error"),
+             "added": item.get("added", False),
+             "auto_add_error": item.get("auto_add_error"),
++            "transcript_status": item.get("transcript_status"),
++            "transcript_error": item.get("transcript_error"),
++            "transcript_lines": item.get("transcript_lines"),
+         })
+     return {
+         "id": batch.get("id"),
+@@ -149,6 +154,7 @@ def _public_batch(batch: dict) -> dict:
+         "target_playlist_id": batch.get("target_playlist_id"),
+         "target_playlist_name": batch.get("target_playlist_name") or "",
+         "sequential": batch.get("sequential", True),
++        "fetch_transcripts": batch.get("fetch_transcripts", False),
+         "created_at": batch.get("created_at"),
+         "phase": batch.get("phase"),
+         "total_count": batch.get("total_count", 0),
+@@ -156,6 +162,9 @@ def _public_batch(batch: dict) -> dict:
+         "completed_count": batch.get("completed_count", 0),
+         "failed_count": batch.get("failed_count", 0),
+         "added_count": batch.get("added_count", 0),
++        "transcripts_total": batch.get("transcripts_total", 0),
++        "transcripts_done_count": batch.get("transcripts_done_count", 0),
++        "transcripts_saved_count": batch.get("transcripts_saved_count", 0),
+         "tasks": tasks,
+     }
+ 
+@@ -314,6 +323,71 @@ async def _ensure_supervisor(batch_id: str) -> None:
+     asyncio.create_task(_supervise_batch(batch_id))
+ 
+ 
++async def _fetch_batch_transcripts(batch_id: str) -> None:
++    """Fetch the YouTube auto transcript for every video in a batch, in parallel.
++
++    Runs independently of the download queue (downloads and transcript fetches
++    happen at the same time). Each successful transcript is saved into the
++    persistent Transcript Saver, keyed by video id, so it survives reloads.
++    """
++    semaphore = asyncio.Semaphore(_TRANSCRIPT_FETCH_CONCURRENCY)
++
++    async def fetch_one(item: dict) -> None:
++        async with semaphore:
++            with _LOCK:
++                current = _BATCHES.get(batch_id)
++                if current is None:
++                    return
++                current_item = next(
++                    (task for task in current.get("tasks", []) if task.get("index") == item.get("index")),
++                    None,
++                )
++            if current_item is None:
++                return
++            current_item["transcript_status"] = "fetching"
++            try:
++                result = await fetch_url_transcript(item["url"])
++            except Exception as exc:  # noqa: BLE001
++                current_item["transcript_status"] = "error"
++                current_item["transcript_error"] = str(exc)[:300]
++            else:
++                if result.get("available"):
++                    try:
++                        save_saved_transcript(
++                            title=item.get("title") or "YouTube transcript",
++                            text=result.get("text") or "",
++                            url=item.get("url") or "",
++                            video_id=item.get("id") or None,
++                            source="youtube",
++                        )
++                    except Exception as exc:  # noqa: BLE001
++                        current_item["transcript_status"] = "error"
++                        current_item["transcript_error"] = str(exc)[:300]
++                    else:
++                        current_item["transcript_status"] = "saved"
++                        current_item["transcript_lines"] = len(result.get("segments") or [])
++                        with _LOCK:
++                            active = _BATCHES.get(batch_id)
++                            if active is not None:
++                                active["transcripts_saved_count"] = active.get("transcripts_saved_count", 0) + 1
++                else:
++                    current_item["transcript_status"] = "unavailable"
++                    current_item["transcript_error"] = (result.get("reason") or "")[:300]
++            with _LOCK:
++                active = _BATCHES.get(batch_id)
++                if active is not None:
++                    active["transcripts_done_count"] = active.get("transcripts_done_count", 0) + 1
++
++    with _LOCK:
++        batch = _BATCHES.get(batch_id)
++        if not batch:
++            return
++        targets = [item for item in batch.get("tasks", []) if not item.get("task_id") or True]
++
++    if targets:
++        await asyncio.gather(*(fetch_one(item) for item in targets), return_exceptions=True)
++
++
+ async def create_batch(
+     url: str,
+     indices: list[int],
+@@ -321,6 +395,7 @@ async def create_batch(
+     format_ext: str = "mp4",
+     target_playlist_id: int | None = None,
+     sequential: bool = True,
++    fetch_transcripts: bool = False,
+ ) -> dict:
+     """Create a batch download from a single playlist URL and enqueue it."""
+     from services.url_guard import validate_public_url
+@@ -368,6 +443,9 @@ async def create_batch(
+             "filename": None,
+             "error": None,
+             "added": False,
++            "transcript_status": "pending" if fetch_transcripts else "skipped",
++            "transcript_error": None,
++            "transcript_lines": None,
+         })
+ 
+     batch = {
+@@ -379,6 +457,7 @@ async def create_batch(
+         "target_playlist_id": target_playlist_id,
+         "target_playlist_name": target_name,
+         "sequential": bool(sequential),
++        "fetch_transcripts": bool(fetch_transcripts),
+         "created_at": time.time(),
+         "tasks": tasks,
+         "total_count": len(tasks),
+@@ -388,6 +467,9 @@ async def create_batch(
+         "added_count": 0,
+         "enqueued_count": 0,
+         "next_to_enqueue": 0,
++        "transcripts_total": len(tasks) if fetch_transcripts else 0,
++        "transcripts_done_count": 0,
++        "transcripts_saved_count": 0,
+         "phase": "running",
+         "cancel_requested": False,
+         "done": False,
+@@ -410,6 +492,12 @@ async def create_batch(
+             await _enqueue_one(batch, item)
+ 
+     await _ensure_supervisor(batch_id)
++
++    # Optionally fetch YouTube auto transcripts in parallel with the downloads
++    # and save them into the persistent Transcript Saver.
++    if fetch_transcripts and tasks:
++        asyncio.create_task(_fetch_batch_transcripts(batch_id))
++
+     return _BATCHES[batch_id]
+ 
+ 
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 8356bcb..a3720a4 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3912,3 +3912,175 @@ body[data-theme='dark'] .main-stage {
+ 	white-space: nowrap;
+ 	max-width: 100%;
+ }
++
++/* ==========================================================================
++   Transcript Saver (persistent lecture transcripts)
++   ========================================================================== */
++.transcript-saver-header__actions {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	flex-wrap: wrap;
++}
++
++.ghost-button--danger {
++	color: #f87171;
++	border-color: rgba(239, 68, 68, 0.45);
++}
++
++.ghost-button--danger:hover {
++	background: rgba(239, 68, 68, 0.12);
++}
++
++.transcript-saver-divider {
++	color: var(--text-muted);
++	font-size: 0.85rem;
++	white-space: nowrap;
++}
++
++.transcript-saver-fetch-input {
++	flex: 1;
++	min-width: 220px;
++}
++
++.transcript-saver-list {
++	display: grid;
++	gap: 8px;
++	margin-top: 16px;
++}
++
++.saver-item {
++	border: 1px solid var(--border);
++	border-radius: 14px;
++	background: var(--surface-muted);
++	overflow: hidden;
++}
++
++.saver-item--expanded {
++	border-color: var(--accent);
++}
++
++.saver-item__head {
++	display: flex;
++	align-items: center;
++	gap: 10px;
++	padding: 10px 12px;
++}
++
++.saver-item__toggle {
++	background: none;
++	border: none;
++	color: var(--text-muted);
++	cursor: pointer;
++	padding: 4px;
++	display: inline-flex;
++	align-items: center;
++	border-radius: 8px;
++	flex-shrink: 0;
++}
++
++.saver-item__toggle:hover {
++	color: var(--text);
++	background: rgba(255, 255, 255, 0.06);
++}
++
++.saver-item__title {
++	display: flex;
++	flex-direction: column;
++	gap: 2px;
++	min-width: 0;
++	flex-shrink: 1;
++}
++
++.saver-item__meta {
++	color: var(--text-muted);
++	font-size: 0.78rem;
++}
++
++.saver-item__preview {
++	flex: 1;
++	min-width: 0;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++	color: var(--text-muted);
++	font-size: 0.85rem;
++	padding: 0 8px;
++}
++
++.saver-item__actions {
++	display: flex;
++	gap: 4px;
++	flex-shrink: 0;
++}
++
++.saver-item__text {
++	white-space: pre-wrap;
++	word-break: break-word;
++	font-family: inherit;
++	font-size: 0.88rem;
++	line-height: 1.55;
++	margin: 0;
++	padding: 12px 14px;
++	border-top: 1px dashed var(--border);
++	max-height: 360px;
++	overflow-y: auto;
++	color: var(--text);
++}
++
++.saver-item__edit {
++	display: grid;
++	gap: 10px;
++	padding: 12px 14px;
++	border-top: 1px dashed var(--border);
++}
++
++.saver-item__edit .transcript-textarea {
++	min-height: 160px;
++}
++
++/* Transcript status flag inside batch task rows */
++.playlist-batch-task__tflag {
++	display: inline-flex;
++	align-items: center;
++	gap: 5px;
++	font-size: 0.76rem;
++	white-space: nowrap;
++	flex-shrink: 0;
++	padding: 2px 8px;
++	border-radius: 999px;
++	border: 1px solid var(--border);
++	color: var(--text-muted);
++	background: rgba(255, 255, 255, 0.04);
++}
++
++.playlist-batch-task__tflag--saved {
++	color: #34d399;
++	border-color: rgba(34, 197, 94, 0.45);
++	background: rgba(34, 197, 94, 0.08);
++}
++
++.playlist-batch-task__tflag--fetching,
++.playlist-batch-task__tflag--pending {
++	color: var(--accent-cool);
++	border-color: rgba(34, 211, 238, 0.4);
++}
++
++.playlist-batch-task__tflag--unavailable {
++	color: var(--text-muted);
++}
++
++.playlist-batch-task__tflag--error {
++	color: #f87171;
++	border-color: rgba(239, 68, 68, 0.45);
++}
++
++.playlist-batch-seq--transcripts {
++	color: var(--accent-cool);
++}
++
++@media (max-width: 720px) {
++	.saver-item__preview {
++		display: none;
++	}
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 027b67f..c907640 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -35,6 +35,12 @@ import {
+   ListOrdered,
+   CheckCircle2,
+   XCircle,
++  Save,
++  Copy,
++  PenLine,
++  BookOpenText,
++  ChevronDown,
++  ChevronUp,
+ } from 'lucide-react';
+ 
+ import './App.css';
+@@ -751,11 +757,30 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [plTarget, setPlTarget] = useState('');                 // '' = none, playlist id, or 'new'
+   const [plNewName, setPlNewName] = useState('');
+   const [plSequential, setPlSequential] = useState(true);
++  const [plFetchTranscripts, setPlFetchTranscripts] = useState(false);
+   const [batchId, setBatchId] = useState(null);
+   const [batch, setBatch] = useState(null);
+   const [batchStarting, setBatchStarting] = useState(false);
+   const batchCompletedRef = useRef(0);
+   const stopPollingRef = useRef(false);
++
++  // Transcript Saver (persistent lecture transcripts)
++  const [saverItems, setSaverItems] = useState([]);
++  const [saverLoading, setSaverLoading] = useState(false);
++  const [saverError, setSaverError] = useState('');
++  const [saverTitle, setSaverTitle] = useState('');
++  const [saverUrl, setSaverUrl] = useState('');
++  const [saverText, setSaverText] = useState('');
++  const [saverSaving, setSaverSaving] = useState(false);
++  const [saverFetching, setSaverFetching] = useState(false);
++  const [saverFetchUrl, setSaverFetchUrl] = useState('');
++  const [saverExpandedId, setSaverExpandedId] = useState(null);
++  const [saverEditingId, setSaverEditingId] = useState(null);
++  const [saverEditTitle, setSaverEditTitle] = useState('');
++  const [saverEditText, setSaverEditText] = useState('');
++  const [saverSavingEdit, setSaverSavingEdit] = useState(false);
++  const [saverConfirmClearAll, setSaverConfirmClearAll] = useState(false);
++  const [saverCopyStatusId, setSaverCopyStatusId] = useState(null);
+   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
+   const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
+   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
+@@ -938,6 +963,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+         format: plFormat,
+         target_playlist_id: targetId,
+         sequential: plSequential,
++        fetch_transcripts: plFetchTranscripts,
+       });
+       batchCompletedRef.current = 0;
+       stopPollingRef.current = false;
+@@ -1023,6 +1049,161 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     };
+   }, [batchId, onLibraryChanged]);
+ 
++  // --- Transcript Saver handlers -----------------------------------------
++  const transcriptStatusLabel = (status) => {
++    const map = {
++      pending: 'Transcript queued',
++      fetching: 'Fetching transcript…',
++      saved: 'Transcript saved',
++      unavailable: 'No transcript',
++      error: 'Transcript error',
++      skipped: '',
++    };
++    return map[status] || '';
++  };
++
++  const loadSaverItems = useCallback(async () => {
++    try {
++      const res = await api.get('/transcript-saver');
++      setSaverItems(Array.isArray(res.data?.transcripts) ? res.data.transcripts : []);
++      setSaverError('');
++    } catch (err) {
++      setSaverError(safeFetchError(err, 'Unable to load saved transcripts.'));
++    }
++  }, []);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load on mount
++    loadSaverItems();
++  }, [loadSaverItems]);
++
++  const handleSaverSave = async () => {
++    if (saverSaving) return;
++    const title = saverTitle.trim();
++    const text = saverText.trim();
++    if (!title || !text) {
++      notify('Enter a title and the transcript text to save', 'error');
++      return;
++    }
++    setSaverSaving(true);
++    try {
++      await api.post('/transcript-saver', { title, text, url: saverUrl.trim() });
++      setSaverTitle('');
++      setSaverText('');
++      setSaverUrl('');
++      await loadSaverItems();
++      notify('Transcript saved to the saver', 'success');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to save transcript.'), 'error');
++    } finally {
++      setSaverSaving(false);
++    }
++  };
++
++  const handleSaverFetch = async () => {
++    const trimmed = saverFetchUrl.trim();
++    if (!trimmed || saverFetching) return;
++    setSaverFetching(true);
++    setSaverError('');
++    try {
++      const res = await api.post('/transcript-saver/fetch', { url: trimmed });
++      const saved = res.data?.transcript;
++      await loadSaverItems();
++      notify(saved?.title ? `Saved: ${saved.title}` : 'Transcript fetched and saved', 'success');
++      setSaverFetchUrl('');
++      if (saved?.id) setSaverExpandedId(saved.id);
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to fetch transcript.'), 'error');
++    } finally {
++      setSaverFetching(false);
++    }
++  };
++
++  const handleSaveCurrentUrlTranscript = async () => {
++    if (!transcriptText || !transcriptResult?.title) return;
++    try {
++      await api.post('/transcript-saver', {
++        title: transcriptResult.title,
++        text: transcriptText,
++        url: transcriptResult.webpage_url || transcriptUrl,
++      });
++      await loadSaverItems();
++      notify('Saved the fetched transcript to the saver', 'success');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to save transcript.'), 'error');
++    }
++  };
++
++  const handleSaverCopy = async (item) => {
++    try {
++      await navigator.clipboard.writeText(item.text || '');
++      setSaverCopyStatusId(item.id);
++      window.setTimeout(() => setSaverCopyStatusId(null), 1600);
++    } catch (err) {
++      notify('Copy failed — select the text manually', 'error');
++    }
++  };
++
++  const handleSaverStartEdit = (item) => {
++    setSaverEditingId(item.id);
++    setSaverEditTitle(item.title || '');
++    setSaverEditText(item.text || '');
++    setSaverExpandedId(item.id);
++  };
++
++  const handleSaverSaveEdit = async () => {
++    if (!saverEditingId || saverSavingEdit) return;
++    if (!saverEditTitle.trim() || !saverEditText.trim()) {
++      notify('Title and text cannot be empty', 'error');
++      return;
++    }
++    setSaverSavingEdit(true);
++    try {
++      await api.patch(`/transcript-saver/${saverEditingId}`, {
++        title: saverEditTitle.trim(),
++        text: saverEditText.trim(),
++      });
++      setSaverEditingId(null);
++      await loadSaverItems();
++      notify('Transcript updated', 'success');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to update transcript.'), 'error');
++    } finally {
++      setSaverSavingEdit(false);
++    }
++  };
++
++  const handleSaverDelete = async (id) => {
++    try {
++      await api.delete(`/transcript-saver/${id}`);
++      if (saverExpandedId === id) setSaverExpandedId(null);
++      if (saverEditingId === id) setSaverEditingId(null);
++      await loadSaverItems();
++      notify('Transcript deleted', 'info');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to delete transcript.'), 'error');
++    }
++  };
++
++  const handleSaverClearAll = async () => {
++    if (!saverConfirmClearAll) {
++      setSaverConfirmClearAll(true);
++      window.setTimeout(() => setSaverConfirmClearAll(false), 4000);
++      notify('Click "Clear all" again to confirm', 'info');
++      return;
++    }
++    try {
++      await api.delete('/transcript-saver');
++      setSaverConfirmClearAll(false);
++      setSaverExpandedId(null);
++      setSaverEditingId(null);
++      await loadSaverItems();
++      notify('All saved transcripts cleared', 'info');
++    } catch (err) {
++      notify(safeFetchError(err, 'Unable to clear transcripts.'), 'error');
++    }
++  };
++
+   const handleFetchMetadata = async () => {
+     const trimmed = url.trim();
+     if (!trimmed || metadataLoading) return;
+@@ -1249,6 +1430,16 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               <Clipboard size={16} />
+               {transcriptCopyStatus}
+             </button>
++            <button
++              className="ghost-button"
++              type="button"
++              onClick={handleSaveCurrentUrlTranscript}
++              disabled={!transcriptText}
++              title="Save this transcript into the Transcript Saver below so it survives reloads"
++            >
++              <Save size={16} />
++              Save to Saver
++            </button>
+           </div>
+         </form>
+ 
+@@ -1268,6 +1459,171 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+         ) : null}
+       </section>
+ 
++      {/* --- Transcript Saver: persistent lecture transcripts --- */}
++      <section className="panel panel--form transcript-saver-panel">
++        <div className="panel__header panel__header--stacked">
++          <div>
++            <div className="section-eyebrow section-eyebrow--soft">Saved for every lecture</div>
++            <h2 className="panel__title">Transcript Saver</h2>
++            <p className="panel__subtitle">
++              Transcripts saved here stay forever — even after a video is deleted or the page is reloaded,
++              you never have to re-paste the link or re-fetch captions. Copy-paste any lecture's notes, or
++              fetch YouTube's auto transcript in one click.
++            </p>
++          </div>
++          <div className="transcript-saver-header__actions">
++            <span className="panel__badge panel__badge--soft">{saverItems.length} saved</span>
++            <button
++              className={`ghost-button ${saverConfirmClearAll ? 'ghost-button--danger' : ''}`}
++              type="button"
++              onClick={handleSaverClearAll}
++              disabled={saverItems.length === 0}
++            >
++              <Trash2 size={16} />
++              {saverConfirmClearAll ? 'Confirm clear all' : 'Clear all'}
++            </button>
++          </div>
++        </div>
++
++        <div className="form-grid">
++          <div className="field">
++            <label className="field__label" htmlFor="saver-title">TITLE (e.g. Lecture 4 – Calculus)</label>
++            <input
++              id="saver-title"
++              className="input"
++              value={saverTitle}
++              onChange={(event) => setSaverTitle(event.target.value)}
++              placeholder="Lecture title"
++              maxLength={300}
++            />
++          </div>
++          <div className="field">
++            <label className="field__label" htmlFor="saver-url">YOUTUBE LINK (optional, for reference)</label>
++            <input
++              id="saver-url"
++              className="input"
++              value={saverUrl}
++              onChange={(event) => setSaverUrl(event.target.value)}
++              placeholder="https://youtube.com/watch?v=..."
++            />
++          </div>
++          <div className="field field--full">
++            <label className="field__label" htmlFor="saver-text">TRANSCRIPT TEXT</label>
++            <textarea
++              id="saver-text"
++              className="transcript-textarea"
++              rows={6}
++              value={saverText}
++              onChange={(event) => setSaverText(event.target.value)}
++              placeholder="Paste the lecture transcript here…"
++            />
++          </div>
++        </div>
++
++        <div className="transcript-actions">
++          <button className="primary-button" type="button" onClick={handleSaverSave} disabled={saverSaving}>
++            {saverSaving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
++            {saverSaving ? 'Saving…' : 'Save transcript'}
++          </button>
++          <span className="transcript-saver-divider">or fetch from YouTube</span>
++          <input
++            className="input transcript-saver-fetch-input"
++            value={saverFetchUrl}
++            onChange={(event) => setSaverFetchUrl(event.target.value)}
++            placeholder="Paste a YouTube link to fetch & save its auto transcript"
++            onKeyDown={(event) => {
++              if (event.key === 'Enter') {
++                event.preventDefault();
++                handleSaverFetch();
++              }
++            }}
++          />
++          <button className="ghost-button" type="button" onClick={handleSaverFetch} disabled={saverFetching || !saverFetchUrl.trim()}>
++            {saverFetching ? <Loader2 className="spin" size={16} /> : <FileText size={16} />}
++            {saverFetching ? 'Fetching…' : 'Fetch & save'}
++          </button>
++        </div>
++
++        {saverError ? <p className="download-card__error">{saverError}</p> : null}
++
++        <div className="transcript-saver-list">
++          {saverLoading ? (
++            <div className="empty-state empty-state--compact"><p>Loading saved transcripts…</p></div>
++          ) : saverItems.length === 0 ? (
++            <div className="empty-state empty-state--compact">
++              <p>No saved transcripts yet. Paste one above, fetch from YouTube, or use the “Save to Saver” button
++              next to any transcript you fetch.</p>
++            </div>
++          ) : (
++            saverItems.map((item) => {
++              const expanded = saverExpandedId === item.id;
++              const editing = saverEditingId === item.id;
++              return (
++                <div key={item.id} className={`saver-item ${expanded ? 'saver-item--expanded' : ''}`}>
++                  <div className="saver-item__head">
++                    <button
++                      className="saver-item__toggle"
++                      type="button"
++                      onClick={() => setSaverExpandedId(expanded ? null : item.id)}
++                    >
++                      {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
++                    </button>
++                    <div className="saver-item__title">
++                      <strong>{item.title}</strong>
++                      <span className="saver-item__meta">
++                        {item.source === 'youtube' ? 'YouTube auto' : 'Manual'} · {item.line_count} lines ·
++                        {new Date(item.updated_at * 1000).toLocaleDateString()}
++                        {item.video_id ? ` · ${item.video_id}` : ''}
++                      </span>
++                    </div>
++                    <span className="saver-item__preview">{item.preview}</span>
++                    <div className="saver-item__actions">
++                      <button className="icon-button" type="button" title="Copy full transcript" onClick={() => handleSaverCopy(item)}>
++                        {saverCopyStatusId === item.id ? <Check size={15} /> : <Copy size={15} />}
++                      </button>
++                      <button className="icon-button" type="button" title="Edit" onClick={() => handleSaverStartEdit(item)}>
++                        <PenLine size={15} />
++                      </button>
++                      <button className="icon-button icon-button--danger" type="button" title="Delete" onClick={() => handleSaverDelete(item.id)}>
++                        <Trash2 size={15} />
++                      </button>
++                    </div>
++                  </div>
++
++                  {editing ? (
++                    <div className="saver-item__edit">
++                      <input
++                        className="input"
++                        value={saverEditTitle}
++                        onChange={(event) => setSaverEditTitle(event.target.value)}
++                        maxLength={300}
++                      />
++                      <textarea
++                        className="transcript-textarea"
++                        rows={8}
++                        value={saverEditText}
++                        onChange={(event) => setSaverEditText(event.target.value)}
++                      />
++                      <div className="transcript-actions">
++                        <button className="primary-button" type="button" onClick={handleSaverSaveEdit} disabled={saverSavingEdit}>
++                          {saverSavingEdit ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
++                          Save changes
++                        </button>
++                        <button className="ghost-button" type="button" onClick={() => setSaverEditingId(null)}>
++                          <X size={16} /> Cancel
++                        </button>
++                      </div>
++                    </div>
++                  ) : expanded ? (
++                    <pre className="saver-item__text">{item.text}</pre>
++                  ) : null}
++                </div>
++              );
++            })
++          )}
++        </div>
++      </section>
++
+       {/* Toggle Switch */}
+       <section className="panel panel--toggle">
+         <div className="download-mode-toggle">
+@@ -1772,6 +2128,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                 <input type="checkbox" checked={plSequential} onChange={(event) => setPlSequential(event.target.checked)} />
+                 <span>Download one by one (wait for each video to finish before the next)</span>
+               </label>
++              <label className="playlist-batch-seq playlist-batch-seq--transcripts">
++                <input type="checkbox" checked={plFetchTranscripts} onChange={(event) => setPlFetchTranscripts(event.target.checked)} />
++                <span>Also fetch YouTube auto transcript for each video (saved to Transcript Saver)</span>
++              </label>
+               <button
+                 className="primary-button"
+                 type="button"
+@@ -1805,6 +2165,9 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                     ? `${batch.completed_count} of ${batch.total_count} done`
+                       + (batch.added_count ? ` · ${batch.added_count} added to "${batch.target_playlist_name || 'playlist'}"` : '')
+                       + (batch.failed_count ? ` · ${batch.failed_count} failed` : '')
++                      + (batch.fetch_transcripts
++                        ? ` · ${batch.transcripts_saved_count || 0}/${batch.transcripts_total || 0} transcripts saved`
++                        : '')
+                     : 'Starting…'}
+                 </p>
+               </div>
+@@ -1860,6 +2223,20 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                           <Loader2 className="spin" size={14} /> {batchTaskStatusLabel(task.status)}
+                         </span>
+                       )}
++                      {task.transcript_status && task.transcript_status !== 'skipped' ? (
++                        <span
++                          className={`playlist-batch-task__tflag playlist-batch-task__tflag--${task.transcript_status}`}
++                          title={task.transcript_error || transcriptStatusLabel(task.transcript_status)}
++                        >
++                          {task.transcript_status === 'saved' ? <CheckCircle2 size={13} /> : null}
++                          {task.transcript_status === 'unavailable' || task.transcript_status === 'error'
++                            ? <XCircle size={13} />
++                            : task.transcript_status === 'fetching'
++                              ? <Loader2 className="spin" size={13} />
++                              : null}
++                          {transcriptStatusLabel(task.transcript_status)}
++                        </span>
++                      ) : null}
+                       {(task.error && task.status === 'error') || task.auto_add_error ? (
+                         <span className="playlist-batch-task__err" title={task.error || task.auto_add_error}>
+                           {task.error || task.auto_add_error}

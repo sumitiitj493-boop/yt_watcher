@@ -1,0 +1,183 @@
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index a8f8e1d..a2cf156 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4070,3 +4070,18 @@ body[data-theme='dark'] .main-stage {
+ 		max-width: 100%;
+ 	}
+ }
++
++/* Transcript bulk actions (copy all / download all) */
++.transcript-bulk-actions {
++	display: flex;
++	gap: 8px;
++	margin-left: auto;
++	align-items: center;
++}
++
++@media (max-width: 720px) {
++	.transcript-bulk-actions {
++		margin-left: 0;
++		width: 100%;
++	}
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 297c5c1..0525b5e 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1843,12 +1843,27 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                       + (batch.failed_count ? ` · ${batch.failed_count} failed` : '')
+                       + (batch.fetch_transcripts
+                         ? ` · ${batch.transcripts_saved_count || 0}/${batch.transcripts_total || 0} transcripts saved`
++                          + (batch.transcript_folder ? ` to "${batch.transcript_folder}"` : ' to General')
+                         : '')
+                     : 'Starting…'}
+                 </p>
+               </div>
+               {batch ? (
+                 <div className="playlist-batch-progress__actions">
++                  {batch.fetch_transcripts && (batch.transcripts_saved_count || 0) > 0 ? (
++                    <Link
++                      className="ghost-button"
++                      to={
++                        batch.transcript_folder
++                          ? `/transcripts?folder=${encodeURIComponent(batch.transcript_folder)}`
++                          : '/transcripts'
++                      }
++                      title="Open all saved transcripts from this batch"
++                    >
++                      <BookOpenText size={16} />
++                      View {batch.transcripts_saved_count} transcript{batch.transcripts_saved_count === 1 ? '' : 's'}
++                    </Link>
++                  ) : null}
+                   {['running', 'cancelling'].includes(batch.phase) ? (
+                     <button className="ghost-button" type="button" onClick={handleCancelBatch}>
+                       <X size={16} /> Cancel batch
+diff --git a/frontend/src/pages/Transcripts.jsx b/frontend/src/pages/Transcripts.jsx
+index 91dbc41..d176cd8 100644
+--- a/frontend/src/pages/Transcripts.jsx
++++ b/frontend/src/pages/Transcripts.jsx
+@@ -1,7 +1,9 @@
+ import { useCallback, useEffect, useMemo, useState } from 'react';
++import { useSearchParams } from 'react-router-dom';
+ import {
+   Check,
+   Copy,
++  Download,
+   FileText,
+   Loader2,
+   PenLine,
+@@ -25,6 +27,7 @@ function formatDate(value) {
+ }
+ 
+ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
++  const [searchParams, setSearchParams] = useSearchParams();
+   const [items, setItems] = useState([]);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState('');
+@@ -34,9 +37,13 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+   const [fetchFolder, setFetchFolder] = useState('');
+   const [fetching, setFetching] = useState(false);
+ 
+-  // Search + folder filter
++  // Search + folder filter (folder may come from ?folder= in the URL,
++  // e.g. when the batch progress card links "View transcripts")
+   const [query, setQuery] = useState('');
+-  const [activeFolder, setActiveFolder] = useState('all');
++  const [activeFolder, setActiveFolder] = useState(() => {
++    const folder = searchParams.get('folder');
++    return folder ? folder : 'all';
++  });
+ 
+   // Expand / edit / clear
+   const [expandedId, setExpandedId] = useState(null);
+@@ -45,6 +52,7 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+   const [editText, setEditText] = useState('');
+   const [savingEdit, setSavingEdit] = useState(false);
+   const [copyStatusId, setCopyStatusId] = useState(null);
++  const [copyAllStatus, setCopyAllStatus] = useState(false);
+   const [confirmClearAll, setConfirmClearAll] = useState(false);
+ 
+   const notify = useCallback((message, type = 'info') => {
+@@ -98,6 +106,53 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+     return list;
+   }, [items, activeFolder, query]);
+ 
++  const selectFolder = (folder) => {
++    setActiveFolder(folder);
++    if (folder === 'all') {
++      setSearchParams({}, { replace: true });
++    } else {
++      setSearchParams({ folder }, { replace: true });
++    }
++  };
++
++  // All transcripts in the current view combined into one text (title separators).
++  const combinedText = useMemo(() => {
++    return filtered
++      .map((item) => {
++        const header = `==========\n${item.title || 'Transcript'}  ·  ${folderLabel(item.folder)}\n==========`;
++        return `${header}\n${item.text || ''}`;
++      })
++      .join('\n\n\n');
++  }, [filtered]);
++
++  const handleCopyAll = async () => {
++    if (!combinedText) return;
++    try {
++      await navigator.clipboard.writeText(combinedText);
++      setCopyAllStatus(true);
++      window.setTimeout(() => setCopyAllStatus(false), 1600);
++      notify(`Copied ${filtered.length} transcript${filtered.length === 1 ? '' : 's'} to clipboard`, 'success');
++    } catch {
++      notify('Copy failed — try Download .txt instead', 'error');
++    }
++  };
++
++  const handleDownloadAll = () => {
++    if (!combinedText) return;
++    const folderName = activeFolder === 'all' ? 'All-Transcripts' : (activeFolder || 'General');
++    const safeName = folderName.replace(/[^\w-]+/g, '_').replace(/^_+|_+$/g, '') || 'Transcripts';
++    const blob = new Blob([combinedText], { type: 'text/plain;charset=utf-8' });
++    const url = URL.createObjectURL(blob);
++    const link = document.createElement('a');
++    link.href = url;
++    link.download = `${safeName} (${filtered.length} transcripts).txt`;
++    document.body.appendChild(link);
++    link.click();
++    document.body.removeChild(link);
++    URL.revokeObjectURL(url);
++    notify(`Downloaded ${filtered.length} transcript${filtered.length === 1 ? '' : 's'} as .txt`, 'success');
++  };
++
+   const handleFetch = async () => {
+     const trimmed = fetchUrl.trim();
+     if (!trimmed || fetching) return;
+@@ -277,7 +332,7 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+               key={folder}
+               type="button"
+               className={`transcript-folder-chip ${activeFolder === folder ? 'transcript-folder-chip--active' : ''}`}
+-              onClick={() => setActiveFolder(folder)}
++              onClick={() => selectFolder(folder)}
+             >
+               {folder === 'all' ? 'All' : folderLabel(folder)}
+               <span className="transcript-folder-chip__count">
+@@ -288,6 +343,18 @@ export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
+             </button>
+           ))}
+         </div>
++        {filtered.length > 0 ? (
++          <div className="transcript-bulk-actions">
++            <button className="ghost-button ghost-button--small" type="button" onClick={handleCopyAll}>
++              {copyAllStatus ? <Check size={14} /> : <Copy size={14} />}
++              {copyAllStatus ? 'Copied!' : `Copy all (${filtered.length})`}
++            </button>
++            <button className="ghost-button ghost-button--small" type="button" onClick={handleDownloadAll}>
++              <Download size={14} />
++              Download .txt
++            </button>
++          </div>
++        ) : null}
+       </section>
+ 
+       {/* List */}

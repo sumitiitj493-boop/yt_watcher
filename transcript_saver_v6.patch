@@ -1,0 +1,51 @@
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 0525b5e..47c63b0 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1850,7 +1850,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               </div>
+               {batch ? (
+                 <div className="playlist-batch-progress__actions">
+-                  {batch.fetch_transcripts && (batch.transcripts_saved_count || 0) > 0 ? (
++                  {batch.fetch_transcripts ? (
+                     <Link
+                       className="ghost-button"
+                       to={
+@@ -1858,10 +1858,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                           ? `/transcripts?folder=${encodeURIComponent(batch.transcript_folder)}`
+                           : '/transcripts'
+                       }
+-                      title="Open all saved transcripts from this batch"
++                      title="Open the Transcripts page (auto-filtered to this batch's folder)"
+                     >
+                       <BookOpenText size={16} />
+-                      View {batch.transcripts_saved_count} transcript{batch.transcripts_saved_count === 1 ? '' : 's'}
++                      {batch.transcripts_saved_count > 0
++                        ? `View ${batch.transcripts_saved_count} transcript${batch.transcripts_saved_count === 1 ? '' : 's'}`
++                        : 'View Transcripts page'}
+                     </Link>
+                   ) : null}
+                   {['running', 'cancelling'].includes(batch.phase) ? (
+@@ -1890,7 +1892,22 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+                   <span>{batch.done_count}/{batch.total_count} finished</span>
+                   <span>{batch.added_count} added to playlist</span>
+                   <span>{batch.failed_count} failed</span>
++                  {batch.fetch_transcripts ? (
++                    <span>
++                      {batch.transcripts_saved_count}/{batch.transcripts_total} transcripts saved
++                      {batch.transcript_folder ? ` → "${batch.transcript_folder}"` : ' → General'}
++                    </span>
++                  ) : null}
+                 </div>
++                {batch.fetch_transcripts
++                  && batch.transcripts_saved_count === 0
++                  && ['completed', 'partial', 'cancelled'].includes(batch.phase) ? (
++                  <p className="download-card__error">
++                    No transcripts were saved. The videos may have no YouTube captions (see “No transcript” on
++                    the rows below), or the backend needs a restart after applying patches. If captions exist,
++                    restart the backend and re-run the batch.
++                  </p>
++                ) : null}
+                 <div className="playlist-batch-tasks">
+                   {batch.tasks.map((task) => (
+                     <div

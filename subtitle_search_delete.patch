@@ -1,0 +1,871 @@
+diff --git a/SEARCH_DELETE_FEATURE.md b/SEARCH_DELETE_FEATURE.md
+new file mode 100644
+index 0000000..0f7881e
+--- /dev/null
++++ b/SEARCH_DELETE_FEATURE.md
+@@ -0,0 +1,57 @@
++# Subtitle Search + Clean Deletion Model
++
++Two improvements that fix the daily pain of big playlists and confusing deletes.
++
++## 1. Find a video by pasting its subtitle
++
++Inside the Playlist page's **"Fetch Transcripts Again"** panel there is now a
++**"Find a video by pasting a subtitle line"** search:
++
++- Paste any transcript/subtitle text (e.g. *"mitochondria is the powerhouse"*)
++  and click **Find video**.
++- The app searches the **saved transcripts** of the active playlist's videos
++  (fast). If nothing matches and some videos have no saved transcript, it
++  **fetches their YouTube transcripts on the fly** (small concurrency) and
++  checks those too.
++- Results show the matching video with a **snippet** of where the text appears;
++  click a result → it **jumps to that video in the playlist and starts playing**.
++
++Backend: `POST /api/search-by-transcript`
++`{ query, playlist_id, fetch_missing: true, limit: 20 }`
++→ `{ matches: [{filename, title, video_id, snippet, source}], checked, fetched_missing, no_transcript }`
++(no `playlist_id` = search the whole Library.)
++
++## 2. One consistent deletion model
++
++Previously: deleting from a playlist kept the file on your PC and in the
++Library; deleting from the Library left dangling playlist entries. Now:
++
++| Action | Result |
++|---|---|
++| **Delete from a playlist** | File is **permanently deleted** from disk, Library, and every other playlist (two-click confirm warns you) |
++| **Delete from Library** | File deleted **and removed from all playlists** |
++| **Clear Library** | Same clean-up for every file |
++| **File in a playlist** | **Hidden from the Library grid** by default (they "live" in the playlist) |
++
++The Library toolbar has a **"Hide playlist files"** toggle (on by default) to
++switch between *only non-playlist files* and *everything*. A file that's in a
++playlist is flagged `in_playlist` in the API, and each Library card can show
++which playlist it belongs to.
++
++Backend changes:
++- `DELETE /api/playlists/{id}/items/{filename}` now permanently deletes.
++- `DELETE /api/delete/{filename}` and `/api/files/clear` remove the file from
++  all playlists too.
++- `GET /api/files?hide_playlist=1` returns only non-playlist files.
++- New DB helpers: `find_saved_transcript_by_video_id`,
++  `playlist_all_filenames`, `remove_file_from_all_playlists`.
++
++## Files changed
++
++- `backend/services/database.py` — helpers
++- `backend/routes/library.py` — search endpoint, hide-playlist filter, permanent-delete helper
++- `frontend/src/pages/Playlist.jsx` — subtitle search UI, two-click permanent delete
++- `frontend/src/App.jsx` — Library "Hide playlist files" toggle
++- `frontend/src/App.css` — subtitle search styles
++
++Apply the patch, then **restart the backend** (backend changed) and hard-refresh.
+diff --git a/backend/routes/library.py b/backend/routes/library.py
+index 3a97181..808c243 100644
+--- a/backend/routes/library.py
++++ b/backend/routes/library.py
+@@ -1,3 +1,4 @@
++import asyncio
+ import mimetypes
+ import time
+ 
+@@ -13,10 +14,14 @@ from services.database import (
+     delete_file_link,
+     delete_note,
+     delete_playlist,
++    find_saved_transcript_by_video_id,
+     get_default_playlist_id,
++    get_file_link,
+     get_playlist_items,
+     list_notes,
+     list_playlists,
++    playlist_all_filenames,
++    remove_file_from_all_playlists,
+     remove_playlist_item,
+     rename_playlist,
+     reorder_playlist,
+@@ -29,7 +34,7 @@ import stat
+ import sys
+ from services.files import DOWNLOAD_DIR, clean_title, extract_video_id, resolve_download_path
+ from services.stream_state import active_streams
+-from services.transcripts import fetch_online_transcript
++from services.transcripts import fetch_online_transcript, fetch_url_transcript
+ from services.audio_extractor import (
+     get_audio_extraction_job,
+     start_audio_extraction,
+@@ -87,9 +92,9 @@ class AudioExtractRequest(BaseModel):
+     bitrate: str = Field(default="192k", max_length=10)
+ 
+ 
+-def _get_cached_files() -> list[dict]:
++def _get_cached_files(hide_playlist: bool = False) -> list[dict]:
+     now = time.time()
+-    if now - _files_cache["ts"] <= CACHE_TTL_SECONDS:
++    if now - _files_cache["ts"] <= CACHE_TTL_SECONDS and not hide_playlist:
+         return _files_cache["data"]
+     # Patterns to exclude from library
+     EXCLUDE_SUFFIXES = {".part", ".temp", ".ytdl", ".json"}
+@@ -98,6 +103,8 @@ def _get_cached_files() -> list[dict]:
+     # hide incomplete video/audio files, not legitimate small photos.
+     IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+ 
++    in_playlist = playlist_all_filenames()
++
+     file_list = []
+     for file_path in DOWNLOAD_DIR.iterdir():
+         # Skip non-files
+@@ -112,6 +119,9 @@ def _get_cached_files() -> list[dict]:
+         # Skip non-media files
+         if file_path.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
+             continue
++        # Hide files that already belong to a playlist (they live in the playlist).
++        if hide_playlist and file_path.name in in_playlist:
++            continue
+         # Skip very small files (likely corrupted/partial) under 100KB —
+         # but NOT for images, which can be legitimately small.
+         if file_path.stat().st_size < 102400 and file_path.suffix.lower() not in IMAGE_SUFFIXES:
+@@ -125,6 +135,7 @@ def _get_cached_files() -> list[dict]:
+             "size": stat_info.st_size,
+             "created_at": stat_info.st_mtime,
+             "ext": file_path.suffix.lower().lstrip("."),
++            "in_playlist": file_path.name in in_playlist,
+         })
+ 
+     file_list = sorted(
+@@ -132,16 +143,19 @@ def _get_cached_files() -> list[dict]:
+         key=lambda item: item.get("created_at", 0),
+         reverse=True,
+     )
+-    _files_cache["ts"] = now
+-    _files_cache["data"] = file_list
++    # Only the unfiltered scan may populate the shared cache; filtered
++    # (hide_playlist) scans must not poison it for other callers.
++    if not hide_playlist:
++        _files_cache["ts"] = now
++        _files_cache["data"] = file_list
+     return file_list
+ 
+ 
+ @router.get("/files")
+-async def list_files():
++async def list_files(hide_playlist: int = 0):
+     if not DOWNLOAD_DIR.exists():
+         return {"files": []}
+-    return {"files": _get_cached_files()}
++    return {"files": _get_cached_files(hide_playlist=bool(hide_playlist))}
+ 
+ 
+ @router.get("/storage")
+@@ -216,17 +230,14 @@ async def extract_audio_status(job_id: str):
+ 
+ 
+ @router.delete("/delete/{filename}")
+-async def delete_file(filename: str):
+-    try:
+-        file_path = resolve_download_path(filename)
+-    except ValueError:
+-        raise HTTPException(status_code=400, detail="Invalid filename")
+-
+-    if not file_path.exists():
+-        raise HTTPException(status_code=404, detail="File not found")
+-
++def _delete_file_permanently(filename: str) -> None:
++    """Delete a media file from disk and clean up every reference to it:
++    file link, all playlists. Shared by library delete, clear-all and
++    playlist-item delete so the model is consistent everywhere.
++    """
++    file_path = resolve_download_path(filename)
+     # Attempt to release any known active streams for this file, then delete.
+-    active_streams.discard(filename)
++    active_streams.discard(file_path.name)
+     gc.collect()
+     try:
+         file_path.unlink()
+@@ -245,6 +256,20 @@ async def delete_file(filename: str):
+                 )
+     _files_cache["ts"] = 0.0
+     delete_file_link(file_path.name)
++    remove_file_from_all_playlists(file_path.name)
++
++
++@router.delete("/delete/{filename}")
++async def delete_file(filename: str):
++    try:
++        file_path = resolve_download_path(filename)
++    except ValueError:
++        raise HTTPException(status_code=400, detail="Invalid filename")
++
++    if not file_path.exists():
++        raise HTTPException(status_code=404, detail="File not found")
++
++    _delete_file_permanently(file_path.name)
+     return {"message": "Deleted"}
+ 
+ 
+@@ -262,6 +287,109 @@ async def search_files(query: str):
+     return {"results": results}
+ 
+ 
++class SearchByTranscriptRequest(BaseModel):
++    """Find a downloaded video by pasting a snippet of its transcript/subtitle."""
++    query: str = Field(min_length=2, max_length=2000)
++    playlist_id: int | None = Field(default=None)
++    fetch_missing: bool = Field(default=True)
++    limit: int = Field(default=20, ge=1, le=100)
++
++
++def _snippet_around(text: str, query: str, radius: int = 70) -> str:
++    idx = text.lower().find(query.lower())
++    if idx < 0:
++        return text[: radius * 2]
++    start = max(0, idx - radius)
++    end = min(len(text), idx + len(query) + radius)
++    prefix = "…" if start > 0 else ""
++    suffix = "…" if end < len(text) else ""
++    return f"{prefix}{text[start:end].strip()}{suffix}"
++
++
++@router.post("/search-by-transcript")
++async def search_by_transcript(request: SearchByTranscriptRequest):
++    """Find which downloaded video contains the pasted subtitle text.
++
++    Searches saved transcripts first (fast); if nothing matches and
++    ``fetch_missing`` is on, it fetches YouTube transcripts for videos that
++    have none saved (small concurrency) and checks those too.
++    """
++    query = request.query.strip()
++    if len(query) < 2:
++        raise HTTPException(status_code=400, detail="Type at least 2 characters to search")
++
++    # Candidate files: the playlist's items, or every media file in the library.
++    if request.playlist_id is not None:
++        if not any(p.get("id") == request.playlist_id for p in list_playlists()):
++            raise HTTPException(status_code=404, detail="Playlist not found")
++        candidates = get_playlist_items(request.playlist_id)
++    else:
++        candidates = [f["filename"] for f in _get_cached_files() if f.get("ext") not in {"jpg", "jpeg", "png", "webp", "gif", "avif"}]
++
++    matches: list[dict] = []
++    missing: list[dict] = []
++    checked = 0
++
++    for filename in candidates:
++        filename = str(filename)
++        video_id = extract_video_id(filename)
++        row = find_saved_transcript_by_video_id(video_id) if video_id else None
++        checked += 1
++        if row and row.get("text"):
++            text = row["text"]
++            if query.lower() in text.lower():
++                matches.append({
++                    "filename": filename,
++                    "title": clean_title(filename),
++                    "video_id": video_id or "",
++                    "snippet": _snippet_around(text, query),
++                    "source": "saved",
++                })
++        else:
++            missing.append({"filename": filename, "video_id": video_id or ""})
++
++    fetched = 0
++    if request.fetch_missing and missing and (len(matches) == 0 or len(matches) < 3):
++        targets = missing[: request.limit]
++        sem = asyncio.Semaphore(3)
++
++        async def check_one(item: dict) -> None:
++            nonlocal fetched
++            async with sem:
++                url = (get_file_link(item["filename"]) or {}).get("url") or ""
++                if not url and item["video_id"]:
++                    url = f"https://www.youtube.com/watch?v={item['video_id']}"
++                if not url:
++                    return
++                try:
++                    result = await fetch_url_transcript(url)
++                except Exception:
++                    return
++                if not result.get("available"):
++                    return
++                fetched += 1
++                text = result.get("text") or ""
++                if query.lower() in text.lower():
++                    matches.append({
++                        "filename": item["filename"],
++                        "title": clean_title(item["filename"]),
++                        "video_id": item["video_id"] or "",
++                        "snippet": _snippet_around(text, query),
++                        "source": "online",
++                    })
++
++        await asyncio.gather(*(check_one(item) for item in targets), return_exceptions=True)
++
++    return {
++        "query": query,
++        "matches": matches[: request.limit],
++        "count": len(matches[: request.limit]),
++        "checked": checked,
++        "fetched_missing": fetched,
++        "no_transcript": len(missing),
++    }
++
++
+ @router.get("/transcript/{filename}")
+ async def get_transcript(filename: str):
+     try:
+@@ -317,15 +445,17 @@ async def clear_files():
+         active_streams.discard(file_path.name)
+         gc.collect()
+         try:
+-            file_path.unlink()
++            _delete_file_permanently(file_path.name)
+             deleted += 1
+         except PermissionError:
+             try:
+                 os.chmod(str(file_path), stat.S_IWRITE)
+-                file_path.unlink()
++                _delete_file_permanently(file_path.name)
+                 deleted += 1
+             except Exception:
+                 failed.append(file_path.name)
++        except Exception:
++            failed.append(file_path.name)
+ 
+     _files_cache["ts"] = 0.0
+     # Return a summary so the client can handle partial failures (e.g., files in use on Windows).
+@@ -467,13 +597,23 @@ async def playlists_add_items_batch(playlist_id: int, payload: PlaylistAddItemsR
+ 
+ @router.delete('/playlists/{playlist_id}/items/{filename}')
+ async def playlists_remove_item(playlist_id: int, filename: str):
++    """Remove an item from a playlist AND delete the file permanently.
++
++    Removing from a playlist means "I don't want this anymore" — so the file is
++    also removed from disk, the Library and every other playlist.
++    """
+     if not _playlist_exists(playlist_id):
+         raise HTTPException(status_code=404, detail="Playlist not found")
+     try:
+         safe_path = resolve_download_path(filename)
+     except ValueError:
+         raise HTTPException(status_code=400, detail="Invalid filename")
+-    return remove_playlist_item(playlist_id, safe_path.name)
++    if not safe_path.exists():
++        # File already gone — just clean up references.
++        remove_file_from_all_playlists(safe_path.name)
++        return {"message": "Deleted", "permanently": True}
++    _delete_file_permanently(safe_path.name)
++    return {"message": "Deleted from playlist and device", "permanently": True}
+ 
+ 
+ @router.post('/playlists/{playlist_id}/reorder')
+diff --git a/backend/services/database.py b/backend/services/database.py
+index 7238bb1..312365b 100644
+--- a/backend/services/database.py
++++ b/backend/services/database.py
+@@ -743,6 +743,35 @@ def delete_file_link(filename: str) -> None:
+         conn.commit()
+ 
+ 
++def find_saved_transcript_by_video_id(video_id: str) -> Optional[dict]:
++    """Return the most recent saved transcript text for a video id (for search)."""
++    ensure_db_initialized()
++    if not video_id:
++        return None
++    with _connect() as conn:
++        row = conn.execute(
++            "SELECT id, title, text, folder, source FROM saved_transcripts WHERE video_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
++            (video_id,),
++        ).fetchone()
++    return dict(row) if row else None
++
++
++def playlist_all_filenames() -> set:
++    """Set of every filename that currently belongs to any playlist."""
++    ensure_db_initialized()
++    with _connect() as conn:
++        rows = conn.execute("SELECT DISTINCT filename FROM playlist_items").fetchall()
++    return {row["filename"] for row in rows}
++
++
++def remove_file_from_all_playlists(filename: str) -> None:
++    """Remove a filename from every playlist (used when the file is deleted)."""
++    ensure_db_initialized()
++    with _connect() as conn:
++        conn.execute("DELETE FROM playlist_items WHERE filename = ?", ((filename or "").strip(),))
++        conn.commit()
++
++
+ # --- Saved clips (video editor output) ------------------------------------
+ def list_clips() -> List[dict]:
+     ensure_db_initialized()
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index 5da8e66..92c2b5c 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -4817,6 +4817,122 @@ body,
+ 	animation: hint-pop 240ms ease both;
+ }
+ 
++/* Media converter modal */
++.converter-backdrop {
++	position: fixed;
++	inset: 0;
++	z-index: 1550;
++	background: rgba(3, 6, 18, 0.6);
++	backdrop-filter: blur(6px);
++	-webkit-backdrop-filter: blur(6px);
++	display: flex;
++	align-items: center;
++	justify-content: center;
++	padding: 20px;
++}
++
++.converter-modal {
++	width: 100%;
++	max-width: 440px;
++	background: var(--surface);
++	border: 1px solid var(--border);
++	border-radius: 18px;
++	box-shadow: var(--shadow);
++	padding: 20px;
++	display: grid;
++	gap: 14px;
++}
++
++.converter-modal__head {
++	display: flex;
++	align-items: center;
++	gap: 12px;
++}
++
++.converter-modal__icon {
++	width: 36px;
++	height: 36px;
++	border-radius: 10px;
++	display: grid;
++	place-items: center;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	color: var(--accent-cool);
++	flex-shrink: 0;
++}
++
++.converter-modal__title {
++	display: flex;
++	flex-direction: column;
++	gap: 2px;
++	min-width: 0;
++	flex: 1;
++}
++
++.converter-modal__subtitle {
++	font-size: 0.78rem;
++	color: var(--text-muted);
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.converter-modal__close {
++	background: none;
++	border: none;
++	color: var(--text-muted);
++	cursor: pointer;
++	padding: 6px;
++	border-radius: 8px;
++	display: inline-flex;
++	flex-shrink: 0;
++}
++
++.converter-modal__close:hover {
++	color: var(--text);
++	background: rgba(255, 255, 255, 0.06);
++}
++
++.converter-form {
++	display: grid;
++	gap: 12px;
++}
++
++.converter-progress {
++	display: grid;
++	gap: 8px;
++}
++
++.converter-progress__row {
++	display: flex;
++	justify-content: space-between;
++	font-size: 0.85rem;
++	color: var(--text-muted);
++}
++
++.converter-done {
++	display: grid;
++	gap: 8px;
++	text-align: center;
++	padding: 8px 0;
++}
++
++.converter-done__title {
++	margin: 0;
++	font-weight: 700;
++	color: #34d399;
++	font-size: 1rem;
++}
++
++.converter-done__meta {
++	margin: 0;
++	color: var(--text-muted);
++	font-size: 0.82rem;
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
+ /* ==========================================================================
+    Clip Studio
+    ========================================================================== */
+@@ -4931,3 +5047,80 @@ body,
+ 	border-radius: 12px;
+ 	background: #000;
+ }
++
++/* Subtitle search (find video by pasted text) */
++.subtitle-search {
++	display: grid;
++	gap: 8px;
++	border-top: 1px dashed var(--border);
++	padding-top: 14px;
++	margin-top: 4px;
++}
++
++.subtitle-search__head {
++	display: flex;
++	align-items: center;
++	gap: 8px;
++	color: var(--accent-cool);
++	font-size: 0.85rem;
++	font-weight: 600;
++}
++
++.subtitle-search__row {
++	display: flex;
++	gap: 10px;
++	flex-wrap: wrap;
++}
++
++.subtitle-search__row .input {
++	flex: 1;
++	min-width: 220px;
++}
++
++.subtitle-search__summary {
++	margin: 4px 0 0;
++	font-size: 0.82rem;
++	color: var(--text-muted);
++}
++
++.subtitle-search__results {
++	display: grid;
++	gap: 6px;
++}
++
++.subtitle-search__match {
++	display: grid;
++	gap: 4px;
++	text-align: left;
++	padding: 10px 12px;
++	border: 1px solid var(--border);
++	border-radius: 12px;
++	background: var(--surface-muted);
++	cursor: pointer;
++	font-family: inherit;
++	color: var(--text);
++	transition: border-color 140ms ease, background 140ms ease;
++}
++
++.subtitle-search__match:hover {
++	border-color: var(--accent);
++	background: rgba(124, 58, 237, 0.08);
++}
++
++.subtitle-search__match-title {
++	font-weight: 700;
++	font-size: 0.9rem;
++}
++
++.subtitle-search__match-snippet {
++	font-size: 0.82rem;
++	color: var(--text-muted);
++	overflow: hidden;
++	text-overflow: ellipsis;
++	white-space: nowrap;
++}
++
++.subtitle-search__match-cta {
++	font-size: 0.78rem;
++	color: var(--accent-cool);
++}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index bcf4762..8623047 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -37,6 +37,7 @@ import {
+   XCircle,
+   BookOpenText,
+   ArrowUp,
++  ArrowLeftRight,
+   Scissors,
+ } from 'lucide-react';
+ 
+@@ -48,13 +49,14 @@ import LibraryPicker from './components/LibraryPicker';
+ import AudioExtractorPage from './pages/AudioExtractor';
+ import PhotosPage from './pages/photos';
+ import TranscriptsPage from './pages/Transcripts';
++import ClipsPage from './pages/Clips';
+ import CommandPalette from './components/CommandPalette';
+ import DownloadDock from './components/DownloadDock';
+ import ShortcutsModal from './components/ShortcutsModal';
+ import ConfettiBurst from './components/ConfettiBurst';
+ import Skeleton from './components/Skeleton';
+ import WelcomeQuote from './components/WelcomeQuote';
+-import ClipsPage from './pages/Clips';
++import ConverterDialog from './components/ConverterDialog';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -493,7 +495,7 @@ function DownloadCard({ item, onDelete, onRetry, onCancel, compact = false, onPr
+   );
+ }
+ 
+-function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMode = false, selected = false, onToggleSelect }) {
++function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, onConvert, selectMode = false, selected = false, onToggleSelect }) {
+   const title = file.title || cleanTitle(file.filename || 'Unknown file');
+   const ext = (file.ext || mediaExt(file.filename || '')).toLowerCase();
+   const downloadUrl = `${API_BASE}/files/download/${encodeURIComponent(file.filename)}`;
+@@ -528,6 +530,12 @@ function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMod
+           <a className="icon-button" href={downloadUrl} download title="Download file" onClick={(event) => event.stopPropagation()}>
+             <Download size={15} />
+           </a>
++          <button className="icon-button" type="button" title="Convert file" onClick={(event) => {
++            event.stopPropagation();
++            onConvert?.(file);
++          }}>
++            <ArrowLeftRight size={15} />
++          </button>
+           <button className="icon-button" type="button" title="Add to playlist" onClick={(event) => {
+             event.stopPropagation();
+             onAddToPlaylist?.(file.filename);
+@@ -2828,7 +2836,25 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+   const [selectionMode, setSelectionMode] = useState(false);
+   const [selectedFiles, setSelectedFiles] = useState(() => new Set());
+-  const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
++  const [convertFile, setConvertFile] = useState(null);
++  const [hidePlaylistFiles, setHidePlaylistFiles] = useState(true);
++  const [libraryFiles, setLibraryFiles] = useState(files);
++
++  useEffect(() => {
++    let active = true;
++    if (hidePlaylistFiles) {
++      api.get('/files?hide_playlist=1')
++        .then((res) => {
++          if (active) setLibraryFiles(Array.isArray(res.data?.files) ? res.data.files : files);
++        })
++        .catch(() => { if (active) setLibraryFiles(files); });
++    } else {
++      setLibraryFiles(files);
++    }
++    return () => { active = false; };
++  }, [hidePlaylistFiles, files]);
++
++  const mediaFiles = useMemo(() => libraryFiles.filter((file) => isMediaFile(file.filename || '')), [libraryFiles]);
+ 
+   const toggleSelectionMode = useCallback(() => {
+     setSelectionMode((current) => {
+@@ -3082,6 +3108,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+           />
+         </div>
+         <div className="toolbar-actions">
++          <label className="playlist-batch-seq" title="Files already in a playlist live there — hide them here to avoid duplicates">
++            <input
++              type="checkbox"
++              checked={hidePlaylistFiles}
++              onChange={(event) => setHidePlaylistFiles(event.target.checked)}
++            />
++            <span>Hide playlist files</span>
++          </label>
+           {selectionMode ? (
+             <>
+               <button
+@@ -3234,6 +3268,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+                 onSelect={setSelectedFile}
+                 onDelete={handleDeleteFile}
+                 onAddToPlaylist={onAddToPlaylist}
++                onConvert={setConvertFile}
+                 selectMode={selectionMode}
+                 selected={selectedFiles.has(file.filename)}
+                 onToggleSelect={toggleSelectFile}
+@@ -3243,6 +3278,16 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+           </div>
+         )}
+       </section>
++
++      {convertFile ? (
++        <ConverterDialog
++          file={convertFile}
++          onClose={() => setConvertFile(null)}
++          onConverted={() => {
++            if (onRefreshFiles) onRefreshFiles();
++          }}
++        />
++      ) : null}
+     </div>
+   );
+ }
+@@ -3867,7 +3912,7 @@ export default function App() {
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+           <Route path="/library" element={<LibraryPage files={files} filesReady={filesReady} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+-          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
++          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
+           <Route path="/transcripts" element={<TranscriptsPage onNotify={pushToast} onTranscriptsChanged={refreshTranscriptCount} />} />
+           <Route path="/clips" element={<ClipsPage files={files} onNotify={pushToast} onClipsChanged={refreshClipsCount} />} />
+           <Route path="/photos" element={<PhotosPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onNotify={pushToast} />} />
+diff --git a/frontend/src/pages/Playlist.jsx b/frontend/src/pages/Playlist.jsx
+index 5f0ce40..abf02e8 100644
+--- a/frontend/src/pages/Playlist.jsx
++++ b/frontend/src/pages/Playlist.jsx
+@@ -157,7 +157,7 @@ function PlaylistThumb({ file }) {
+   );
+ }
+ 
+-export default function PlaylistPage({ files = [], onNotify }) {
++export default function PlaylistPage({ files = [], onNotify, onLibraryChanged }) {
+   // Multi-playlist state
+   const [playlists, setPlaylists] = useState([]);                 // [{ id, name, created_at, item_count }]
+   const [activePlaylistId, setActivePlaylistId] = useState(null);
+@@ -229,6 +229,12 @@ export default function PlaylistPage({ files = [], onNotify }) {
+   const [trStarting, setTrStarting] = useState(false);
+   const [trBatchId, setTrBatchId] = useState(null);
+   const [trBatch, setTrBatch] = useState(null);
++
++  // Find video by pasted subtitle
++  const [subQuery, setSubQuery] = useState('');
++  const [subSearching, setSubSearching] = useState(false);
++  const [subResults, setSubResults] = useState(null); // { matches, count, fetched_missing, no_transcript }
++  const [subError, setSubError] = useState('');
+   const trStopRef = useRef(false);
+ 
+   const trStatusLabel = (status) => {
+@@ -339,6 +345,36 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     };
+   }, [trBatchId]);
+ 
++  const handleSubtitleSearch = async () => {
++    const q = subQuery.trim();
++    if (q.length < 2 || subSearching) return;
++    setSubSearching(true);
++    setSubError('');
++    setSubResults(null);
++    try {
++      const res = await api.post('/search-by-transcript', {
++        query: q,
++        playlist_id: activePlaylistId,
++        fetch_missing: true,
++        limit: 20,
++      });
++      setSubResults(res.data || { matches: [], count: 0 });
++    } catch (err) {
++      setSubError(err?.response?.data?.detail || 'Unable to search transcripts');
++    } finally {
++      setSubSearching(false);
++    }
++  };
++
++  const jumpToSubtitleMatch = (filename) => {
++    const idx = playlist.findIndex((item) => item === filename);
++    if (idx >= 0) {
++      setCurrentIndex(idx);
++      setIsPlaying(true);
++      window.setTimeout(() => playerRef.current?.play?.(), 0);
++    }
++  };
++
+   const resetTranscriptFetch = () => {
+     setTrBatchId(null);
+     setTrBatch(null);
+@@ -587,13 +623,23 @@ export default function PlaylistPage({ files = [], onNotify }) {
+     }
+   };
+ 
++  const [confirmRemoveFile, setConfirmRemoveFile] = useState(null); // two-step permanent delete guard
++
+   const removeItem = async (filename) => {
+     if (!activePlaylistId) return;
++    if (confirmRemoveFile !== filename) {
++      setConfirmRemoveFile(filename);
++      notify('Click delete again to confirm — this also deletes the file from your device & Library', 'info');
++      window.setTimeout(() => setConfirmRemoveFile((current) => (current === filename ? null : current)), 4000);
++      return;
++    }
++    setConfirmRemoveFile(null);
+     try {
+-      const response = await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
+-      setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
++      await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
++      setPlaylist((current) => current.filter((item) => item !== filename));
+       await loadPlaylists();
+-      notify('Removed from playlist', 'info');
++      if (onLibraryChanged) onLibraryChanged();
++      notify('Removed from playlist & file deleted from device', 'success');
+     } catch (error) {
+       notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
+     }
+@@ -1033,6 +1079,46 @@ export default function PlaylistPage({ files = [], onNotify }) {
+               ) : null}
+             </div>
+ 
++            {/* Find a video by pasting its subtitle */}
++            <div className="subtitle-search">
++              <div className="subtitle-search__head">
++                <Search size={14} />
++                <span>Find a video by pasting a subtitle line</span>
++              </div>
++              <div className="subtitle-search__row">
++                <input
++                  className="input"
++                  value={subQuery}
++                  onChange={(event) => { setSubQuery(event.target.value); setSubResults(null); setSubError(''); }}
++                  onKeyDown={(event) => { if (event.key === 'Enter') handleSubtitleSearch(); }}
++                  placeholder="Paste any subtitle text from the video… (e.g. “mitochondria is the powerhouse”)"
++                />
++                <button className="ghost-button" type="button" onClick={handleSubtitleSearch} disabled={subSearching || subQuery.trim().length < 2}>
++                  {subSearching ? <Loader2 className="spin" size={16} /> : <Search size={16} />}
++                  {subSearching ? 'Searching…' : 'Find video'}
++                </button>
++              </div>
++              {subError ? <p className="download-card__error">{subError}</p> : null}
++              {subResults ? (
++                <div className="subtitle-search__results">
++                  <p className="subtitle-search__summary">
++                    {subResults.count > 0
++                      ? `Found ${subResults.count} video${subResults.count === 1 ? '' : 's'} in this playlist`
++                      : 'No matching video found'}
++                    {subResults.fetched_missing > 0 ? ` · fetched ${subResults.fetched_missing} transcript${subResults.fetched_missing === 1 ? '' : 's'} to check` : ''}
++                    {subResults.no_transcript > 0 && subResults.count === 0 ? ` · ${subResults.no_transcript} video${subResults.no_transcript === 1 ? '' : 's'} had no saved transcript` : ''}
++                  </p>
++                  {subResults.matches?.map((m) => (
++                    <button key={m.filename} className="subtitle-search__match" type="button" onClick={() => jumpToSubtitleMatch(m.filename)}>
++                      <span className="subtitle-search__match-title">{m.title}</span>
++                      <span className="subtitle-search__match-snippet">“{m.snippet}”</span>
++                      <span className="subtitle-search__match-cta">Play in playlist →</span>
++                    </button>
++                  ))}
++                </div>
++              ) : null}
++            </div>
++
+             {trBatchId ? (
+               <div className="playlist-batch-progress">
+                 <div className="download-card__title-row">

@@ -1,0 +1,1640 @@
+diff --git a/TRANSCRIPT_SAVER_FEATURE.md b/TRANSCRIPT_SAVER_FEATURE.md
+index 30f684d..e4d83b8 100644
+--- a/TRANSCRIPT_SAVER_FEATURE.md
++++ b/TRANSCRIPT_SAVER_FEATURE.md
+@@ -1,84 +1,55 @@
+-# Transcript Saver v3 — Floating Sphere + Folders + Auto-Save
++# Transcripts Page (final design)
+ 
+-This updates the Transcript Saver to a **floating sphere + full-screen overlay** design
+-with **named folders** and **fully automatic saving**. It builds on top of the v2
+-Transcript Saver and the v1 playlist batch feature.
++The saver is now a **proper page in the sidebar** — the natural fit for this app
++(every feature here is a page: Download, History, Whisper, Library, Playlist…).
++The floating-sphere/overlay experiment is removed.
+ 
+ ---
+ 
+-## What changed (v3)
+-
+-### 1. Floating sphere → full-screen overlay
+-- A small **floating sphere** (bottom-right, with a count badge) sits near the
+-  **URL Transcript** section on the Download page.
+-- Clicking the sphere opens the Transcript Saver as a **full-screen overlay**
+-  (covers the whole screen). Click **Close** (or the X) to return.
+-- The URL Transcript panel also has an **Open Saver** button.
+-
+-### 2. Transcript cards (like YouTube thumbnails)
+-- Saved transcripts appear as a grid of **square cards**.
+-- Each card shows the **title + the first few lines of the transcript** (the
+-  "thumbnail"), plus the folder, source and line count.
+-- Clicking a card expands it to show the **full transcript**; there are also
+-  **Copy**, **Edit** and **Delete** buttons right on the card.
+-
+-### 3. Named folders + first-come-first-serve (General)
+-- When you pick a download range in **"Download a Range from a Playlist"** and tick
+-  **"Also fetch YouTube auto transcript"**, a **"Save transcripts into folder"** box
+-  appears — type any folder name (e.g. `Calculus Lectures`).
+-- Every auto-fetched transcript is saved **in parallel** with the download into that
+-  folder. If you leave the box empty, transcripts land in **General**
+-  (first-come-first-serve).
+-- The overlay has **folder chips** (All / General / each named folder) to filter the
+-  cards.
+-
+-### 4. No manual saving — it's automatic
+-- Fetching a transcript in the **URL Transcript** panel (paste link + Enter) now
+-  **auto-saves** it into the saver (General folder) — nothing to click.
+-- Fetches inside the overlay ("Fetch & save") also auto-save into the folder you
+-  typed there.
+-- Batch downloads auto-save every fetched transcript into the chosen folder.
+-- Everything persists in the database — survives video deletion, cache clears and
+-  page reloads. **Clear all** (click twice to confirm) empties everything, or delete
+-  individual cards.
+-
+----
+-
+-## New/updated backend fields
+-
+-- `saved_transcripts.folder` column (auto-migrated on existing installs; empty =
+-  General).
+-- `POST /api/playlist/download` accepts `transcript_folder` (folder name for the
+-  auto-fetched transcripts).
+-- `POST /api/transcript-saver` accepts `folder`.
+-- `POST /api/transcript-saver/fetch` accepts `folder` (request body `{url, folder}`).
+-- `PATCH /api/transcript-saver/{id}` accepts `folder`.
++## How it works
++
++### The "Transcripts" page (sidebar → Transcripts)
++- **Sidebar item "Transcripts"** with a live count badge (number of saved transcripts).
++- Top panel: **Fetch & save** — paste a YouTube link (+ optional folder) and its auto
++  transcript is fetched and saved instantly. No manual save step.
++- **Search box** filters by title / text / URL / folder.
++- **Folder chips** (All / General / each named folder) filter the list.
++- Each saved transcript is a **card** showing the **first few lines** (like a preview).
++  Click a card to **read the full transcript**; each card has **Copy**, **Edit** and
++  **Delete** buttons.
++- **Clear all** (click twice to confirm) empties everything; **Refresh** reloads.
++
++### Automatic saving (you never save manually)
++1. **URL Transcript panel (Download page):** paste a link and press **Get Transcript** →
++   it fetches, shows the transcript, and **auto-saves it** to Transcripts (General
++   folder) with a toast. A **View Transcripts** link next to the panel takes you to the page.
++2. **Playlist batch downloads:** tick *"Also fetch YouTube auto transcript"* + enter a
++   **folder name** → every video's transcript is fetched **in parallel** with the
++   download and saved into that folder. Empty folder = **General** (first-come-first-serve).
++
++### Persistence
++Transcripts are stored in the SQLite `saved_transcripts` table. They survive video
++deletion, cache clears and page reloads. The sidebar badge updates automatically.
+ 
+ ---
+ 
+-## Files changed (v3 only)
+-
+-**Backend**
+-- `backend/models.py` — `folder` fields + `TranscriptSaverFetchRequest`.
+-- `backend/services/database.py` — `folder` column + migration + CRUD updates.
+-- `backend/routes/transcript_saver.py` — folder pass-through on save/fetch/update.
+-- `backend/services/playlist_batch.py` — `transcript_folder` on batches; parallel
+-  fetches save into that folder.
+-- `backend/routes/playlist_batch.py` — passes `transcript_folder` through.
++## Files changed (this update)
+ 
+-**Frontend**
+-- `frontend/src/App.jsx` — floating sphere, full-screen overlay, folder chips,
+-  card grid with preview/full/copy/edit/delete, folder box in the batch wizard,
+-  auto-save on URL transcript fetch.
+-- `frontend/src/App.css` — sphere, overlay, chips and card styles.
++- `frontend/src/pages/Transcripts.jsx` *(new)* — the page component.
++- `frontend/src/App.jsx` — sidebar item + badge, `/transcripts` route, removed the
++  floating sphere / overlay, URL-Transcript auto-save now notifies the badge, "View
++  Transcripts" link.
++- `frontend/src/App.css` — page styles; removed sphere/overlay styles.
++- `TRANSCRIPT_SAVER_FEATURE.md` — this doc.
+ 
+-**Docs**
+-- `TRANSCRIPT_SAVER_FEATURE.md` *(this file)*.
+-
+----
++(Backend unchanged — the folder-capable `/api/transcript-saver` endpoints from the
++previous update are reused as-is.)
+ 
+ ## Apply order
+ 
+ 1. `playlist_batch_feature_local.patch` (v1 — playlist range download)
+-2. `transcript_saver_feature.patch` (v2 — original saver + batch auto-transcripts)
+-3. `transcript_saver_v3.patch` (this file — sphere/overlay + folders + auto-save)
++2. `transcript_saver_feature.patch` (v2 — saver endpoints + batch auto-transcripts)
++3. `transcript_saver_v3.patch` (v3 — folder support)
++4. `transcript_saver_v4.patch` (this update — Transcripts page)
++
++> If you already applied v1–v3, just apply `transcript_saver_v4.patch` now.
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+index cf1eda9..a8f8e1d 100644
+--- a/frontend/src/App.css
++++ b/frontend/src/App.css
+@@ -3914,296 +3914,30 @@ body[data-theme='dark'] .main-stage {
+ }
+ 
+ /* ==========================================================================
+-   Transcript Saver (persistent lecture transcripts)
++   Transcripts page
+    ========================================================================== */
+-.transcript-saver-header__actions {
++.transcript-fetch-row {
+ 	display: flex;
+-	align-items: center;
+ 	gap: 10px;
+ 	flex-wrap: wrap;
+ }
+ 
+-.ghost-button--danger {
+-	color: #f87171;
+-	border-color: rgba(239, 68, 68, 0.45);
+-}
+-
+-.ghost-button--danger:hover {
+-	background: rgba(239, 68, 68, 0.12);
+-}
+-
+-.transcript-saver-divider {
+-	color: var(--text-muted);
+-	font-size: 0.85rem;
+-	white-space: nowrap;
+-}
+-
+-.transcript-saver-fetch-input {
+-	flex: 1;
+-	min-width: 220px;
+-}
+-
+-.transcript-saver-list {
+-	display: grid;
+-	gap: 8px;
+-	margin-top: 16px;
+-}
+-
+-.saver-item {
+-	border: 1px solid var(--border);
+-	border-radius: 14px;
+-	background: var(--surface-muted);
+-	overflow: hidden;
+-}
+-
+-.saver-item--expanded {
+-	border-color: var(--accent);
+-}
+-
+-.saver-item__head {
+-	display: flex;
+-	align-items: center;
+-	gap: 10px;
+-	padding: 10px 12px;
+-}
+-
+-.saver-item__toggle {
+-	background: none;
+-	border: none;
+-	color: var(--text-muted);
+-	cursor: pointer;
+-	padding: 4px;
+-	display: inline-flex;
+-	align-items: center;
+-	border-radius: 8px;
+-	flex-shrink: 0;
+-}
+-
+-.saver-item__toggle:hover {
+-	color: var(--text);
+-	background: rgba(255, 255, 255, 0.06);
+-}
+-
+-.saver-item__title {
+-	display: flex;
+-	flex-direction: column;
+-	gap: 2px;
+-	min-width: 0;
+-	flex-shrink: 1;
+-}
+-
+-.saver-item__meta {
+-	color: var(--text-muted);
+-	font-size: 0.78rem;
+-}
+-
+-.saver-item__preview {
++.transcript-fetch-row .input {
+ 	flex: 1;
+-	min-width: 0;
+-	overflow: hidden;
+-	text-overflow: ellipsis;
+-	white-space: nowrap;
+-	color: var(--text-muted);
+-	font-size: 0.85rem;
+-	padding: 0 8px;
+-}
+-
+-.saver-item__actions {
+-	display: flex;
+-	gap: 4px;
+-	flex-shrink: 0;
++	min-width: 200px;
+ }
+ 
+-.saver-item__text {
+-	white-space: pre-wrap;
+-	word-break: break-word;
+-	font-family: inherit;
+-	font-size: 0.88rem;
+-	line-height: 1.55;
+-	margin: 0;
+-	padding: 12px 14px;
+-	border-top: 1px dashed var(--border);
+-	max-height: 360px;
+-	overflow-y: auto;
+-	color: var(--text);
+-}
+-
+-.saver-item__edit {
+-	display: grid;
+-	gap: 10px;
+-	padding: 12px 14px;
+-	border-top: 1px dashed var(--border);
+-}
+-
+-.saver-item__edit .transcript-textarea {
+-	min-height: 160px;
+-}
+-
+-/* Transcript status flag inside batch task rows */
+-.playlist-batch-task__tflag {
+-	display: inline-flex;
+-	align-items: center;
+-	gap: 5px;
+-	font-size: 0.76rem;
+-	white-space: nowrap;
+-	flex-shrink: 0;
+-	padding: 2px 8px;
+-	border-radius: 999px;
+-	border: 1px solid var(--border);
+-	color: var(--text-muted);
+-	background: rgba(255, 255, 255, 0.04);
+-}
+-
+-.playlist-batch-task__tflag--saved {
+-	color: #34d399;
+-	border-color: rgba(34, 197, 94, 0.45);
+-	background: rgba(34, 197, 94, 0.08);
+-}
+-
+-.playlist-batch-task__tflag--fetching,
+-.playlist-batch-task__tflag--pending {
+-	color: var(--accent-cool);
+-	border-color: rgba(34, 211, 238, 0.4);
+-}
+-
+-.playlist-batch-task__tflag--unavailable {
+-	color: var(--text-muted);
+-}
+-
+-.playlist-batch-task__tflag--error {
+-	color: #f87171;
+-	border-color: rgba(239, 68, 68, 0.45);
+-}
+-
+-.playlist-batch-seq--transcripts {
+-	color: var(--accent-cool);
+-}
+-
+-@media (max-width: 720px) {
+-	.saver-item__preview {
+-		display: none;
+-	}
+-}
+-
+-/* ==========================================================================
+-   Transcript Saver v3 — floating sphere + full-screen overlay + card grid
+-   ========================================================================== */
+-.transcript-saver-fetch-folder {
+-	max-width: 180px;
++.transcript-fetch-folder {
++	max-width: 240px;
+ }
+ 
+-/* Floating sphere (bottom-right FAB) */
+-.saver-sphere {
+-	position: fixed;
+-	right: 22px;
+-	bottom: 22px;
+-	z-index: 1200;
+-	width: 58px;
+-	height: 58px;
+-	border-radius: 50%;
+-	border: none;
+-	cursor: pointer;
+-	display: flex;
+-	align-items: center;
+-	justify-content: center;
+-	color: #fff;
+-	background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+-	box-shadow: 0 10px 30px rgba(99, 102, 241, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+-	transition: transform 150ms ease, box-shadow 150ms ease;
+-}
+-
+-.saver-sphere:hover {
+-	transform: translateY(-2px) scale(1.05);
+-	box-shadow: 0 14px 36px rgba(99, 102, 241, 0.55);
+-}
+-
+-.saver-sphere__badge {
+-	position: absolute;
+-	top: -4px;
+-	right: -4px;
+-	min-width: 20px;
+-	height: 20px;
+-	border-radius: 999px;
+-	background: #f87171;
+-	color: #fff;
+-	font-size: 0.7rem;
+-	font-weight: 700;
+-	display: flex;
+-	align-items: center;
+-	justify-content: center;
+-	padding: 0 5px;
+-	border: 2px solid var(--bg);
+-}
+-
+-/* Full-screen overlay */
+-.saver-overlay {
+-	position: fixed;
+-	inset: 0;
+-	z-index: 1300;
+-	background: rgba(3, 6, 18, 0.82);
+-	backdrop-filter: blur(10px);
+-	-webkit-backdrop-filter: blur(10px);
+-	display: flex;
+-	align-items: center;
+-	justify-content: center;
+-	padding: 24px;
+-}
+-
+-.saver-overlay__inner {
+-	background: var(--surface);
+-	border: 1px solid var(--border);
+-	border-radius: 20px;
+-	box-shadow: var(--shadow);
+-	width: 100%;
+-	max-width: 1100px;
+-	height: 100%;
+-	max-height: 92vh;
+-	display: flex;
+-	flex-direction: column;
+-	overflow: hidden;
+-}
+-
+-.saver-overlay__header {
+-	display: flex;
+-	align-items: flex-start;
+-	justify-content: space-between;
+-	gap: 16px;
+-	padding: 20px 24px 14px;
+-	border-bottom: 1px solid var(--border);
+-	flex-wrap: wrap;
+-}
+-
+-.saver-overlay__header-actions {
+-	display: flex;
+-	align-items: center;
+-	gap: 10px;
+-	flex-wrap: wrap;
+-}
+-
+-.saver-overlay__body {
+-	padding: 18px 24px 24px;
+-	overflow-y: auto;
+-	display: grid;
+-	gap: 14px;
+-}
+-
+-.saver-overlay__form {
+-	border: 1px dashed var(--border);
+-	border-radius: 16px;
+-	padding: 14px;
+-	background: rgba(255, 255, 255, 0.02);
+-	display: grid;
+-	gap: 10px;
+-}
+-
+-/* Folder chips */
+-.saver-folder-chips {
++.transcript-folder-chips {
+ 	display: flex;
+ 	flex-wrap: wrap;
+ 	gap: 8px;
+ }
+ 
+-.saver-folder-chip {
++.transcript-folder-chip {
+ 	display: inline-flex;
+ 	align-items: center;
+ 	gap: 7px;
+@@ -4217,17 +3951,16 @@ body[data-theme='dark'] .main-stage {
+ 	transition: border-color 140ms ease, background 140ms ease;
+ }
+ 
+-.saver-folder-chip:hover {
++.transcript-folder-chip:hover {
+ 	border-color: var(--accent-strong);
+ }
+ 
+-.saver-folder-chip--active {
++.transcript-folder-chip--active {
+ 	border-color: var(--accent);
+ 	background: rgba(124, 58, 237, 0.14);
+-	color: var(--text);
+ }
+ 
+-.saver-folder-chip__count {
++.transcript-folder-chip__count {
+ 	font-size: 0.72rem;
+ 	font-weight: 700;
+ 	color: var(--text-muted);
+@@ -4236,125 +3969,104 @@ body[data-theme='dark'] .main-stage {
+ 	padding: 1px 7px;
+ }
+ 
+-/* Card grid */
+-.saver-card-grid {
+-	display: grid;
+-	grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+-	gap: 12px;
+-}
+-
+-.saver-card {
+-	border: 1px solid var(--border);
+-	border-radius: 14px;
+-	background: var(--surface-muted);
+-	overflow: hidden;
++/* Transcript list item */
++.transcript-item {
+ 	display: flex;
+ 	flex-direction: column;
+-	min-height: 150px;
+-	transition: border-color 140ms ease, transform 140ms ease;
+-}
+-
+-.saver-card:hover {
+-	border-color: var(--accent-strong);
+-	transform: translateY(-1px);
+-}
+-
+-.saver-card--expanded {
+-	border-color: var(--accent);
+-	grid-column: span 1;
+-}
+-
+-@media (min-width: 900px) {
+-	.saver-card--expanded {
+-		grid-column: span 2;
+-	}
++	width: 100%;
+ }
+ 
+-.saver-card__head {
++.transcript-item__head {
+ 	display: flex;
+ 	align-items: flex-start;
+ 	justify-content: space-between;
+-	gap: 8px;
+-	padding: 10px 12px;
+-	border-bottom: 1px dashed var(--border);
++	gap: 12px;
+ }
+ 
+-.saver-card__title {
+-	display: flex;
+-	flex-direction: column;
+-	gap: 3px;
++.transcript-item__expand {
++	flex: 1;
+ 	min-width: 0;
++	display: flex;
++	text-align: left;
++	background: none;
++	border: none;
++	padding: 0;
++	cursor: pointer;
++	color: inherit;
++	font-family: inherit;
+ }
+ 
+-.saver-card__title strong {
+-	font-size: 0.9rem;
+-	line-height: 1.3;
+-	display: -webkit-box;
+-	-webkit-line-clamp: 2;
+-	-webkit-box-orient: vertical;
+-	overflow: hidden;
+-}
+-
+-.saver-card__meta {
+-	color: var(--text-muted);
+-	font-size: 0.74rem;
+-	white-space: nowrap;
+-	overflow: hidden;
+-	text-overflow: ellipsis;
++.transcript-item__title-wrap {
++	display: flex;
++	flex-direction: column;
++	gap: 4px;
++	min-width: 0;
+ }
+ 
+-.saver-card__actions {
++.transcript-item__actions {
+ 	display: flex;
+-	gap: 2px;
++	gap: 4px;
+ 	flex-shrink: 0;
+ }
+ 
+-.saver-card__preview {
++.transcript-item__preview {
+ 	flex: 1;
+ 	display: flex;
+ 	flex-direction: column;
+ 	gap: 6px;
+-	padding: 12px;
++	margin-top: 10px;
++	padding: 12px 14px;
+ 	text-align: left;
+-	background: none;
+-	border: none;
++	background: var(--surface-muted);
++	border: 1px dashed var(--border);
++	border-radius: 12px;
+ 	color: var(--text);
+ 	cursor: pointer;
+ 	font-family: inherit;
+-	font-size: 0.82rem;
+-	line-height: 1.5;
++	font-size: 0.85rem;
++	line-height: 1.55;
+ 	white-space: pre-wrap;
+-	overflow: hidden;
++	transition: border-color 140ms ease, background 140ms ease;
+ }
+ 
+-.saver-card__preview:hover {
+-	background: rgba(255, 255, 255, 0.03);
++.transcript-item__preview:hover {
++	border-color: var(--accent-strong);
++	background: rgba(255, 255, 255, 0.04);
+ }
+ 
+-.saver-card__more {
++.transcript-item__more {
+ 	color: var(--accent-cool);
+-	font-size: 0.76rem;
++	font-size: 0.78rem;
+ }
+ 
+-.saver-card__full {
++.transcript-item__full {
+ 	white-space: pre-wrap;
+ 	word-break: break-word;
+ 	font-family: inherit;
+-	font-size: 0.86rem;
+-	line-height: 1.55;
+-	margin: 0;
+-	padding: 12px 14px;
++	font-size: 0.9rem;
++	line-height: 1.6;
++	margin: 10px 0 0;
++	padding: 14px 16px;
++	background: var(--surface-muted);
++	border: 1px solid var(--border);
++	border-radius: 12px;
+ 	max-height: 60vh;
+ 	overflow-y: auto;
+ 	color: var(--text);
+ }
+ 
+-.saver-card__edit {
++.transcript-item__edit {
+ 	display: grid;
+ 	gap: 10px;
+-	padding: 12px 14px;
++	margin-top: 10px;
+ }
+ 
+-.saver-card__edit .transcript-textarea {
+-	min-height: 140px;
++.transcript-item__edit .transcript-textarea {
++	min-height: 160px;
++}
++
++@media (max-width: 720px) {
++	.transcript-fetch-folder {
++		max-width: 100%;
++	}
+ }
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index e8f79ce..297c5c1 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -35,9 +35,6 @@ import {
+   ListOrdered,
+   CheckCircle2,
+   XCircle,
+-  Save,
+-  Copy,
+-  PenLine,
+   BookOpenText,
+ } from 'lucide-react';
+ 
+@@ -48,6 +45,7 @@ import PlaylistPicker from './components/PlaylistPicker';
+ import LibraryPicker from './components/LibraryPicker';
+ import AudioExtractorPage from './pages/AudioExtractor';
+ import PhotosPage from './pages/photos';
++import TranscriptsPage from './pages/Transcripts';
+ 
+ const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
+ const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
+@@ -711,7 +709,7 @@ function AboutPage() {
+   );
+ }
+ 
+-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged }) {
++function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged, onTranscriptsChanged }) {
+   const notify = useCallback((message, type = 'info') => {
+     if (onNotify) onNotify(message, type);
+   }, [onNotify]);
+@@ -739,6 +737,12 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const [transcriptError, setTranscriptError] = useState('');
+   const [transcriptCopyStatus, setTranscriptCopyStatus] = useState('Copy Transcript');
+   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
++  const transcriptText = transcriptSegmentsToText(transcriptResult?.segments || []);
++  const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
++  const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
++  const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
++  const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
++  const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
+ 
+   // Playlist batch download (range/specific videos from one playlist link)
+   const [playlistUrl, setPlaylistUrl] = useState('');
+@@ -763,55 +767,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+   const batchCompletedRef = useRef(0);
+   const stopPollingRef = useRef(false);
+ 
+-  // Transcript Saver (floating sphere + full-screen overlay)
+-  const [saverOpen, setSaverOpen] = useState(false);
+-  const [saverItems, setSaverItems] = useState([]);
+-  const [saverLoading, setSaverLoading] = useState(false);
+-  const [saverError, setSaverError] = useState('');
+-  const [saverTitle, setSaverTitle] = useState('');
+-  const [saverUrl, setSaverUrl] = useState('');
+-  const [saverFolder, setSaverFolder] = useState('');
+-  const [saverText, setSaverText] = useState('');
+-  const [saverSaving, setSaverSaving] = useState(false);
+-  const [saverFetching, setSaverFetching] = useState(false);
+-  const [saverFetchUrl, setSaverFetchUrl] = useState('');
+-  const [saverFetchFolder, setSaverFetchFolder] = useState('');
+-  const [saverActiveFolder, setSaverActiveFolder] = useState('all');
+-  const [saverExpandedId, setSaverExpandedId] = useState(null);
+-  const [saverEditingId, setSaverEditingId] = useState(null);
+-  const [saverEditTitle, setSaverEditTitle] = useState('');
+-  const [saverEditText, setSaverEditText] = useState('');
+-  const [saverSavingEdit, setSaverSavingEdit] = useState(false);
+-  const [saverConfirmClearAll, setSaverConfirmClearAll] = useState(false);
+-  const [saverCopyStatusId, setSaverCopyStatusId] = useState(null);
+-  const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
+-  const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
+-  const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
+-  const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
+-  const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
+-  const transcriptText = transcriptSegmentsToText(transcriptResult?.segments || []);
+-
+-  const location = useLocation();
+-  useEffect(() => {
+-    const state = location?.state || {};
+-    if (state?.autoStart && state?.url) {
+-      const u = state.url;
+-      const q = state.quality || 'best';
+-      const f = state.format || 'mp4';
+-      setUrl(u);
+-      setQuality(q === '1080' ? '1080' : q);
+-      setFormat(f);
+-      (async () => {
+-        try {
+-          await onStartDownload({ url: u, quality: q, format: f });
+-          setUrl('');
+-        } catch (e) {
+-          // ignore errors here — they will be surfaced elsewhere
+-        }
+-      })();
+-    }
+-  }, [location, onStartDownload]);
+-
+   // --- Playlist batch download handlers ---------------------------------
+   const batchTaskStatusLabel = (status) => {
+     const map = {
+@@ -1053,7 +1008,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     };
+   }, [batchId, onLibraryChanged]);
+ 
+-  // --- Transcript Saver handlers -----------------------------------------
+   const transcriptStatusLabel = (status) => {
+     const map = {
+       pending: 'Transcript queued',
+@@ -1066,171 +1020,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+     return map[status] || '';
+   };
+ 
+-  const loadSaverItems = useCallback(async () => {
+-    try {
+-      const res = await api.get('/transcript-saver');
+-      setSaverItems(Array.isArray(res.data?.transcripts) ? res.data.transcripts : []);
+-      setSaverError('');
+-    } catch (err) {
+-      setSaverError(safeFetchError(err, 'Unable to load saved transcripts.'));
+-    }
+-  }, []);
+-
+-  useEffect(() => {
+-    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load on mount
+-    loadSaverItems();
+-  }, [loadSaverItems]);
+-
+-  const handleSaverSave = async () => {
+-    if (saverSaving) return;
+-    const title = saverTitle.trim();
+-    const text = saverText.trim();
+-    if (!title || !text) {
+-      notify('Enter a title and the transcript text to save', 'error');
+-      return;
+-    }
+-    setSaverSaving(true);
+-    try {
+-      await api.post('/transcript-saver', { title, text, url: saverUrl.trim(), folder: saverFolder.trim() });
+-      setSaverTitle('');
+-      setSaverText('');
+-      setSaverUrl('');
+-      setSaverFolder('');
+-      await loadSaverItems();
+-      notify('Transcript saved to the saver', 'success');
+-    } catch (err) {
+-      notify(safeFetchError(err, 'Unable to save transcript.'), 'error');
+-    } finally {
+-      setSaverSaving(false);
+-    }
+-  };
+-
+-  const handleSaverFetch = async () => {
+-    const trimmed = saverFetchUrl.trim();
+-    if (!trimmed || saverFetching) return;
+-    setSaverFetching(true);
+-    setSaverError('');
+-    try {
+-      const res = await api.post('/transcript-saver/fetch', { url: trimmed, folder: saverFetchFolder.trim() });
+-      const saved = res.data?.transcript;
+-      await loadSaverItems();
+-      notify(saved?.title ? `Saved: ${saved.title}` : 'Transcript fetched and saved', 'success');
+-      setSaverFetchUrl('');
+-      setSaverFetchFolder('');
+-      if (saved?.id) {
+-        setSaverExpandedId(saved.id);
+-        setSaverActiveFolder('all');
+-      }
+-    } catch (err) {
+-      notify(safeFetchError(err, 'Unable to fetch transcript.'), 'error');
+-    } finally {
+-      setSaverFetching(false);
+-    }
+-  };
+-
+-  // Auto-save: whenever a transcript is fetched from the URL Transcript panel,
+-  // it is also saved into the saver (General folder = first-come-first-serve)
+-  // so the user never has to save manually.
+-  const autoSaveFetchedTranscript = async (title, text, url) => {
+-    if (!text) return;
+-    try {
+-      await api.post('/transcript-saver', { title: title || 'YouTube transcript', text, url: url || '', folder: '' });
+-      await loadSaverItems();
+-      notify('Auto-saved to Transcript Saver (General)', 'success');
+-    } catch (err) {
+-      // non-fatal: the transcript is still shown in the panel
+-    }
+-  };
+-
+-  const saverFolders = useMemo(() => {
+-    const set = new Set();
+-    (saverItems || []).forEach((item) => set.add((item.folder || '').trim()));
+-    // Keep the empty folder ("General", first-come-first-serve) in the list.
+-    const folders = [...set].sort((a, b) => {
+-      if (a === '') return -1;
+-      if (b === '') return 1;
+-      return a.localeCompare(b);
+-    });
+-    return ['all', ...folders];
+-  }, [saverItems]);
+-
+-  const filteredSaverItems = useMemo(() => {
+-    if (saverActiveFolder === 'all') return saverItems;
+-    return (saverItems || []).filter((item) => (item.folder || '').trim() === saverActiveFolder);
+-  }, [saverItems, saverActiveFolder]);
+-
+-  const folderLabel = (folder) => (folder && folder.trim() ? folder.trim() : 'General');
+-
+-  const handleSaverCopy = async (item) => {
+-    try {
+-      await navigator.clipboard.writeText(item.text || '');
+-      setSaverCopyStatusId(item.id);
+-      window.setTimeout(() => setSaverCopyStatusId(null), 1600);
+-    } catch (err) {
+-      notify('Copy failed — select the text manually', 'error');
+-    }
+-  };
+-
+-  const handleSaverStartEdit = (item) => {
+-    setSaverEditingId(item.id);
+-    setSaverEditTitle(item.title || '');
+-    setSaverEditText(item.text || '');
+-    setSaverExpandedId(item.id);
+-  };
+-
+-  const handleSaverSaveEdit = async () => {
+-    if (!saverEditingId || saverSavingEdit) return;
+-    if (!saverEditTitle.trim() || !saverEditText.trim()) {
+-      notify('Title and text cannot be empty', 'error');
+-      return;
+-    }
+-    setSaverSavingEdit(true);
+-    try {
+-      await api.patch(`/transcript-saver/${saverEditingId}`, {
+-        title: saverEditTitle.trim(),
+-        text: saverEditText.trim(),
+-      });
+-      setSaverEditingId(null);
+-      await loadSaverItems();
+-      notify('Transcript updated', 'success');
+-    } catch (err) {
+-      notify(safeFetchError(err, 'Unable to update transcript.'), 'error');
+-    } finally {
+-      setSaverSavingEdit(false);
+-    }
+-  };
+-
+-  const handleSaverDelete = async (id) => {
+-    try {
+-      await api.delete(`/transcript-saver/${id}`);
+-      if (saverExpandedId === id) setSaverExpandedId(null);
+-      if (saverEditingId === id) setSaverEditingId(null);
+-      await loadSaverItems();
+-      notify('Transcript deleted', 'info');
+-    } catch (err) {
+-      notify(safeFetchError(err, 'Unable to delete transcript.'), 'error');
+-    }
+-  };
+-
+-  const handleSaverClearAll = async () => {
+-    if (!saverConfirmClearAll) {
+-      setSaverConfirmClearAll(true);
+-      window.setTimeout(() => setSaverConfirmClearAll(false), 4000);
+-      notify('Click "Clear all" again to confirm', 'info');
+-      return;
+-    }
+-    try {
+-      await api.delete('/transcript-saver');
+-      setSaverConfirmClearAll(false);
+-      setSaverExpandedId(null);
+-      setSaverEditingId(null);
+-      await loadSaverItems();
+-      notify('All saved transcripts cleared', 'info');
+-    } catch (err) {
+-      notify(safeFetchError(err, 'Unable to clear transcripts.'), 'error');
+-    }
+-  };
+-
+   const handleFetchMetadata = async () => {
+     const trimmed = url.trim();
+     if (!trimmed || metadataLoading) return;
+@@ -1391,10 +1180,21 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+         return;
+       }
+       setTranscriptResult(data);
+-      // Auto-save into the Transcript Saver (General folder) so it persists.
++      // Auto-save into the Transcripts page (General folder) so it persists.
+       const fetchedText = transcriptSegmentsToText(data.segments || []);
+       if (fetchedText) {
+-        autoSaveFetchedTranscript(data.title, fetchedText, data.webpage_url || trimmed);
++        try {
++          await api.post('/transcript-saver', {
++            title: data.title || 'YouTube transcript',
++            text: fetchedText,
++            url: data.webpage_url || trimmed,
++            folder: '',
++          });
++          notify('Auto-saved to Transcripts', 'success');
++          if (onTranscriptsChanged) onTranscriptsChanged();
++        } catch (err) {
++          // non-fatal: transcript is still shown in the panel
++        }
+       }
+     } catch (error) {
+       setTranscriptError(safeFetchError(error, 'Unable to fetch transcript.'));
+@@ -1462,15 +1262,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+               <Clipboard size={16} />
+               {transcriptCopyStatus}
+             </button>
+-            <button
+-              className="ghost-button"
+-              type="button"
+-              onClick={() => setSaverOpen(true)}
+-              title="Open the Transcript Saver floating sphere (fetched transcripts are auto-saved here)"
+-            >
++            <Link className="ghost-button" to="/transcripts" title="View all saved transcripts (fetched transcripts are auto-saved here)">
+               <BookOpenText size={16} />
+-              Open Saver
+-            </button>
++              View Transcripts
++            </Link>
+           </div>
+         </form>
+ 
+@@ -2136,208 +1931,6 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
+         ) : null}
+       </section>
+ 
+-      {/* Floating sphere — opens the Transcript Saver full-screen overlay */}
+-      <button
+-        className="saver-sphere"
+-        type="button"
+-        onClick={() => setSaverOpen(true)}
+-        title="Transcript Saver — open saved lecture transcripts"
+-        aria-label="Open Transcript Saver"
+-      >
+-        <BookOpenText size={22} />
+-        {saverItems.length > 0 ? <span className="saver-sphere__badge">{saverItems.length}</span> : null}
+-      </button>
+-
+-      {saverOpen ? (
+-        <div className="saver-overlay" role="dialog" aria-modal="true">
+-          <div className="saver-overlay__inner">
+-            <div className="saver-overlay__header">
+-              <div>
+-                <div className="section-eyebrow section-eyebrow--soft">Transcript Saver</div>
+-                <h2 className="panel__title">Saved transcripts</h2>
+-                <p className="panel__subtitle">
+-                  Transcripts are auto-saved here — even after the video is deleted or the page reloads.
+-                  Click a card to read the full transcript, or copy it directly.
+-                </p>
+-              </div>
+-              <div className="saver-overlay__header-actions">
+-                <span className="panel__badge panel__badge--soft">{saverItems.length} saved</span>
+-                <button
+-                  className={`ghost-button ${saverConfirmClearAll ? 'ghost-button--danger' : ''}`}
+-                  type="button"
+-                  onClick={handleSaverClearAll}
+-                  disabled={saverItems.length === 0}
+-                >
+-                  <Trash2 size={16} />
+-                  {saverConfirmClearAll ? 'Confirm clear all' : 'Clear all'}
+-                </button>
+-                <button className="ghost-button" type="button" onClick={() => setSaverOpen(false)} title="Close">
+-                  <X size={16} /> Close
+-                </button>
+-              </div>
+-            </div>
+-
+-            <div className="saver-overlay__body">
+-              {/* Add / fetch form */}
+-              <div className="saver-overlay__form">
+-                <div className="form-grid">
+-                  <div className="field">
+-                    <label className="field__label" htmlFor="saver-title">TITLE</label>
+-                    <input
+-                      id="saver-title"
+-                      className="input"
+-                      value={saverTitle}
+-                      onChange={(event) => setSaverTitle(event.target.value)}
+-                      placeholder="e.g. Lecture 4 – Calculus"
+-                      maxLength={300}
+-                    />
+-                  </div>
+-                  <div className="field">
+-                    <label className="field__label" htmlFor="saver-folder">FOLDER (optional)</label>
+-                    <input
+-                      id="saver-folder"
+-                      className="input"
+-                      value={saverFolder}
+-                      onChange={(event) => setSaverFolder(event.target.value)}
+-                      placeholder="e.g. Calculus — empty = General"
+-                      maxLength={120}
+-                    />
+-                  </div>
+-                  <div className="field field--full">
+-                    <label className="field__label" htmlFor="saver-text">PASTE TRANSCRIPT TEXT</label>
+-                    <textarea
+-                      id="saver-text"
+-                      className="transcript-textarea"
+-                      rows={3}
+-                      value={saverText}
+-                      onChange={(event) => setSaverText(event.target.value)}
+-                      placeholder="Paste a lecture transcript here…"
+-                    />
+-                  </div>
+-                </div>
+-                <div className="transcript-actions">
+-                  <button className="primary-button" type="button" onClick={handleSaverSave} disabled={saverSaving}>
+-                    {saverSaving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+-                    {saverSaving ? 'Saving…' : 'Save to saver'}
+-                  </button>
+-                  <span className="transcript-saver-divider">or fetch from YouTube</span>
+-                  <input
+-                    className="input transcript-saver-fetch-input"
+-                    value={saverFetchUrl}
+-                    onChange={(event) => setSaverFetchUrl(event.target.value)}
+-                    placeholder="YouTube link…"
+-                    onKeyDown={(event) => {
+-                      if (event.key === 'Enter') {
+-                        event.preventDefault();
+-                        handleSaverFetch();
+-                      }
+-                    }}
+-                  />
+-                  <input
+-                    className="input transcript-saver-fetch-folder"
+-                    value={saverFetchFolder}
+-                    onChange={(event) => setSaverFetchFolder(event.target.value)}
+-                    placeholder="Folder (empty = General)"
+-                    maxLength={120}
+-                  />
+-                  <button className="ghost-button" type="button" onClick={handleSaverFetch} disabled={saverFetching || !saverFetchUrl.trim()}>
+-                    {saverFetching ? <Loader2 className="spin" size={16} /> : <FileText size={16} />}
+-                    {saverFetching ? 'Fetching…' : 'Fetch & save'}
+-                  </button>
+-                </div>
+-              </div>
+-
+-              {/* Folder chips */}
+-              <div className="saver-folder-chips">
+-                {saverFolders.map((folder) => (
+-                  <button
+-                    key={folder}
+-                    type="button"
+-                    className={`saver-folder-chip ${saverActiveFolder === folder ? 'saver-folder-chip--active' : ''}`}
+-                    onClick={() => setSaverActiveFolder(folder)}
+-                  >
+-                    {folder === 'all' ? 'All' : folderLabel(folder)}
+-                    <span className="saver-folder-chip__count">
+-                      {folder === 'all'
+-                        ? saverItems.length
+-                        : saverItems.filter((item) => (item.folder || '').trim() === folder).length}
+-                    </span>
+-                  </button>
+-                ))}
+-              </div>
+-
+-              {saverError ? <p className="download-card__error">{saverError}</p> : null}
+-
+-              {/* Card grid */}
+-              {saverLoading ? (
+-                <div className="empty-state empty-state--compact"><p>Loading saved transcripts…</p></div>
+-              ) : filteredSaverItems.length === 0 ? (
+-                <div className="empty-state empty-state--compact">
+-                  <p>
+-                    {saverItems.length === 0
+-                      ? 'No saved transcripts yet — fetch one from the Download page and it appears here automatically.'
+-                      : 'No transcripts in this folder yet.'}
+-                  </p>
+-                </div>
+-              ) : (
+-                <div className="saver-card-grid">
+-                  {filteredSaverItems.map((item) => {
+-                    const expanded = saverExpandedId === item.id;
+-                    const editing = saverEditingId === item.id;
+-                    const previewLines = (item.text || '').split('\n').slice(0, 4).join('\n');
+-                    return (
+-                      <div key={item.id} className={`saver-card ${expanded ? 'saver-card--expanded' : ''}`}>
+-                        <div className="saver-card__head">
+-                          <div className="saver-card__title">
+-                            <strong>{item.title}</strong>
+-                            <span className="saver-card__meta">
+-                              {folderLabel(item.folder)} · {item.source === 'youtube' ? 'YouTube auto' : 'Manual'} · {item.line_count} lines
+-                            </span>
+-                          </div>
+-                          <div className="saver-card__actions">
+-                            <button className="icon-button" type="button" title="Copy full transcript" onClick={() => handleSaverCopy(item)}>
+-                              {saverCopyStatusId === item.id ? <Check size={15} /> : <Copy size={15} />}
+-                            </button>
+-                            <button className="icon-button" type="button" title="Edit" onClick={() => handleSaverStartEdit(item)}>
+-                              <PenLine size={15} />
+-                            </button>
+-                            <button className="icon-button icon-button--danger" type="button" title="Delete" onClick={() => handleSaverDelete(item.id)}>
+-                              <Trash2 size={15} />
+-                            </button>
+-                          </div>
+-                        </div>
+-
+-                        {editing ? (
+-                          <div className="saver-card__edit">
+-                            <input className="input" value={saverEditTitle} onChange={(event) => setSaverEditTitle(event.target.value)} maxLength={300} />
+-                            <textarea className="transcript-textarea" rows={8} value={saverEditText} onChange={(event) => setSaverEditText(event.target.value)} />
+-                            <div className="transcript-actions">
+-                              <button className="primary-button" type="button" onClick={handleSaverSaveEdit} disabled={saverSavingEdit}>
+-                                {saverSavingEdit ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+-                                Save changes
+-                              </button>
+-                              <button className="ghost-button" type="button" onClick={() => setSaverEditingId(null)}>
+-                                <X size={16} /> Cancel
+-                              </button>
+-                            </div>
+-                          </div>
+-                        ) : expanded ? (
+-                          <pre className="saver-card__full">{item.text}</pre>
+-                        ) : (
+-                          <button className="saver-card__preview" type="button" onClick={() => setSaverExpandedId(item.id)} title="Click to read full transcript">
+-                            {previewLines}
+-                            <span className="saver-card__more">… click to read full</span>
+-                          </button>
+-                        )}
+-                      </div>
+-                    );
+-                  })}
+-                </div>
+-              )}
+-            </div>
+-          </div>
+-        </div>
+-      ) : null}
+     </div>
+   );
+ }
+@@ -3210,7 +2803,7 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
+   );
+ }
+ 
+-function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
++function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcriptCount }) {
+   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length;
+   const themeIsDark = theme === 'dark';
+ 
+@@ -3271,6 +2864,12 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
+           <Music2 size={18} />
+           <span>Playlist</span>
+         </NavLink>
++
++        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/transcripts" end>
++          <BookOpenText size={18} />
++          <span>Transcripts</span>
++          {transcriptCount > 0 ? <span className="nav-link__badge">{transcriptCount}</span> : null}
++        </NavLink>
+       </nav>
+ 
+       <div className="sidebar__footer">
+@@ -3306,6 +2905,20 @@ export default function App() {
+   const notifiedDownloadedRef = useRef(new Set());
+   const previousStatusesRef = useRef(new Map());
+   const statusTrackerReadyRef = useRef(false);
++  const [transcriptCount, setTranscriptCount] = useState(0);
++
++  const refreshTranscriptCount = useCallback(async () => {
++    try {
++      const res = await api.get('/transcript-saver');
++      setTranscriptCount(Array.isArray(res.data?.transcripts) ? res.data.transcripts.length : 0);
++    } catch {
++      // backend not reachable yet — keep previous count
++    }
++  }, []);
++
++  useEffect(() => {
++    refreshTranscriptCount();
++  }, [refreshTranscriptCount]);
+   // use module-level `isMobileDevice` defined above so components declared earlier can reference it
+   const [currentTaskId, setCurrentTaskId] = useState(null);
+ 
+@@ -3687,18 +3300,19 @@ export default function App() {
+ 
+   return (
+     <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
+-      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} />
++      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} transcriptCount={transcriptCount} />
+ 
+       <main className="main-stage">
+         <Routes>
+           <Route path="/" element={<Navigate to="/about" replace />} />
+           <Route path="/about" element={<AboutPage />} />
+-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
++          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} onTranscriptsChanged={refreshTranscriptCount} />} />
+           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
+           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
+           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
+           <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+           <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
++          <Route path="/transcripts" element={<TranscriptsPage onNotify={pushToast} onTranscriptsChanged={refreshTranscriptCount} />} />
+           <Route path="/photos" element={<PhotosPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onNotify={pushToast} />} />
+           <Route path="*" element={<Navigate to="/download" replace />} />
+         </Routes>
+diff --git a/frontend/src/pages/Transcripts.jsx b/frontend/src/pages/Transcripts.jsx
+new file mode 100644
+index 0000000..91dbc41
+--- /dev/null
++++ b/frontend/src/pages/Transcripts.jsx
+@@ -0,0 +1,396 @@
++import { useCallback, useEffect, useMemo, useState } from 'react';
++import {
++  Check,
++  Copy,
++  FileText,
++  Loader2,
++  PenLine,
++  RefreshCw,
++  Save,
++  Search,
++  Trash2,
++  X,
++} from 'lucide-react';
++import { api } from '../lib/api';
++
++const folderLabel = (folder = '') => (folder && folder.trim() ? folder.trim() : 'General');
++
++function formatDate(value) {
++  if (!value) return '';
++  try {
++    return new Date(value * 1000).toLocaleDateString();
++  } catch {
++    return '';
++  }
++}
++
++export default function TranscriptsPage({ onNotify, onTranscriptsChanged }) {
++  const [items, setItems] = useState([]);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState('');
++
++  // Fetch & save form
++  const [fetchUrl, setFetchUrl] = useState('');
++  const [fetchFolder, setFetchFolder] = useState('');
++  const [fetching, setFetching] = useState(false);
++
++  // Search + folder filter
++  const [query, setQuery] = useState('');
++  const [activeFolder, setActiveFolder] = useState('all');
++
++  // Expand / edit / clear
++  const [expandedId, setExpandedId] = useState(null);
++  const [editingId, setEditingId] = useState(null);
++  const [editTitle, setEditTitle] = useState('');
++  const [editText, setEditText] = useState('');
++  const [savingEdit, setSavingEdit] = useState(false);
++  const [copyStatusId, setCopyStatusId] = useState(null);
++  const [confirmClearAll, setConfirmClearAll] = useState(false);
++
++  const notify = useCallback((message, type = 'info') => {
++    if (onNotify) onNotify(message, type);
++  }, [onNotify]);
++
++  const loadItems = useCallback(async () => {
++    try {
++      const res = await api.get('/transcript-saver');
++      setItems(Array.isArray(res.data?.transcripts) ? res.data.transcripts : []);
++      setError('');
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to load saved transcripts.');
++    }
++  }, []);
++
++  useEffect(() => {
++    setLoading(true);
++    loadItems().finally(() => setLoading(false));
++  }, [loadItems]);
++
++  const refresh = useCallback(async () => {
++    await loadItems();
++    if (onTranscriptsChanged) onTranscriptsChanged();
++  }, [loadItems, onTranscriptsChanged]);
++
++  const folders = useMemo(() => {
++    const set = new Set();
++    items.forEach((item) => set.add((item.folder || '').trim()));
++    const list = [...set].sort((a, b) => {
++      if (a === '') return -1;
++      if (b === '') return 1;
++      return a.localeCompare(b);
++    });
++    return ['all', ...list];
++  }, [items]);
++
++  const filtered = useMemo(() => {
++    let list = items;
++    if (activeFolder !== 'all') {
++      list = list.filter((item) => (item.folder || '').trim() === activeFolder);
++    }
++    const needle = query.trim().toLowerCase();
++    if (needle) {
++      list = list.filter((item) =>
++        [item.title, item.text, item.url, item.folder]
++          .filter(Boolean)
++          .some((value) => String(value).toLowerCase().includes(needle)),
++      );
++    }
++    return list;
++  }, [items, activeFolder, query]);
++
++  const handleFetch = async () => {
++    const trimmed = fetchUrl.trim();
++    if (!trimmed || fetching) return;
++    setFetching(true);
++    setError('');
++    try {
++      const res = await api.post('/transcript-saver/fetch', { url: trimmed, folder: fetchFolder.trim() });
++      const saved = res.data?.transcript;
++      await refresh();
++      notify(saved?.title ? `Saved: ${saved.title}` : 'Transcript fetched and saved', 'success');
++      setFetchUrl('');
++      setFetchFolder('');
++      if (saved?.id) setExpandedId(saved.id);
++    } catch (err) {
++      setError(err?.response?.data?.detail || 'Unable to fetch transcript.');
++    } finally {
++      setFetching(false);
++    }
++  };
++
++  const handleCopy = async (item) => {
++    try {
++      await navigator.clipboard.writeText(item.text || '');
++      setCopyStatusId(item.id);
++      window.setTimeout(() => setCopyStatusId(null), 1600);
++    } catch {
++      notify('Copy failed — select the text manually', 'error');
++    }
++  };
++
++  const startEdit = (item) => {
++    setEditingId(item.id);
++    setEditTitle(item.title || '');
++    setEditText(item.text || '');
++    setExpandedId(item.id);
++  };
++
++  const saveEdit = async () => {
++    if (!editingId || savingEdit) return;
++    if (!editTitle.trim() || !editText.trim()) {
++      notify('Title and text cannot be empty', 'error');
++      return;
++    }
++    setSavingEdit(true);
++    try {
++      await api.patch(`/transcript-saver/${editingId}`, {
++        title: editTitle.trim(),
++        text: editText.trim(),
++      });
++      setEditingId(null);
++      await refresh();
++      notify('Transcript updated', 'success');
++    } catch (err) {
++      notify(err?.response?.data?.detail || 'Unable to update transcript.', 'error');
++    } finally {
++      setSavingEdit(false);
++    }
++  };
++
++  const handleDelete = async (id) => {
++    try {
++      await api.delete(`/transcript-saver/${id}`);
++      if (expandedId === id) setExpandedId(null);
++      if (editingId === id) setEditingId(null);
++      await refresh();
++      notify('Transcript deleted', 'info');
++    } catch (err) {
++      notify(err?.response?.data?.detail || 'Unable to delete transcript.', 'error');
++    }
++  };
++
++  const handleClearAll = async () => {
++    if (!confirmClearAll) {
++      setConfirmClearAll(true);
++      window.setTimeout(() => setConfirmClearAll(false), 4000);
++      notify('Click "Clear all" again to confirm', 'info');
++      return;
++    }
++    try {
++      await api.delete('/transcript-saver');
++      setConfirmClearAll(false);
++      setExpandedId(null);
++      setEditingId(null);
++      await refresh();
++      notify('All saved transcripts cleared', 'info');
++    } catch (err) {
++      notify(err?.response?.data?.detail || 'Unable to clear transcripts.', 'error');
++    }
++  };
++
++  return (
++    <div className="page-shell">
++      <div className="page-header">
++        <div>
++          <h1 className="page-title">Transcripts</h1>
++          <p className="page-subtitle">
++            Every transcript you fetch is auto-saved here and stays forever — even after the video is
++            deleted or the page reloads. Search, copy, edit or remove them anytime.
++          </p>
++        </div>
++        <div className="page-header__actions">
++          <button className="ghost-button" type="button" onClick={refresh}>
++            <RefreshCw size={16} /> Refresh
++          </button>
++          {items.length > 0 ? (
++            <button
++              className={`ghost-button ${confirmClearAll ? 'ghost-button--danger' : ''}`}
++              type="button"
++              onClick={handleClearAll}
++            >
++              <Trash2 size={16} />
++              {confirmClearAll ? 'Confirm clear all' : 'Clear all'}
++            </button>
++          ) : null}
++        </div>
++      </div>
++
++      {/* Fetch & save */}
++      <section className="panel panel--form">
++        <div className="panel__header panel__header--stacked">
++          <div>
++            <div className="section-eyebrow section-eyebrow--soft">Quick save</div>
++            <h2 className="panel__title">Fetch a transcript from YouTube</h2>
++            <p className="panel__subtitle">
++              Paste a YouTube link and its auto transcript is fetched and saved here instantly
++              (no manual save needed).
++            </p>
++          </div>
++          <span className="panel__badge panel__badge--soft">{items.length} saved</span>
++        </div>
++        <form
++          className="download-form"
++          onSubmit={(event) => {
++            event.preventDefault();
++            handleFetch();
++          }}
++        >
++          <div className="transcript-fetch-row">
++            <input
++              className="input"
++              value={fetchUrl}
++              onChange={(event) => setFetchUrl(event.target.value)}
++              placeholder="https://youtube.com/watch?v=..."
++              autoComplete="off"
++              spellCheck="false"
++            />
++            <input
++              className="input transcript-fetch-folder"
++              value={fetchFolder}
++              onChange={(event) => setFetchFolder(event.target.value)}
++              placeholder="Folder (optional, e.g. Calculus)"
++              maxLength={120}
++            />
++            <button className="primary-button" type="submit" disabled={fetching || !fetchUrl.trim()}>
++              {fetching ? <Loader2 className="spin" size={16} /> : <FileText size={16} />}
++              {fetching ? 'Fetching…' : 'Fetch & save'}
++            </button>
++          </div>
++          {error ? <p className="download-card__error">{error}</p> : null}
++        </form>
++      </section>
++
++      {/* Toolbar: search + folder chips */}
++      <section className="panel panel--toolbar">
++        <div className="search-box">
++          <Search size={15} className="search-box__icon" />
++          <input
++            className="input input--search"
++            value={query}
++            onChange={(event) => setQuery(event.target.value)}
++            placeholder="Search transcripts…"
++          />
++        </div>
++        <div className="transcript-folder-chips">
++          {folders.map((folder) => (
++            <button
++              key={folder}
++              type="button"
++              className={`transcript-folder-chip ${activeFolder === folder ? 'transcript-folder-chip--active' : ''}`}
++              onClick={() => setActiveFolder(folder)}
++            >
++              {folder === 'all' ? 'All' : folderLabel(folder)}
++              <span className="transcript-folder-chip__count">
++                {folder === 'all'
++                  ? items.length
++                  : items.filter((item) => (item.folder || '').trim() === folder).length}
++              </span>
++            </button>
++          ))}
++        </div>
++      </section>
++
++      {/* List */}
++      <section className="panel panel--list">
++        <div className="panel__header">
++          <div>
++            <h2 className="panel__title">{activeFolder === 'all' ? 'All transcripts' : folderLabel(activeFolder)}</h2>
++            <p className="panel__subtitle">
++              {filtered.length} transcript{filtered.length === 1 ? '' : 's'}
++              {query.trim() ? ` matching “${query.trim()}”` : ''}
++            </p>
++          </div>
++          <span className="panel__badge">{filtered.length}</span>
++        </div>
++
++        {loading ? (
++          <div className="empty-state"><p>Loading transcripts…</p></div>
++        ) : items.length === 0 ? (
++          <div className="empty-state">
++            <p>
++              No saved transcripts yet. Fetch one from the Download page (paste a link and press
++              Get Transcript — it auto-saves here) or use the fetch box above.
++            </p>
++          </div>
++        ) : filtered.length === 0 ? (
++          <div className="empty-state">
++            <p>{query.trim() ? 'No transcripts match your search.' : 'No transcripts in this folder yet.'}</p>
++          </div>
++        ) : (
++          <div className="stack-list">
++            {filtered.map((item) => {
++              const expanded = expandedId === item.id;
++              const editing = editingId === item.id;
++              const previewLines = (item.text || '').split('\n').slice(0, 3).join('\n');
++              return (
++                <article
++                  key={item.id}
++                  className={`download-card ${expanded ? 'download-card--active' : ''}`}
++                >
++                  <div className="transcript-item">
++                    <div className="transcript-item__head">
++                      <button
++                        className="transcript-item__expand"
++                        type="button"
++                        onClick={() => setExpandedId(expanded ? null : item.id)}
++                        title={expanded ? 'Collapse' : 'Read full transcript'}
++                      >
++                        <div className="transcript-item__title-wrap">
++                          <h3 className="download-card__title">{item.title}</h3>
++                          <span className="download-card__meta">
++                            {folderLabel(item.folder)} · {item.source === 'youtube' ? 'YouTube auto' : 'Manual'} ·{' '}
++                            {item.line_count} lines · {formatDate(item.updated_at)}
++                            {item.video_id ? ` · ${item.video_id}` : ''}
++                          </span>
++                        </div>
++                      </button>
++                      <div className="transcript-item__actions">
++                        <button className="icon-button" type="button" title="Copy full transcript" onClick={() => handleCopy(item)}>
++                          {copyStatusId === item.id ? <Check size={15} /> : <Copy size={15} />}
++                        </button>
++                        <button className="icon-button" type="button" title="Edit" onClick={() => startEdit(item)}>
++                          <PenLine size={15} />
++                        </button>
++                        <button className="icon-button icon-button--danger" type="button" title="Delete" onClick={() => handleDelete(item.id)}>
++                          <Trash2 size={15} />
++                        </button>
++                      </div>
++                    </div>
++
++                    {editing ? (
++                      <div className="transcript-item__edit">
++                        <input className="input" value={editTitle} onChange={(event) => setEditTitle(event.target.value)} maxLength={300} />
++                        <textarea className="transcript-textarea" rows={8} value={editText} onChange={(event) => setEditText(event.target.value)} />
++                        <div className="transcript-actions">
++                          <button className="primary-button" type="button" onClick={saveEdit} disabled={savingEdit}>
++                            {savingEdit ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
++                            Save changes
++                          </button>
++                          <button className="ghost-button" type="button" onClick={() => setEditingId(null)}>
++                            <X size={16} /> Cancel
++                          </button>
++                        </div>
++                      </div>
++                    ) : expanded ? (
++                      <pre className="transcript-item__full">{item.text}</pre>
++                    ) : (
++                      <button
++                        className="transcript-item__preview"
++                        type="button"
++                        onClick={() => setExpandedId(item.id)}
++                        title="Click to read full transcript"
++                      >
++                        {previewLines}
++                        <span className="transcript-item__more">… click to read full transcript</span>
++                      </button>
++                    )}
++                  </div>
++                </article>
++              );
++            })}
++          </div>
++        )}
++      </section>
++    </div>
++  );
++}
