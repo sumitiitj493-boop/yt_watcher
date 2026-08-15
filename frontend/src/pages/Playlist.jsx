@@ -1,5 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Download, Edit3, Loader2, Pause, Play, Plus, RefreshCw, Search, Shuffle, Trash2, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import {
+  BookOpenText,
+  CheckCircle2,
+  Download,
+  Edit3,
+  Loader2,
+  Pause,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Shuffle,
+  Trash2,
+  X,
+  XCircle,
+} from 'lucide-react';
 import { API_BASE, api } from '../lib/api';
 
 const cleanTitle = (filename = '') => (
@@ -141,7 +157,7 @@ function PlaylistThumb({ file }) {
   );
 }
 
-export default function PlaylistPage({ files = [], onNotify }) {
+export default function PlaylistPage({ files = [], onNotify, onLibraryChanged }) {
   // Multi-playlist state
   const [playlists, setPlaylists] = useState([]);                 // [{ id, name, created_at, item_count }]
   const [activePlaylistId, setActivePlaylistId] = useState(null);
@@ -159,6 +175,42 @@ export default function PlaylistPage({ files = [], onNotify }) {
   const [addNewName, setAddNewName] = useState('');
   const [isAdding, setIsAdding] = useState(false);
 
+  // Drag & drop reordering
+  const suppressClickRef = useRef(false);
+  const [dragIndex, setDragIndex] = useState(null);
+  const [dragOverIndex, setDragOverIndex] = useState(null);
+
+  const handleDragStart = (index) => (event) => {
+    setDragIndex(index);
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(index));
+  };
+
+  const handleDragOver = (index) => (event) => {
+    event.preventDefault();
+    if (dragIndex !== null && dragOverIndex !== index) setDragOverIndex(index);
+  };
+
+  const handleDrop = (index) => async (event) => {
+    event.preventDefault();
+    const from = dragIndex;
+    setDragIndex(null);
+    setDragOverIndex(null);
+    if (from === null || from === index || from < 0 || from >= playlist.length) return;
+    // The browser fires a click after drop — suppress it so dropping doesn't start playback.
+    suppressClickRef.current = true;
+    const next = [...playlist];
+    const [moved] = next.splice(from, 1);
+    next.splice(index, 0, moved);
+    setCurrentIndex(0);
+    saveOrder(next);
+  };
+
+  const handleDragEnd = () => {
+    setDragIndex(null);
+    setDragOverIndex(null);
+  };
+
   // Player state
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -168,6 +220,170 @@ export default function PlaylistPage({ files = [], onNotify }) {
   const [transcriptStatus, setTranscriptStatus] = useState('Get Transcript');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const playerRef = useRef(null);
+
+  // Re-fetch transcripts for the active playlist (no download)
+  const [trFolder, setTrFolder] = useState('');
+  const [trRangeFrom, setTrRangeFrom] = useState('');
+  const [trRangeTo, setTrRangeTo] = useState('');
+  const [trSpecific, setTrSpecific] = useState('');
+  const [trStarting, setTrStarting] = useState(false);
+  const [trBatchId, setTrBatchId] = useState(null);
+  const [trBatch, setTrBatch] = useState(null);
+
+  // Find video by pasted subtitle
+  const [subQuery, setSubQuery] = useState('');
+  const [subSearching, setSubSearching] = useState(false);
+  const [subResults, setSubResults] = useState(null); // { matches, count, fetched_missing, no_transcript }
+  const [subError, setSubError] = useState('');
+  const trStopRef = useRef(false);
+
+  const trStatusLabel = (status) => {
+    const map = {
+      pending: 'Transcript queued',
+      fetching: 'Fetching transcript…',
+      saved: 'Transcript saved',
+      unavailable: 'No transcript',
+      error: 'Transcript error',
+    };
+    return map[status] || status || '—';
+  };
+
+  const trSelectionIndices = () => {
+    if (!activePlaylist) return null;
+    const total = playlist.length;
+    if (trSpecific.trim()) {
+      const wanted = new Set();
+      const parts = trSpecific.split(/[,;\s]+/).filter(Boolean);
+      for (const part of parts) {
+        const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
+        if (range) {
+          const a = parseInt(range[1], 10);
+          const b = parseInt(range[2], 10);
+          for (let i = Math.min(a, b); i <= Math.max(a, b); i += 1) {
+            if (i >= 1 && i <= total) wanted.add(i);
+          }
+        } else if (/^\d+$/.test(part)) {
+          const n = parseInt(part, 10);
+          if (n >= 1 && n <= total) wanted.add(n);
+        }
+      }
+      if (wanted.size === 0) return null;
+      return [...wanted].sort((a, b) => a - b);
+    }
+    if (trRangeFrom.trim() || trRangeTo.trim()) {
+      const from = parseInt(trRangeFrom, 10);
+      const to = parseInt(trRangeTo, 10);
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
+      const low = Math.max(1, Math.min(from, to));
+      const high = Math.min(total, Math.max(from, to));
+      if (low > high) return null;
+      const out = [];
+      for (let i = low; i <= high; i += 1) out.push(i);
+      return out;
+    }
+    return null; // null = all
+  };
+
+  const handleFetchTranscripts = async () => {
+    if (!activePlaylistId || trStarting || trBatchId) return;
+    const indices = trSelectionIndices();
+    if (trSpecific.trim() && !indices) {
+      notify('Enter valid item numbers (e.g. 1, 3, 5-8)', 'error');
+      return;
+    }
+    if ((trRangeFrom.trim() || trRangeTo.trim()) && !indices) {
+      notify('Enter both a From and a To item number', 'error');
+      return;
+    }
+    setTrStarting(true);
+    try {
+      const res = await api.post(`/playlist/${activePlaylistId}/transcripts`, {
+        indices,
+        transcript_folder: trFolder.trim(),
+      });
+      trStopRef.current = false;
+      setTrBatchId(res.data.batch_id);
+      setTrBatch(null);
+      notify(
+        indices
+          ? `Fetching ${indices.length} transcript${indices.length === 1 ? '' : 's'} (no download)…`
+          : `Fetching transcripts for all ${res.data.task_count} items (no download)…`,
+        'success',
+      );
+    } catch (err) {
+      notify(err?.response?.data?.detail || 'Unable to fetch transcripts.', 'error');
+    } finally {
+      setTrStarting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!trBatchId) return undefined;
+    let active = true;
+    let timer = null;
+    const poll = async () => {
+      if (trStopRef.current || !active) return;
+      try {
+        const res = await api.get(`/playlist/batches/${trBatchId}`);
+        if (!active) return;
+        setTrBatch(res.data || {});
+        if (['completed', 'partial', 'cancelled'].includes(res.data?.phase)) {
+          trStopRef.current = true;
+          setTrBatch((prev) => (prev ? { ...prev, finished: true } : prev));
+        } else {
+          timer = window.setTimeout(poll, 1500);
+        }
+      } catch {
+        if (!active) return;
+        timer = window.setTimeout(poll, 3000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [trBatchId]);
+
+  const handleSubtitleSearch = async () => {
+    const q = subQuery.trim();
+    if (q.length < 2 || subSearching) return;
+    setSubSearching(true);
+    setSubError('');
+    setSubResults(null);
+    try {
+      const res = await api.post('/search-by-transcript', {
+        query: q,
+        playlist_id: activePlaylistId,
+        fetch_missing: true,
+        limit: 20,
+      });
+      setSubResults(res.data || { matches: [], count: 0 });
+    } catch (err) {
+      setSubError(err?.response?.data?.detail || 'Unable to search transcripts');
+    } finally {
+      setSubSearching(false);
+    }
+  };
+
+  const jumpToSubtitleMatch = (filename) => {
+    const idx = playlist.findIndex((item) => item === filename);
+    if (idx >= 0) {
+      setCurrentIndex(idx);
+      setIsPlaying(true);
+      window.setTimeout(() => playerRef.current?.play?.(), 0);
+    }
+  };
+
+  const resetTranscriptFetch = () => {
+    setTrBatchId(null);
+    setTrBatch(null);
+    trStopRef.current = false;
+    setTrFolder('');
+    setTrRangeFrom('');
+    setTrRangeTo('');
+    setTrSpecific('');
+  };
 
   const activePlaylist = playlists.find((item) => item.id === activePlaylistId) || null;
 
@@ -407,13 +623,23 @@ export default function PlaylistPage({ files = [], onNotify }) {
     }
   };
 
+  const [confirmRemoveFile, setConfirmRemoveFile] = useState(null); // two-step permanent delete guard
+
   const removeItem = async (filename) => {
     if (!activePlaylistId) return;
+    if (confirmRemoveFile !== filename) {
+      setConfirmRemoveFile(filename);
+      notify('Click delete again to confirm — this also deletes the file from your device & Library', 'info');
+      window.setTimeout(() => setConfirmRemoveFile((current) => (current === filename ? null : current)), 4000);
+      return;
+    }
+    setConfirmRemoveFile(null);
     try {
-      const response = await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
-      setPlaylist(Array.isArray(response.data) ? response.data : playlist.filter((item) => item !== filename));
+      await api.delete(`/playlists/${activePlaylistId}/items/${encodeURIComponent(filename)}`);
+      setPlaylist((current) => current.filter((item) => item !== filename));
       await loadPlaylists();
-      notify('Removed from playlist', 'info');
+      if (onLibraryChanged) onLibraryChanged();
+      notify('Removed from playlist & file deleted from device', 'success');
     } catch (error) {
       notify(error?.response?.data?.detail || 'Unable to remove item', 'error');
     }
@@ -773,6 +999,190 @@ export default function PlaylistPage({ files = [], onNotify }) {
         </button>
       </section>
 
+      {/* Re-fetch transcripts for the active playlist (no download) */}
+      <section className="panel panel--form">
+        <div className="panel__header panel__header--stacked">
+          <div>
+            <div className="section-eyebrow section-eyebrow--soft">Transcripts for this playlist</div>
+            <h2 className="panel__title">Fetch Transcripts Again (no download)</h2>
+            <p className="panel__subtitle">
+              Deleted or forgot a transcript? The source link of every downloaded video is stored —
+              so you can re-fetch the YouTube auto transcript for this playlist's items (all, a range,
+              or specific ones) straight into the Transcript Saver. No re-download, no Whisper.
+            </p>
+          </div>
+          <span className="panel__badge panel__badge--soft">{playlist.length} items</span>
+        </div>
+
+        {activePlaylistId ? (
+          <div className="download-form">
+            <div className="form-grid">
+              <div className="field">
+                <label className="field__label" htmlFor="tr-folder">SAVE INTO FOLDER (optional)</label>
+                <input
+                  id="tr-folder"
+                  className="input"
+                  value={trFolder}
+                  onChange={(event) => setTrFolder(event.target.value)}
+                  placeholder="e.g. dbms — empty = General (first come, first serve)"
+                  maxLength={120}
+                />
+              </div>
+            </div>
+
+            <div className="playlist-batch-pick">
+              <div className="playlist-batch-pick__range">
+                <input
+                  className="input input--num"
+                  value={trRangeFrom}
+                  onChange={(event) => setTrRangeFrom(event.target.value)}
+                  placeholder="From #"
+                  inputMode="numeric"
+                />
+                <span>to</span>
+                <input
+                  className="input input--num"
+                  value={trRangeTo}
+                  onChange={(event) => setTrRangeTo(event.target.value)}
+                  placeholder="To #"
+                  inputMode="numeric"
+                />
+              </div>
+              <div className="playlist-batch-pick__typed">
+                <input
+                  className="input"
+                  value={trSpecific}
+                  onChange={(event) => setTrSpecific(event.target.value)}
+                  placeholder="Or specific numbers: 1, 3, 5-8 (empty = ALL)"
+                />
+              </div>
+            </div>
+
+            <div className="transcript-actions">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleFetchTranscripts}
+                disabled={trStarting || !!trBatchId || playlist.length === 0}
+              >
+                {trStarting ? <Loader2 className="spin" size={16} /> : <BookOpenText size={16} />}
+                {trStarting
+                  ? 'Starting…'
+                  : trSpecific.trim() || trRangeFrom.trim()
+                    ? 'Fetch selected transcripts (no download)'
+                    : `Fetch all ${playlist.length} transcript${playlist.length === 1 ? '' : 's'} (no download)`}
+              </button>
+              {trBatchId ? (
+                <button className="ghost-button" type="button" onClick={resetTranscriptFetch}>
+                  <X size={16} /> Reset
+                </button>
+              ) : null}
+            </div>
+
+            {/* Find a video by pasting its subtitle */}
+            <div className="subtitle-search">
+              <div className="subtitle-search__head">
+                <Search size={14} />
+                <span>Find a video by pasting a subtitle line</span>
+              </div>
+              <div className="subtitle-search__row">
+                <input
+                  className="input"
+                  value={subQuery}
+                  onChange={(event) => { setSubQuery(event.target.value); setSubResults(null); setSubError(''); }}
+                  onKeyDown={(event) => { if (event.key === 'Enter') handleSubtitleSearch(); }}
+                  placeholder="Paste any subtitle text from the video… (e.g. “mitochondria is the powerhouse”)"
+                />
+                <button className="ghost-button" type="button" onClick={handleSubtitleSearch} disabled={subSearching || subQuery.trim().length < 2}>
+                  {subSearching ? <Loader2 className="spin" size={16} /> : <Search size={16} />}
+                  {subSearching ? 'Searching…' : 'Find video'}
+                </button>
+              </div>
+              {subError ? <p className="download-card__error">{subError}</p> : null}
+              {subResults ? (
+                <div className="subtitle-search__results">
+                  <p className="subtitle-search__summary">
+                    {subResults.count > 0
+                      ? `Found ${subResults.count} video${subResults.count === 1 ? '' : 's'} in this playlist`
+                      : 'No matching video found'}
+                    {subResults.fetched_missing > 0 ? ` · fetched ${subResults.fetched_missing} transcript${subResults.fetched_missing === 1 ? '' : 's'} to check` : ''}
+                    {subResults.no_transcript > 0 && subResults.count === 0 ? ` · ${subResults.no_transcript} video${subResults.no_transcript === 1 ? '' : 's'} had no saved transcript` : ''}
+                  </p>
+                  {subResults.matches?.map((m) => (
+                    <button key={m.filename} className="subtitle-search__match" type="button" onClick={() => jumpToSubtitleMatch(m.filename)}>
+                      <span className="subtitle-search__match-title">{m.title}</span>
+                      <span className="subtitle-search__match-snippet">“{m.snippet}”</span>
+                      <span className="subtitle-search__match-cta">Play in playlist →</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            {trBatchId ? (
+              <div className="playlist-batch-progress">
+                <div className="download-card__title-row">
+                  <div>
+                    <h3 className="panel__title panel__title--tight">
+                      {trBatch?.phase === 'completed'
+                        ? 'Transcripts ready ✓'
+                        : trBatch?.phase === 'partial'
+                          ? 'Finished — some unavailable'
+                          : trBatch?.phase === 'cancelled'
+                            ? 'Cancelled'
+                            : 'Fetching transcripts…'}
+                    </h3>
+                    <p className="panel__subtitle">
+                      {trBatch
+                        ? `${trBatch.completed_count || 0}/${trBatch.total_count || 0} saved`
+                          + (trBatch.failed_count ? ` · ${trBatch.failed_count} unavailable` : '')
+                          + (trBatch.transcript_folder ? ` → "${trBatch.transcript_folder}"` : ' → General')
+                        : 'Starting…'}
+                    </p>
+                  </div>
+                  {trBatch && (trBatch.completed_count || 0) > 0 ? (
+                    <Link
+                      className="ghost-button"
+                      to={trBatch.transcript_folder
+                        ? `/transcripts?folder=${encodeURIComponent(trBatch.transcript_folder)}`
+                        : '/transcripts'}
+                    >
+                      <BookOpenText size={16} /> View transcripts
+                    </Link>
+                  ) : null}
+                </div>
+                {trBatch ? (
+                  <div className="playlist-batch-tasks">
+                    {trBatch.tasks.map((task) => (
+                      <div key={`${task.index}-${task.id || task.url}`} className={`playlist-batch-task playlist-batch-task--${task.status}`}>
+                        <span className="playlist-batch-task__index">#{task.index}</span>
+                        <span className="playlist-batch-task__title" title={task.title}>{task.title}</span>
+                        <span className={`playlist-batch-task__tflag playlist-batch-task__tflag--${task.transcript_status}`}
+                          title={task.transcript_error || trStatusLabel(task.transcript_status)}>
+                          {task.transcript_status === 'saved' ? <CheckCircle2 size={13} /> : null}
+                          {task.transcript_status === 'unavailable' || task.transcript_status === 'error'
+                            ? <XCircle size={13} />
+                            : task.transcript_status === 'fetching'
+                              ? <Loader2 className="spin" size={13} />
+                              : null}
+                          {trStatusLabel(task.transcript_status)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state empty-state--compact"><p>Starting…</p></div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="empty-state empty-state--compact">
+            <p>Select a playlist above to fetch its transcripts.</p>
+          </div>
+        )}
+      </section>
+
       {currentFile ? (
         <section className="panel panel--preview">
           <div className="preview-media">
@@ -873,16 +1283,27 @@ export default function PlaylistPage({ files = [], onNotify }) {
             {playlistFiles.map((file, index) => (
               <article
                 key={`${file.filename}-${index}`}
-                className={`download-card ${index === currentIndex ? 'download-card--active' : ''}`}
+                className={`download-card ${index === currentIndex ? 'download-card--active' : ''} ${dragIndex === index ? 'download-card--dragging' : ''} ${dragOverIndex === index ? 'download-card--drop-target' : ''}`}
                 role="button"
                 tabIndex={0}
-                onClick={() => playIndex(index)}
+                draggable
+                onClick={() => {
+                  if (suppressClickRef.current) {
+                    suppressClickRef.current = false;
+                    return;
+                  }
+                  playIndex(index);
+                }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
                     playIndex(index);
                   }
                 }}
+                onDragStart={handleDragStart(index)}
+                onDragOver={handleDragOver(index)}
+                onDrop={handleDrop(index)}
+                onDragEnd={handleDragEnd}
               >
                 <PlaylistThumb file={file} />
                 <div className="download-card__body">

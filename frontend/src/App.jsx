@@ -31,6 +31,13 @@ import {
   Music2,
   Plus,
   SunMedium,
+  ListVideo,
+  ListOrdered,
+  CheckCircle2,
+  XCircle,
+  BookOpenText,
+  ArrowUp,
+  Scissors,
 } from 'lucide-react';
 
 import './App.css';
@@ -39,7 +46,15 @@ import PlaylistPage from './pages/Playlist';
 import PlaylistPicker from './components/PlaylistPicker';
 import LibraryPicker from './components/LibraryPicker';
 import AudioExtractorPage from './pages/AudioExtractor';
-import PhotosPage from './pages/Photos';
+import PhotosPage from './pages/photos';
+import TranscriptsPage from './pages/Transcripts';
+import ClipsPage from './pages/Clips';
+import CommandPalette from './components/CommandPalette';
+import DownloadDock from './components/DownloadDock';
+import ShortcutsModal from './components/ShortcutsModal';
+import ConfettiBurst from './components/ConfettiBurst';
+import Skeleton from './components/Skeleton';
+import WelcomeQuote from './components/WelcomeQuote';
 
 const QUALITY_OPTIONS = ['best', '2160', '1440', '1080', '720', '480', '360', '240', '144'];
 const FORMAT_OPTIONS = ['mp4', 'webm', 'mkv', 'mp3', 'm4a'];
@@ -531,13 +546,25 @@ function FileCard({ file, active, onSelect, onDelete, onAddToPlaylist, selectMod
   );
 }
 
-function ToastStack({ toasts }) {
+function ToastStack({ toasts, onDismiss }) {
   return (
     <div className="toast-stack" aria-live="polite" aria-atomic="true">
       {toasts.map((toast) => (
         <div key={toast.id} className={`toast toast--${toast.type}`}>
           <span className="toast__dot" />
           <span>{toast.message}</span>
+          {toast.action ? (
+            <button
+              className="toast__action"
+              type="button"
+              onClick={() => {
+                toast.action.onClick();
+                onDismiss(toast.id);
+              }}
+            >
+              {toast.action.label}
+            </button>
+          ) : null}
         </div>
       ))}
     </div>
@@ -703,7 +730,7 @@ function AboutPage() {
   );
 }
 
-function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged }) {
+function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocialDownload, onDeleteDownload, onRetryDownload, onCancelDownload, onNotify, onLibraryChanged, onTranscriptsChanged }) {
   const notify = useCallback((message, type = 'info') => {
     if (onNotify) onNotify(message, type);
   }, [onNotify]);
@@ -731,33 +758,420 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
   const [transcriptError, setTranscriptError] = useState('');
   const [transcriptCopyStatus, setTranscriptCopyStatus] = useState('Copy Transcript');
   const [mode, setMode] = useState('youtube'); // 'youtube' or 'social'
+  const transcriptText = transcriptSegmentsToText(transcriptResult?.segments || []);
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status));
   const hasTemporaryInstagramDownloads = downloads.some((item) => String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/'));
   const currentTask = currentTaskId ? downloads.find((d) => d.task_id === currentTaskId) : null;
   const dynamicQualityOptions = metadata?.qualities?.length ? metadata.qualities : QUALITY_OPTIONS;
   const dynamicFormatOptions = metadata?.formats?.length ? metadata.formats : FORMAT_OPTIONS;
-  const transcriptText = transcriptSegmentsToText(transcriptResult?.segments || []);
 
-  const location = useLocation();
+  // Playlist batch download (range/specific videos from one playlist link)
+  const [playlistUrl, setPlaylistUrl] = useState('');
+  const [playlistMeta, setPlaylistMeta] = useState(null);       // { is_playlist, url, playlist_title, count, entries[] }
+  const [playlistLoading, setPlaylistLoading] = useState(false);
+  const [playlistError, setPlaylistError] = useState('');
+  const [selectedIndices, setSelectedIndices] = useState(() => new Set());
+  const [rangeFrom, setRangeFrom] = useState('');
+  const [rangeTo, setRangeTo] = useState('');
+  const [typedSelection, setTypedSelection] = useState('');
+  const [plQuality, setPlQuality] = useState('1080');
+  const [plFormat, setPlFormat] = useState('mp4');
+  const [plPlaylists, setPlPlaylists] = useState([]);
+  const [plTarget, setPlTarget] = useState('');                 // '' = none, playlist id, or 'new'
+  const [plNewName, setPlNewName] = useState('');
+  const [plSequential, setPlSequential] = useState(true);
+  const [plFetchTranscripts, setPlFetchTranscripts] = useState(false);
+  const [plTranscriptFolder, setPlTranscriptFolder] = useState('');
+  const [plTranscriptsOnly, setPlTranscriptsOnly] = useState(false);
+  const [batchId, setBatchId] = useState(null);
+  const [batch, setBatch] = useState(null);
+  const [batchStarting, setBatchStarting] = useState(false);
+  const batchCompletedRef = useRef(0);
+  const stopPollingRef = useRef(false);
+
+  // Multi-link batch download (paste many URLs at once)
+  const [multiUrls, setMultiUrls] = useState('');
+  const [multiQuality, setMultiQuality] = useState('1080');
+  const [multiFormat, setMultiFormat] = useState('mp4');
+  const [multiSequential, setMultiSequential] = useState(true);
+  const [multiFetchTranscripts, setMultiFetchTranscripts] = useState(false);
+  const [multiFolder, setMultiFolder] = useState('');
+  const [multiTarget, setMultiTarget] = useState('');
+  const [multiNewName, setMultiNewName] = useState('');
+  const [multiTranscriptsOnly, setMultiTranscriptsOnly] = useState(false);
+  const [multiBatchId, setMultiBatchId] = useState(null);
+  const [multiBatch, setMultiBatch] = useState(null);
+  const [multiStarting, setMultiStarting] = useState(false);
+  const multiCompletedRef = useRef(0);
+  const multiStopPollingRef = useRef(false);
+
+  // --- Playlist batch download handlers ---------------------------------
+  const batchTaskStatusLabel = (status) => {
+    const map = {
+      planned: 'Waiting',
+      pending: 'Queued',
+      queued: 'Queued',
+      starting: 'Starting',
+      downloading: 'Downloading',
+      processing: 'Processing',
+      completed: 'Done',
+      error: 'Failed',
+      cancelled: 'Cancelled',
+    };
+    return map[status] || status || '—';
+  };
+
   useEffect(() => {
-    const state = location?.state || {};
-    if (state?.autoStart && state?.url) {
-      const u = state.url;
-      const q = state.quality || 'best';
-      const f = state.format || 'mp4';
-      setUrl(u);
-      setQuality(q === '1080' ? '1080' : q);
-      setFormat(f);
-      (async () => {
-        try {
-          await onStartDownload({ url: u, quality: q, format: f });
-          setUrl('');
-        } catch (e) {
-          // ignore errors here — they will be surfaced elsewhere
-        }
-      })();
+    api.get('/playlists')
+      .then((res) => {
+        const list = Array.isArray(res.data?.playlists) ? res.data.playlists : [];
+        setPlPlaylists(list);
+        setPlTarget((current) => current || (list[0] ? String(list[0].id) : 'new'));
+      })
+      .catch(() => {
+        // Playlist list is optional; the batch can still run without it.
+      });
+  }, []);
+
+  const handleLoadPlaylist = async () => {
+    const trimmed = playlistUrl.trim();
+    if (!trimmed || playlistLoading) return;
+    setPlaylistLoading(true);
+    setPlaylistError('');
+    setPlaylistMeta(null);
+    setSelectedIndices(new Set());
+    try {
+      const res = await api.post('/playlist/entries', { url: trimmed });
+      const data = res.data || {};
+      if (!data.is_playlist) {
+        setPlaylistError('That link is not a playlist. Paste a playlist URL like https://www.youtube.com/playlist?list=...');
+        return;
+      }
+      setPlaylistMeta(data);
+      notify(`Playlist loaded: ${data.count} video${data.count === 1 ? '' : 's'}`, 'success');
+    } catch (err) {
+      setPlaylistError(safeFetchError(err, 'Unable to load playlist.'));
+    } finally {
+      setPlaylistLoading(false);
     }
-  }, [location, onStartDownload]);
+  };
+
+  const toggleIndex = (index) => {
+    setSelectedIndices((current) => {
+      const next = new Set(current);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const selectAllPlaylist = () => {
+    if (!playlistMeta?.entries?.length) return;
+    setSelectedIndices(new Set(playlistMeta.entries.map((entry) => entry.index)));
+  };
+
+  const clearPlaylistSelection = () => setSelectedIndices(new Set());
+
+  const applyRangeSelection = () => {
+    const from = parseInt(rangeFrom, 10);
+    const to = parseInt(rangeTo, 10);
+    if (!playlistMeta?.entries?.length || !Number.isFinite(from) || !Number.isFinite(to)) {
+      notify('Enter both a "From" and a "To" video number', 'error');
+      return;
+    }
+    const low = Math.min(from, to);
+    const high = Math.max(from, to);
+    const valid = playlistMeta.entries.filter((entry) => entry.index >= low && entry.index <= high);
+    if (!valid.length) {
+      notify(`No videos between #${low} and #${high}`, 'error');
+      return;
+    }
+    setSelectedIndices((current) => {
+      const next = new Set(current);
+      valid.forEach((entry) => next.add(entry.index));
+      return next;
+    });
+    notify(`Added ${valid.length} video${valid.length === 1 ? '' : 's'} (#${low}–#${high})`, 'success');
+  };
+
+  const applyTypedSelection = () => {
+    const text = typedSelection.trim();
+    if (!text) return;
+    const wanted = new Set();
+    const parts = text.split(/[,;\s]+/).filter(Boolean);
+    for (const part of parts) {
+      const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (range) {
+        const a = parseInt(range[1], 10);
+        const b = parseInt(range[2], 10);
+        for (let i = Math.min(a, b); i <= Math.max(a, b); i += 1) wanted.add(i);
+      } else if (/^\d+$/.test(part)) {
+        wanted.add(parseInt(part, 10));
+      }
+    }
+    if (!wanted.size) {
+      notify('Type numbers like: 1, 3, 5-8', 'error');
+      return;
+    }
+    const valid = (playlistMeta?.entries || []).filter((entry) => wanted.has(entry.index));
+    if (!valid.length) {
+      notify('None of those numbers match videos in this playlist', 'error');
+      return;
+    }
+    setSelectedIndices((current) => {
+      const next = new Set(current);
+      valid.forEach((entry) => next.add(entry.index));
+      return next;
+    });
+    setTypedSelection('');
+    notify(`Added ${valid.length} more video${valid.length === 1 ? '' : 's'}`, 'success');
+  };
+
+  const handleStartPlaylistBatch = async () => {
+    if (!playlistMeta || selectedIndices.size === 0 || batchStarting || batchId) return;
+
+    let targetId = null;
+    if (plTarget === 'new') {
+      const name = plNewName.trim();
+      if (!name) {
+        notify('Enter a name for the new playlist', 'error');
+        return;
+      }
+      try {
+        const created = await api.post('/playlists', { name });
+        targetId = created.data?.playlist?.id || null;
+        setPlPlaylists((current) => [...current, created.data?.playlist].filter(Boolean));
+        notify(`Playlist "${name}" created`, 'success');
+      } catch (err) {
+        notify(safeFetchError(err, 'Unable to create playlist.'), 'error');
+        return;
+      }
+    } else if (plTarget) {
+      targetId = Number(plTarget);
+    }
+
+    setBatchStarting(true);
+    try {
+      const res = await api.post('/playlist/download', {
+        url: playlistMeta.url || playlistUrl.trim(),
+        indices: [...selectedIndices].sort((a, b) => a - b),
+        quality: plQuality,
+        format: plFormat,
+        target_playlist_id: targetId,
+        sequential: plSequential,
+        fetch_transcripts: plFetchTranscripts,
+        transcript_folder: plTranscriptFolder.trim(),
+        transcripts_only: plTranscriptsOnly,
+      });
+      batchCompletedRef.current = 0;
+      stopPollingRef.current = false;
+      setBatchId(res.data.batch_id);
+      setBatch(null);
+      notify(
+        plTranscriptsOnly
+          ? `Transcript fetch started — ${res.data.task_count} video${res.data.task_count === 1 ? '' : 's'} queued (no download).`
+          : `Batch started — ${res.data.task_count} video${res.data.task_count === 1 ? '' : 's'} queued`
+            + (plSequential ? ' one by one' : '') + '.',
+        'success',
+      );
+    } catch (err) {
+      notify(safeFetchError(err, 'Unable to start playlist download.'), 'error');
+    } finally {
+      setBatchStarting(false);
+    }
+  };
+
+  const handleCancelBatch = async () => {
+    if (!batchId) return;
+    try {
+      await api.post(`/playlist/batches/${batchId}/cancel`);
+      notify('Cancelling remaining downloads…', 'info');
+    } catch (err) {
+      notify(safeFetchError(err, 'Unable to cancel batch.'), 'error');
+    }
+  };
+
+  const handleRetryBatch = async () => {
+    if (!batchId) return;
+    try {
+      await api.post(`/playlist/batches/${batchId}/retry`);
+      stopPollingRef.current = false;
+      notify('Re-queueing the failed videos…', 'info');
+    } catch (err) {
+      notify(safeFetchError(err, 'Unable to retry batch.'), 'error');
+    }
+  };
+
+  const resetPlaylistBatch = () => {
+    setBatchId(null);
+    setBatch(null);
+    stopPollingRef.current = false;
+    batchCompletedRef.current = 0;
+    setSelectedIndices(new Set());
+    setPlaylistMeta(null);
+    setPlaylistError('');
+    setPlaylistUrl('');
+    setRangeFrom('');
+    setRangeTo('');
+    setTypedSelection('');
+  };
+
+  useEffect(() => {
+    if (!batchId) return undefined;
+    let active = true;
+    let timer = null;
+    const poll = async () => {
+      if (stopPollingRef.current || !active) return;
+      try {
+        const res = await api.get(`/playlist/batches/${batchId}`);
+        if (!active) return;
+        const data = res.data || {};
+        setBatch(data);
+        if ((data.completed_count || 0) > batchCompletedRef.current) {
+          batchCompletedRef.current = data.completed_count;
+          if (onLibraryChanged) onLibraryChanged();
+        }
+        if (['completed', 'partial', 'cancelled'].includes(data.phase)) {
+          stopPollingRef.current = true;
+          setBatch((prev) => (prev ? { ...prev, finished: true } : prev));
+        } else {
+          timer = window.setTimeout(poll, 1500);
+        }
+      } catch {
+        if (!active) return;
+        timer = window.setTimeout(poll, 3000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [batchId, onLibraryChanged]);
+
+  const transcriptStatusLabel = (status) => {
+    const map = {
+      pending: 'Transcript queued',
+      fetching: 'Fetching transcript…',
+      saved: 'Transcript saved',
+      unavailable: 'No transcript',
+      error: 'Transcript error',
+      skipped: '',
+    };
+    return map[status] || '';
+  };
+
+  // --- Multi-link batch download handlers ---------------------------------
+  const multiUrlList = useMemo(
+    () => multiUrls.split('\n').map((line) => line.trim()).filter(Boolean),
+    [multiUrls],
+  );
+
+  const handleStartMultiBatch = async () => {
+    const urls = multiUrlList;
+    if (urls.length === 0 || multiStarting || multiBatchId) {
+      notify('Paste at least one URL', 'error');
+      return;
+    }
+    let targetId = null;
+    if (multiTarget === 'new') {
+      const name = multiNewName ? multiNewName.trim() : '';
+      if (!name) {
+        notify('Enter a name for the new playlist', 'error');
+        return;
+      }
+      try {
+        const created = await api.post('/playlists', { name });
+        targetId = created.data?.playlist?.id || null;
+        setPlPlaylists((current) => [...current, created.data?.playlist].filter(Boolean));
+        notify(`Playlist "${name}" created`, 'success');
+      } catch (err) {
+        notify(safeFetchError(err, 'Unable to create playlist.'), 'error');
+        return;
+      }
+    } else if (multiTarget) {
+      targetId = Number(multiTarget);
+    }
+
+    setMultiStarting(true);
+    try {
+      const res = await api.post('/multi-download', {
+        urls,
+        quality: multiQuality,
+        format: multiFormat,
+        target_playlist_id: targetId,
+        sequential: multiSequential,
+        fetch_transcripts: multiFetchTranscripts,
+        transcript_folder: multiFolder.trim(),
+        transcripts_only: multiTranscriptsOnly,
+      });
+      multiCompletedRef.current = 0;
+      multiStopPollingRef.current = false;
+      setMultiBatchId(res.data.batch_id);
+      setMultiBatch(null);
+      notify(
+        multiTranscriptsOnly
+          ? `Transcript fetch started for ${urls.length} link${urls.length === 1 ? '' : 's'} (no download).`
+          : `${urls.length} link${urls.length === 1 ? '' : 's'} queued`
+            + (multiSequential ? ' one by one' : '') + '.',
+        'success',
+      );
+    } catch (err) {
+      notify(safeFetchError(err, 'Unable to start multi-link batch.'), 'error');
+    } finally {
+      setMultiStarting(false);
+    }
+  };
+
+  const handleCancelMultiBatch = async () => {
+    if (!multiBatchId) return;
+    try {
+      await api.post(`/playlist/batches/${multiBatchId}/cancel`);
+      notify('Cancelling multi-link batch…', 'info');
+    } catch (err) {
+      notify(safeFetchError(err, 'Unable to cancel batch.'), 'error');
+    }
+  };
+
+  const resetMultiBatch = () => {
+    setMultiBatchId(null);
+    setMultiBatch(null);
+    multiStopPollingRef.current = false;
+    multiCompletedRef.current = 0;
+  };
+
+  useEffect(() => {
+    if (!multiBatchId) return undefined;
+    let active = true;
+    let timer = null;
+    const poll = async () => {
+      if (multiStopPollingRef.current || !active) return;
+      try {
+        const res = await api.get(`/playlist/batches/${multiBatchId}`);
+        if (!active) return;
+        const data = res.data || {};
+        setMultiBatch(data);
+        if ((data.completed_count || 0) > multiCompletedRef.current) {
+          multiCompletedRef.current = data.completed_count;
+          if (onLibraryChanged) onLibraryChanged();
+        }
+        if (['completed', 'partial', 'cancelled'].includes(data.phase)) {
+          multiStopPollingRef.current = true;
+          setMultiBatch((prev) => (prev ? { ...prev, finished: true } : prev));
+        } else {
+          timer = window.setTimeout(poll, 1500);
+        }
+      } catch {
+        if (!active) return;
+        timer = window.setTimeout(poll, 3000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [multiBatchId, onLibraryChanged]);
 
   const handleFetchMetadata = async () => {
     const trimmed = url.trim();
@@ -919,6 +1333,22 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
         return;
       }
       setTranscriptResult(data);
+      // Auto-save into the Transcripts page (General folder) so it persists.
+      const fetchedText = transcriptSegmentsToText(data.segments || []);
+      if (fetchedText) {
+        try {
+          await api.post('/transcript-saver', {
+            title: data.title || 'YouTube transcript',
+            text: fetchedText,
+            url: data.webpage_url || trimmed,
+            folder: '',
+          });
+          notify('Auto-saved to Transcripts', 'success');
+          if (onTranscriptsChanged) onTranscriptsChanged();
+        } catch (err) {
+          // non-fatal: transcript is still shown in the panel
+        }
+      }
     } catch (error) {
       setTranscriptError(safeFetchError(error, 'Unable to fetch transcript.'));
     } finally {
@@ -940,6 +1370,7 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
 
   return (
     <div className="page-shell">
+      <WelcomeQuote />
       <SectionHeader
         title="Download Video"
         subtitle="Paste a YouTube URL, process it, then choose to watch online or download the saved file."
@@ -985,6 +1416,10 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
               <Clipboard size={16} />
               {transcriptCopyStatus}
             </button>
+            <Link className="ghost-button" to="/transcripts" title="View all saved transcripts (fetched transcripts are auto-saved here)">
+              <BookOpenText size={16} />
+              View Transcripts
+            </Link>
           </div>
         </form>
 
@@ -1341,6 +1776,591 @@ function DownloadPage({ downloads, currentTaskId, onStartDownload, onStartSocial
           </div>
         )}
       </section>
+
+      {/* --- Multi-link batch download: paste many URLs at once --- */}
+      <section className="panel panel--form playlist-batch-panel">
+        <div className="panel__header panel__header--stacked">
+          <div>
+            <div className="section-eyebrow section-eyebrow--soft">Multi-link batch</div>
+            <h2 className="panel__title">Download Many Links at Once</h2>
+            <p className="panel__subtitle">
+              Paste as many URLs as you want (one per line, any platform — YouTube, Vimeo, Instagram…).
+              They go into the queue in the same order, one by one, with all the same options as the
+              playlist feature: auto-save into a playlist, auto-transcripts, and transcripts-only mode.
+            </p>
+          </div>
+          <span className="panel__badge panel__badge--soft">{multiUrlList.length} link{multiUrlList.length === 1 ? '' : 's'}</span>
+        </div>
+
+        <div className="download-form">
+          <div className="field field--full">
+            <label className="field__label" htmlFor="multi-urls">URLS — ONE PER LINE</label>
+            <textarea
+              id="multi-urls"
+              className="transcript-textarea"
+              rows={5}
+              value={multiUrls}
+              onChange={(event) => setMultiUrls(event.target.value)}
+              placeholder={'https://youtube.com/watch?v=...\nhttps://vimeo.com/123456\nhttps://www.youtube.com/shorts/...'}
+              spellCheck="false"
+            />
+          </div>
+
+          <div className="form-grid">
+            <div className="field">
+              <label className="field__label" htmlFor="multi-quality">QUALITY</label>
+              <select id="multi-quality" className="select" value={multiQuality} onChange={(event) => setMultiQuality(event.target.value)} disabled={multiTranscriptsOnly}>
+                {QUALITY_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{qualityLabel(option)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label className="field__label" htmlFor="multi-format">FORMAT</label>
+              <select id="multi-format" className="select" value={multiFormat} onChange={(event) => setMultiFormat(event.target.value)} disabled={multiTranscriptsOnly}>
+                {FORMAT_OPTIONS.map((option) => (
+                  <option key={option} value={option}>{option.toUpperCase()}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label className="field__label" htmlFor="multi-target">AUTO-SAVE INTO WHICH PLAYLIST?</label>
+              <select id="multi-target" className="select" value={multiTarget} onChange={(event) => setMultiTarget(event.target.value)} disabled={multiTranscriptsOnly}>
+                <option value="">None (just download)</option>
+                {plPlaylists.map((playlist) => (
+                  <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
+                ))}
+                <option value="new">＋ Create new playlist…</option>
+              </select>
+            </div>
+            {multiTarget === 'new' ? (
+              <div className="field">
+                <label className="field__label" htmlFor="multi-new-name">NEW PLAYLIST NAME</label>
+                <input
+                  id="multi-new-name"
+                  className="input"
+                  value={multiNewName}
+                  onChange={(event) => setMultiNewName(event.target.value)}
+                  placeholder="e.g. Study, Workout Mix…"
+                  maxLength={120}
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="playlist-batch-actions">
+            <label className="playlist-batch-seq">
+              <input type="checkbox" checked={multiSequential} onChange={(event) => setMultiSequential(event.target.checked)} disabled={multiTranscriptsOnly} />
+              <span>Download one by one (wait for each video to finish before the next)</span>
+            </label>
+            <label className="playlist-batch-seq playlist-batch-seq--transcripts">
+              <input type="checkbox" checked={multiFetchTranscripts} onChange={(event) => setMultiFetchTranscripts(event.target.checked)} disabled={multiTranscriptsOnly} />
+              <span>Also fetch YouTube auto transcript for each link</span>
+            </label>
+            <label className="playlist-batch-seq playlist-batch-seq--transcripts">
+              <input type="checkbox" checked={multiTranscriptsOnly} onChange={(event) => setMultiTranscriptsOnly(event.target.checked)} />
+              <span>Transcripts only — fetch directly from YouTube, no download, no Whisper</span>
+            </label>
+            {(multiFetchTranscripts || multiTranscriptsOnly) ? (
+              <div className="field playlist-batch-folder-field">
+                <label className="field__label" htmlFor="multi-folder">
+                  SAVE TRANSCRIPTS INTO FOLDER (optional)
+                </label>
+                <input
+                  id="multi-folder"
+                  className="input"
+                  value={multiFolder}
+                  onChange={(event) => setMultiFolder(event.target.value)}
+                  placeholder="e.g. Course Notes — leave empty for General (first come, first serve)"
+                  maxLength={120}
+                />
+              </div>
+            ) : null}
+            <button
+              className="primary-button"
+              type="button"
+              onClick={handleStartMultiBatch}
+              disabled={multiUrlList.length === 0 || multiStarting || !!multiBatchId}
+            >
+              {multiStarting ? <Loader2 className="spin" size={16} /> : multiTranscriptsOnly ? <BookOpenText size={16} /> : <Download size={16} />}
+              {multiStarting
+                ? 'Starting…'
+                : multiTranscriptsOnly
+                  ? `Fetch ${multiUrlList.length} transcript${multiUrlList.length === 1 ? '' : 's'} (no download)`
+                  : `Queue ${multiUrlList.length} link${multiUrlList.length === 1 ? '' : 's'}`}
+            </button>
+          </div>
+        </div>
+
+        {multiBatchId ? (
+          <div className="playlist-batch-progress">
+            <div className="download-card__title-row">
+              <div>
+                <h3 className="panel__title panel__title--tight">
+                  {multiBatch?.phase === 'completed'
+                    ? 'Batch complete ✓'
+                    : multiBatch?.phase === 'partial'
+                      ? 'Batch finished — some failed'
+                      : multiBatch?.phase === 'cancelled'
+                        ? 'Batch cancelled'
+                        : multiTranscriptsOnly ? 'Fetching transcripts…' : 'Downloading…'}
+                </h3>
+                <p className="panel__subtitle">
+                  {multiBatch
+                    ? multiBatch.transcripts_only
+                      ? `${multiBatch.completed_count || 0}/${multiBatch.total_count || 0} transcripts saved`
+                        + (multiBatch.failed_count ? ` · ${multiBatch.failed_count} unavailable` : '')
+                        + (multiBatch.transcript_folder ? ` → "${multiBatch.transcript_folder}"` : ' → General')
+                      : `${multiBatch.completed_count} of ${multiBatch.total_count} done`
+                        + (multiBatch.added_count ? ` · ${multiBatch.added_count} added to "${multiBatch.target_playlist_name || 'playlist'}"` : '')
+                        + (multiBatch.failed_count ? ` · ${multiBatch.failed_count} failed` : '')
+                        + (multiBatch.fetch_transcripts
+                          ? ` · ${multiBatch.transcripts_saved_count || 0}/${multiBatch.transcripts_total || 0} transcripts saved`
+                          : '')
+                    : 'Starting…'}
+                </p>
+              </div>
+              {multiBatch ? (
+                <div className="playlist-batch-progress__actions">
+                  {multiBatch.fetch_transcripts && (multiBatch.transcripts_saved_count || 0) > 0 ? (
+                    <Link
+                      className="ghost-button"
+                      to={multiBatch.transcript_folder
+                        ? `/transcripts?folder=${encodeURIComponent(multiBatch.transcript_folder)}`
+                        : '/transcripts'}
+                    >
+                      <BookOpenText size={16} />
+                      View {multiBatch.transcripts_saved_count} transcript{multiBatch.transcripts_saved_count === 1 ? '' : 's'}
+                    </Link>
+                  ) : null}
+                  {['running', 'cancelling'].includes(multiBatch.phase) ? (
+                    <button className="ghost-button" type="button" onClick={handleCancelMultiBatch}>
+                      <X size={16} /> Cancel batch
+                    </button>
+                  ) : null}
+                  {multiBatch.finished || ['completed', 'partial', 'cancelled'].includes(multiBatch.phase) ? (
+                    <button className="ghost-button" type="button" onClick={resetMultiBatch}>
+                      <Plus size={16} /> New batch
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            {multiBatch ? (
+              <>
+                <ProgressBar value={multiBatch.total_count ? (multiBatch.done_count / multiBatch.total_count) * 100 : 0} />
+                <div className="playlist-batch-tasks">
+                  {multiBatch.tasks.map((task) => (
+                    <div
+                      key={`${task.index}-${task.id || task.url}`}
+                      className={`playlist-batch-task playlist-batch-task--${task.status}`}
+                    >
+                      <span className="playlist-batch-task__index">#{task.index}</span>
+                      <span className="playlist-batch-task__title" title={task.title}>{task.title}</span>
+                      {multiBatch.transcripts_only ? (
+                        <span className={`playlist-batch-task__tflag playlist-batch-task__tflag--${task.transcript_status}`}
+                          title={task.transcript_error || transcriptStatusLabel(task.transcript_status)}>
+                          {task.transcript_status === 'saved' ? <CheckCircle2 size={13} /> : null}
+                          {task.transcript_status === 'unavailable' || task.transcript_status === 'error'
+                            ? <XCircle size={13} />
+                            : task.transcript_status === 'fetching'
+                              ? <Loader2 className="spin" size={13} />
+                              : null}
+                          {transcriptStatusLabel(task.transcript_status)}
+                        </span>
+                      ) : task.status === 'completed' ? (
+                        <span className="playlist-batch-task__flag">
+                          <CheckCircle2 size={14} />
+                          {task.added ? `In "${multiBatch.target_playlist_name || 'playlist'}"` : 'Downloaded'}
+                        </span>
+                      ) : task.status === 'error' || task.status === 'cancelled' ? (
+                        <span className="playlist-batch-task__flag playlist-batch-task__flag--error">
+                          <XCircle size={14} />
+                          {task.status === 'cancelled' ? 'Cancelled' : 'Failed'}
+                        </span>
+                      ) : (
+                        <span className="playlist-batch-task__flag">
+                          <Loader2 className="spin" size={14} /> {batchTaskStatusLabel(task.status)}
+                        </span>
+                      )}
+                      {(task.error && task.status === 'error') ? (
+                        <span className="playlist-batch-task__err" title={task.error}>{task.error}</span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="empty-state empty-state--compact">
+                <p>Waiting for the backend to start the queue…</p>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+
+      {/* --- Playlist batch download: range/specific videos from one link --- */}
+      <section className="panel panel--form playlist-batch-panel">
+        <div className="panel__header panel__header--stacked">
+          <div>
+            <div className="section-eyebrow section-eyebrow--soft">Playlist batch download</div>
+            <h2 className="panel__title">Download a Range from a Playlist</h2>
+            <p className="panel__subtitle">
+              Paste ONE playlist link — pick a range or tick specific videos. They download one by one into the
+              queue, and every finished video is saved automatically into a playlist you choose.
+            </p>
+          </div>
+          <span className="panel__badge panel__badge--soft">Batch</span>
+        </div>
+
+        <form
+          className="download-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            handleLoadPlaylist();
+          }}
+        >
+          <div className="field field--full">
+            <label className="field__label" htmlFor="playlist-batch-url">PLAYLIST LINK (ONLY THE LINK — NOT EACH VIDEO)</label>
+            <div className="playlist-batch-url-row">
+              <input
+                id="playlist-batch-url"
+                className="input"
+                value={playlistUrl}
+                onChange={(event) => {
+                  setPlaylistUrl(event.target.value);
+                  setPlaylistError('');
+                }}
+                placeholder="https://www.youtube.com/playlist?list=..."
+                autoComplete="off"
+                spellCheck="false"
+              />
+              <button className="ghost-button" type="submit" disabled={playlistLoading || !playlistUrl.trim()}>
+                {playlistLoading ? <Loader2 className="spin" size={16} /> : <ListVideo size={16} />}
+                {playlistLoading ? 'Loading…' : 'Load playlist'}
+              </button>
+            </div>
+            {playlistError ? <p className="download-card__error">{playlistError}</p> : null}
+          </div>
+        </form>
+
+        {playlistMeta?.is_playlist ? (
+          <div className="playlist-batch-body">
+            <div className="playlist-batch-summary">
+              <div className="playlist-batch-summary__text">
+                <strong>{playlistMeta.playlist_title}</strong>
+                <span className="playlist-batch-summary__meta">
+                  {playlistMeta.count} video{playlistMeta.count === 1 ? '' : 's'} found
+                  {playlistMeta.uploader ? ` · ${playlistMeta.uploader}` : ''}
+                </span>
+              </div>
+              <span className="status-pill status-pill--processing">{selectedIndices.size} selected</span>
+            </div>
+
+            <div className="playlist-batch-pick">
+              <div className="playlist-batch-pick__range">
+                <input
+                  className="input input--num"
+                  value={rangeFrom}
+                  onChange={(event) => setRangeFrom(event.target.value)}
+                  placeholder="From #"
+                  inputMode="numeric"
+                />
+                <span>to</span>
+                <input
+                  className="input input--num"
+                  value={rangeTo}
+                  onChange={(event) => setRangeTo(event.target.value)}
+                  placeholder="To #"
+                  inputMode="numeric"
+                />
+                <button className="ghost-button ghost-button--small" type="button" onClick={applyRangeSelection}>
+                  <ListOrdered size={14} /> Add range
+                </button>
+              </div>
+              <div className="playlist-batch-pick__typed">
+                <input
+                  className="input"
+                  value={typedSelection}
+                  onChange={(event) => setTypedSelection(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') applyTypedSelection();
+                  }}
+                  placeholder="Or type specific numbers: 1, 3, 5-8"
+                />
+                <button className="ghost-button ghost-button--small" type="button" onClick={applyTypedSelection}>Add</button>
+              </div>
+              <div className="playlist-batch-pick__actions">
+                <button className="ghost-button ghost-button--small" type="button" onClick={selectAllPlaylist} disabled={!playlistMeta.entries.length}>
+                  All
+                </button>
+                <button className="ghost-button ghost-button--small" type="button" onClick={clearPlaylistSelection} disabled={!selectedIndices.size}>
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            <div className="playlist-batch-list">
+              {playlistMeta.entries.map((entry) => {
+                const checked = selectedIndices.has(entry.index);
+                return (
+                  <label
+                    key={entry.id}
+                    className={`playlist-batch-row ${checked ? 'playlist-batch-row--checked' : ''}`}
+                  >
+                    <input type="checkbox" checked={checked} onChange={() => toggleIndex(entry.index)} />
+                    <span className="playlist-batch-row__index">#{entry.index}</span>
+                    <MediaThumb videoId={entry.id} title={entry.title} />
+                    <span className="playlist-batch-row__title" title={entry.title}>{entry.title}</span>
+                    {entry.duration_label ? <span className="playlist-batch-row__duration">{entry.duration_label}</span> : null}
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="form-grid">
+              <div className="field">
+                <label className="field__label" htmlFor="plb-quality">QUALITY</label>
+                <select id="plb-quality" className="select" value={plQuality} onChange={(event) => setPlQuality(event.target.value)}>
+                  {QUALITY_OPTIONS.map((option) => (
+                    <option key={option} value={option}>{qualityLabel(option)}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label className="field__label" htmlFor="plb-format">FORMAT</label>
+                <select id="plb-format" className="select" value={plFormat} onChange={(event) => setPlFormat(event.target.value)}>
+                  {FORMAT_OPTIONS.map((option) => (
+                    <option key={option} value={option}>{option.toUpperCase()}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label className="field__label" htmlFor="plb-target">AUTO-SAVE INTO WHICH PLAYLIST?</label>
+                <select id="plb-target" className="select" value={plTarget} onChange={(event) => setPlTarget(event.target.value)}>
+                  <option value="">None (just download)</option>
+                  {plPlaylists.map((playlist) => (
+                    <option key={playlist.id} value={String(playlist.id)}>{playlist.name}</option>
+                  ))}
+                  <option value="new">＋ Create new playlist…</option>
+                </select>
+              </div>
+              {plTarget === 'new' ? (
+                <div className="field">
+                  <label className="field__label" htmlFor="plb-new-name">NEW PLAYLIST NAME</label>
+                  <input
+                    id="plb-new-name"
+                    className="input"
+                    value={plNewName}
+                    onChange={(event) => setPlNewName(event.target.value)}
+                    placeholder="e.g. Study, Workout Mix, Road Trip…"
+                    maxLength={120}
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            <div className="playlist-batch-actions">
+              <label className="playlist-batch-seq">
+                <input type="checkbox" checked={plSequential} onChange={(event) => setPlSequential(event.target.checked)} />
+                <span>Download one by one (wait for each video to finish before the next)</span>
+              </label>
+              <label className="playlist-batch-seq playlist-batch-seq--transcripts">
+                <input type="checkbox" checked={plFetchTranscripts} onChange={(event) => setPlFetchTranscripts(event.target.checked)} />
+                <span>Also fetch YouTube auto transcript for each video (saved to Transcript Saver)</span>
+              </label>
+              <label className="playlist-batch-seq playlist-batch-seq--transcripts">
+                <input type="checkbox" checked={plTranscriptsOnly} onChange={(event) => setPlTranscriptsOnly(event.target.checked)} />
+                <span>Transcripts only — fetch directly from YouTube, no download, no Whisper</span>
+              </label>
+              {(plFetchTranscripts || plTranscriptsOnly) ? (
+                <div className="field playlist-batch-folder-field">
+                  <label className="field__label" htmlFor="plb-transcript-folder">
+                    SAVE TRANSCRIPTS INTO FOLDER (optional)
+                  </label>
+                  <input
+                    id="plb-transcript-folder"
+                    className="input"
+                    value={plTranscriptFolder}
+                    onChange={(event) => setPlTranscriptFolder(event.target.value)}
+                    placeholder="e.g. Calculus Lectures — leave empty for General (first come, first serve)"
+                    maxLength={120}
+                  />
+                </div>
+              ) : null}
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleStartPlaylistBatch}
+                disabled={selectedIndices.size === 0 || batchStarting || !!batchId}
+              >
+                {batchStarting ? <Loader2 className="spin" size={16} /> : plTranscriptsOnly ? <BookOpenText size={16} /> : <Download size={16} />}
+                {batchStarting
+                  ? 'Starting…'
+                  : plTranscriptsOnly
+                    ? `Fetch ${selectedIndices.size} transcript${selectedIndices.size === 1 ? '' : 's'} (no download)`
+                    : `Download ${selectedIndices.size} video${selectedIndices.size === 1 ? '' : 's'}`}
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {batchId ? (
+          <div className="playlist-batch-progress">
+            <div className="download-card__title-row">
+              <div>
+                <h3 className="panel__title panel__title--tight">
+                  {batch?.phase === 'completed'
+                    ? 'Batch complete ✓'
+                    : batch?.phase === 'partial'
+                      ? 'Batch finished — some videos failed'
+                      : batch?.phase === 'cancelled'
+                        ? 'Batch cancelled'
+                        : 'Downloading playlist…'}
+                </h3>
+                <p className="panel__subtitle">
+                  {batch
+                    ? batch.transcripts_only
+                      ? `${batch.completed_count || 0}/${batch.total_count || 0} transcripts saved`
+                        + (batch.failed_count ? ` · ${batch.failed_count} unavailable` : '')
+                        + (batch.transcript_folder ? ` → "${batch.transcript_folder}"` : ' → General')
+                      : `${batch.completed_count} of ${batch.total_count} done`
+                        + (batch.added_count ? ` · ${batch.added_count} added to "${batch.target_playlist_name || 'playlist'}"` : '')
+                        + (batch.failed_count ? ` · ${batch.failed_count} failed` : '')
+                        + (batch.fetch_transcripts
+                          ? ` · ${batch.transcripts_saved_count || 0}/${batch.transcripts_total || 0} transcripts saved`
+                            + (batch.transcript_folder ? ` to "${batch.transcript_folder}"` : ' to General')
+                          : '')
+                    : 'Starting…'}
+                </p>
+              </div>
+              {batch ? (
+                <div className="playlist-batch-progress__actions">
+                  {batch.fetch_transcripts ? (
+                    <Link
+                      className="ghost-button"
+                      to={
+                        batch.transcript_folder
+                          ? `/transcripts?folder=${encodeURIComponent(batch.transcript_folder)}`
+                          : '/transcripts'
+                      }
+                      title="Open the Transcripts page (auto-filtered to this batch's folder)"
+                    >
+                      <BookOpenText size={16} />
+                      {batch.transcripts_saved_count > 0
+                        ? `View ${batch.transcripts_saved_count} transcript${batch.transcripts_saved_count === 1 ? '' : 's'}`
+                        : 'View Transcripts page'}
+                    </Link>
+                  ) : null}
+                  {['running', 'cancelling'].includes(batch.phase) ? (
+                    <button className="ghost-button" type="button" onClick={handleCancelBatch}>
+                      <X size={16} /> Cancel batch
+                    </button>
+                  ) : null}
+                  {!batch.transcripts_only && batch.failed_count > 0 && ['completed', 'partial'].includes(batch.phase) ? (
+                    <button className="ghost-button" type="button" onClick={handleRetryBatch}>
+                      <RefreshCw size={16} /> Retry failed
+                    </button>
+                  ) : null}
+                  {batch.finished || ['completed', 'partial', 'cancelled'].includes(batch.phase) ? (
+                    <button className="ghost-button" type="button" onClick={resetPlaylistBatch}>
+                      <Plus size={16} /> New batch
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            {batch ? (
+              <>
+                <ProgressBar value={batch.total_count ? (batch.done_count / batch.total_count) * 100 : 0} />
+                <div className="playlist-batch-stats">
+                  <span>{batch.done_count}/{batch.total_count} finished</span>
+                  <span>{batch.added_count} added to playlist</span>
+                  <span>{batch.failed_count} failed</span>
+                  {batch.fetch_transcripts ? (
+                    <span>
+                      {batch.transcripts_saved_count}/{batch.transcripts_total} transcripts saved
+                      {batch.transcript_folder ? ` → "${batch.transcript_folder}"` : ' → General'}
+                    </span>
+                  ) : null}
+                </div>
+                {batch.fetch_transcripts
+                  && batch.transcripts_saved_count === 0
+                  && ['completed', 'partial', 'cancelled'].includes(batch.phase) ? (
+                  <p className="download-card__error">
+                    No transcripts were saved. The videos may have no YouTube captions (see “No transcript” on
+                    the rows below), or the backend needs a restart after applying patches. If captions exist,
+                    restart the backend and re-run the batch.
+                  </p>
+                ) : null}
+                <div className="playlist-batch-tasks">
+                  {batch.tasks.map((task) => (
+                    <div
+                      key={`${task.index}-${task.id}`}
+                      className={`playlist-batch-task playlist-batch-task--${task.status}`}
+                    >
+                      <span className="playlist-batch-task__index">#{task.index}</span>
+                      <span className="playlist-batch-task__title" title={task.title}>{task.title}</span>
+                      {batch.transcripts_only ? (
+                        <span className={`playlist-batch-task__tflag playlist-batch-task__tflag--${task.transcript_status}`}
+                          title={task.transcript_error || transcriptStatusLabel(task.transcript_status)}>
+                          {task.transcript_status === 'saved' ? <CheckCircle2 size={13} /> : null}
+                          {task.transcript_status === 'unavailable' || task.transcript_status === 'error'
+                            ? <XCircle size={13} />
+                            : task.transcript_status === 'fetching'
+                              ? <Loader2 className="spin" size={13} />
+                              : null}
+                          {transcriptStatusLabel(task.transcript_status)}
+                        </span>
+                      ) : task.status === 'completed' ? (
+                        <span className="playlist-batch-task__flag">
+                          <CheckCircle2 size={14} />
+                          {task.added ? `In "${batch.target_playlist_name || 'playlist'}"` : 'Downloaded'}
+                        </span>
+                      ) : task.status === 'error' || task.status === 'cancelled' ? (
+                        <span className="playlist-batch-task__flag playlist-batch-task__flag--error">
+                          <XCircle size={14} />
+                          {task.status === 'cancelled' ? 'Cancelled' : 'Failed'}
+                        </span>
+                      ) : (
+                        <span className="playlist-batch-task__flag">
+                          <Loader2 className="spin" size={14} /> {batchTaskStatusLabel(task.status)}
+                        </span>
+                      )}
+                      {task.transcript_status && task.transcript_status !== 'skipped' ? (
+                        <span
+                          className={`playlist-batch-task__tflag playlist-batch-task__tflag--${task.transcript_status}`}
+                          title={task.transcript_error || transcriptStatusLabel(task.transcript_status)}
+                        >
+                          {task.transcript_status === 'saved' ? <CheckCircle2 size={13} /> : null}
+                          {task.transcript_status === 'unavailable' || task.transcript_status === 'error'
+                            ? <XCircle size={13} />
+                            : task.transcript_status === 'fetching'
+                              ? <Loader2 className="spin" size={13} />
+                              : null}
+                          {transcriptStatusLabel(task.transcript_status)}
+                        </span>
+                      ) : null}
+                      {(task.error && task.status === 'error') || task.auto_add_error ? (
+                        <span className="playlist-batch-task__err" title={task.error || task.auto_add_error}>
+                          {task.error || task.auto_add_error}
+                        </span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="empty-state empty-state--compact">
+                <p>Waiting for the backend to start the queue…</p>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+
     </div>
   );
 }
@@ -1716,6 +2736,7 @@ function WhisperTranscriptionPage({ onNotify, files = [] }) {
           </div>
         ) : null}
       </section>
+
     </div>
   );
 }
@@ -1795,7 +2816,7 @@ function HistoryPage({ downloads, onDeleteDownload, onRetryDownload, onCancelDow
   );
 }
 
-function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist }) {
+function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddToPlaylist, filesReady }) {
   const [query, setQuery] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
   const [suppressedPreviewFilename, setSuppressedPreviewFilename] = useState('');
@@ -1806,7 +2827,24 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState(() => new Set());
-  const mediaFiles = useMemo(() => files.filter((file) => isMediaFile(file.filename || '')), [files]);
+  const [hidePlaylistFiles, setHidePlaylistFiles] = useState(true);
+  const [libraryFiles, setLibraryFiles] = useState(files);
+
+  useEffect(() => {
+    let active = true;
+    if (hidePlaylistFiles) {
+      api.get('/files?hide_playlist=1')
+        .then((res) => {
+          if (active) setLibraryFiles(Array.isArray(res.data?.files) ? res.data.files : files);
+        })
+        .catch(() => { if (active) setLibraryFiles(files); });
+    } else {
+      setLibraryFiles(files);
+    }
+    return () => { active = false; };
+  }, [hidePlaylistFiles, files]);
+
+  const mediaFiles = useMemo(() => libraryFiles.filter((file) => isMediaFile(file.filename || '')), [libraryFiles]);
 
   const toggleSelectionMode = useCallback(() => {
     setSelectionMode((current) => {
@@ -2060,6 +3098,14 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
           />
         </div>
         <div className="toolbar-actions">
+          <label className="playlist-batch-seq" title="Files already in a playlist live there — hide them here to avoid duplicates">
+            <input
+              type="checkbox"
+              checked={hidePlaylistFiles}
+              onChange={(event) => setHidePlaylistFiles(event.target.checked)}
+            />
+            <span>Hide playlist files</span>
+          </label>
           {selectionMode ? (
             <>
               <button
@@ -2184,7 +3230,20 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
       ) : null}
 
       <section className="panel panel--list">
-        {filtered.length === 0 ? (
+        {!filesReady && filtered.length === 0 ? (
+          <div className="library-grid" aria-busy="true">
+            {[0, 1, 2, 3, 4, 5].map((i) => (
+              <div key={i} className="skeleton-card">
+                <Skeleton className="skeleton-thumb" />
+                <div className="skeleton-lines">
+                  <Skeleton />
+                  <Skeleton />
+                  <Skeleton />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : filtered.length === 0 ? (
           <div className="empty-state">
             <LibraryBig size={32} />
             <p>Your library is empty.</p>
@@ -2212,9 +3271,10 @@ function LibraryPage({ files, onDeleteFile, onRefreshFiles, onClearFiles, onAddT
   );
 }
 
-function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
+function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme, transcriptCount, clipsCount }) {
   const activeDownloads = downloads.filter((item) => ACTIVE_STATUSES.has(item.status)).length;
   const themeIsDark = theme === 'dark';
+  const animatedBytes = useCountUp(storageBytes ?? 0);
 
   return (
     <aside className="sidebar">
@@ -2273,6 +3333,18 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
           <Music2 size={18} />
           <span>Playlist</span>
         </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/transcripts" end>
+          <BookOpenText size={18} />
+          <span>Transcripts</span>
+          {transcriptCount > 0 ? <span className="nav-link__badge">{transcriptCount}</span> : null}
+        </NavLink>
+
+        <NavLink className={({ isActive }) => `nav-link ${isActive ? 'nav-link--active' : ''}`} to="/clips" end>
+          <Scissors size={18} />
+          <span>Clips</span>
+          {clipsCount > 0 ? <span className="nav-link__badge">{clipsCount}</span> : null}
+        </NavLink>
       </nav>
 
       <div className="sidebar__footer">
@@ -2282,18 +3354,47 @@ function Sidebar({ downloads, files, storageBytes, theme, onToggleTheme }) {
         </button>
         <div className="usage-card">
           <div className="usage-card__label">Storage</div>
-          <div className="usage-card__value">{storageBytes === null ? 'Loading...' : formatBytes(storageBytes)}</div>
+          <div className="usage-card__value">
+            {storageBytes === null ? 'Loading...' : formatBytes(Math.round(animatedBytes))}
+          </div>
         </div>
       </div>
     </aside>
   );
 }
 
+function useCountUp(target, duration = 700) {
+  const [value, setValue] = useState(target);
+  const prevRef = useRef(target);
+  useEffect(() => {
+    const from = prevRef.current;
+    const to = Number(target) || 0;
+    if (from === to) return undefined;
+    const start = performance.now();
+    let raf;
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setValue(from + (to - from) * eased);
+      if (t < 1) {
+        raf = requestAnimationFrame(tick);
+      } else {
+        prevRef.current = to;
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target, duration]);
+  return value;
+}
+
 export default function App() {
   const [downloads, setDownloads] = useState([]);
   const [files, setFiles] = useState([]);
+  const [filesReady, setFilesReady] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [downloadNotification, setDownloadNotification] = useState(null);
+  const [celebrateId, setCelebrateId] = useState(0);
   const [accessPassword, setAccessPassword] = useState('');
   const [accessError, setAccessError] = useState('');
   const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
@@ -2308,12 +3409,37 @@ export default function App() {
   const notifiedDownloadedRef = useRef(new Set());
   const previousStatusesRef = useRef(new Map());
   const statusTrackerReadyRef = useRef(false);
+  const [transcriptCount, setTranscriptCount] = useState(0);
+  const [clipsCount, setClipsCount] = useState(0);
+
+  const refreshClipsCount = useCallback(async () => {
+    try {
+      const res = await api.get('/clips');
+      setClipsCount(Array.isArray(res.data?.clips) ? res.data.clips.length : 0);
+    } catch {
+      // keep previous
+    }
+  }, []);
+
+  const refreshTranscriptCount = useCallback(async () => {
+    try {
+      const res = await api.get('/transcript-saver');
+      setTranscriptCount(Array.isArray(res.data?.transcripts) ? res.data.transcripts.length : 0);
+    } catch {
+      // backend not reachable yet — keep previous count
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshTranscriptCount();
+    refreshClipsCount();
+  }, [refreshTranscriptCount, refreshClipsCount]);
   // use module-level `isMobileDevice` defined above so components declared earlier can reference it
   const [currentTaskId, setCurrentTaskId] = useState(null);
 
-  const pushToast = useCallback((message, type = 'info', duration = 3600) => {
+  const pushToast = useCallback((message, type = 'info', duration = 3600, action = null) => {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setToasts((current) => [...current, { id, message, type }].slice(-4));
+    setToasts((current) => [...current, { id, message, type, action }].slice(-4));
     const timer = window.setTimeout(() => {
       setToasts((current) => current.filter((toast) => toast.id !== id));
     }, duration);
@@ -2357,6 +3483,7 @@ export default function App() {
     try {
       const response = await api.get('/files');
       setFiles(Array.isArray(response.data?.files) ? response.data.files : []);
+      setFilesReady(true);
     } catch {
       // polling should stay quiet on transient failures
     }
@@ -2374,8 +3501,10 @@ export default function App() {
   }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
-    if (!authReady || !isUnlocked || !activeDownloadCount) return undefined;
+    if (!authReady || !isUnlocked) return undefined;
 
+    // Poll downloads + files while unlocked so the download dock and badges
+    // stay accurate even for downloads started elsewhere (e.g. playlist batches).
     const downloadTimer = window.setInterval(() => {
       refreshDownloads();
       refreshFiles();
@@ -2383,7 +3512,7 @@ export default function App() {
     return () => {
       window.clearInterval(downloadTimer);
     };
-  }, [authReady, isUnlocked, activeDownloadCount, refreshDownloads, refreshFiles]);
+  }, [authReady, isUnlocked, refreshDownloads, refreshFiles]);
 
   useEffect(() => {
     if (isMobileDevice) {
@@ -2426,6 +3555,8 @@ export default function App() {
       if (previousStatus !== 'completed' && item.status === 'completed' && item.filename) {
         const isRecentlyCompleted = item.completed_at && (Date.now() / 1000 - item.completed_at) < 300; // 5 minutes
         if (isRecentlyCompleted) {
+          // Celebration confetti for each freshly completed download.
+          setCelebrateId((id) => id + 1);
           const isTemporaryInstagramDownload = String(item.filename || '').replace(/\\/g, '/').includes('/_instagram_temp/');
           pushToast(
             isTemporaryInstagramDownload ? 'Instagram post saved temporarily' : 'Video saved to your Library',
@@ -2631,6 +3762,66 @@ export default function App() {
 
   const navigate = useNavigate();
 
+  // --- Global UI: command palette, shortcuts, scroll helpers -------------
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [showScrollTop, setShowScrollTop] = useState(false);
+
+  const isTypingTarget = (event) => {
+    const target = event?.target;
+    return !!target && (
+      target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
+    );
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      // Ctrl/Cmd+K — command palette (works even while typing)
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setPaletteOpen((v) => !v);
+        return;
+      }
+      if (isTypingTarget(event)) return;
+      if (event.key === '?') {
+        event.preventDefault();
+        setShortcutsOpen((v) => !v);
+        return;
+      }
+      if (paletteOpen) return;
+      const pageKeys = { d: '/download', t: '/transcripts', p: '/playlist', l: '/library', h: '/history', w: '/whisper', a: '/extract-audio' };
+      const path = pageKeys[event.key.toLowerCase()];
+      if (path) {
+        const active = document.activeElement;
+        const inNav = active && active.closest && active.closest('a, button, [role="button"]');
+        if (!inNav) navigate(path);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [navigate, paletteOpen]);
+
+  // Reset the main scroll when changing pages, and track it for jump-to-top.
+  const location = useLocation();
+  useEffect(() => {
+    const stage = document.querySelector('.main-stage');
+    if (stage) stage.scrollTop = 0;
+  }, [location.pathname]);
+
+  useEffect(() => {
+    const stage = document.querySelector('.main-stage');
+    if (!stage) return undefined;
+    const onScroll = () => setShowScrollTop(stage.scrollTop > 500);
+    stage.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => stage.removeEventListener('scroll', onScroll);
+  }, [location.pathname]);
+
+  const scrollMainToTop = () => {
+    const stage = document.querySelector('.main-stage');
+    if (stage) stage.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const openDownloadFromHistory = useCallback(({ url, quality = 'best', format = 'mp4' }) => {
     if (!url) return;
 
@@ -2689,18 +3880,20 @@ export default function App() {
 
   return (
     <div className={`app-shell ${!authReady || !isUnlocked ? 'app-shell--locked' : ''}`}>
-      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} />
+      <Sidebar downloads={downloads} files={files} storageBytes={storageBytes} theme={theme} onToggleTheme={toggleTheme} transcriptCount={transcriptCount} clipsCount={clipsCount} />
 
       <main className="main-stage">
         <Routes>
           <Route path="/" element={<Navigate to="/about" replace />} />
           <Route path="/about" element={<AboutPage />} />
-          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
+          <Route path="/download" element={<DownloadPage downloads={downloads} currentTaskId={currentTaskId} onStartDownload={startDownload} onStartSocialDownload={startSocialDownload} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onNotify={pushToast} onLibraryChanged={refreshFiles} onTranscriptsChanged={refreshTranscriptCount} />} />
           <Route path="/history" element={<HistoryPage downloads={downloads} onDeleteDownload={deleteDownload} onRetryDownload={retryDownload} onCancelDownload={cancelDownload} onRefreshDownloads={refreshDownloads} onClearDownloads={clearDownloads} onProcessFromHistory={reprocessFromHistory} />} />
           <Route path="/whisper" element={<WhisperTranscriptionPage onNotify={pushToast} files={files} />} />
           <Route path="/extract-audio" element={<AudioExtractorPage files={files} onNotify={pushToast} />} />
-          <Route path="/library" element={<LibraryPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
-          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} />} />
+          <Route path="/library" element={<LibraryPage files={files} filesReady={filesReady} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onClearFiles={clearFiles} onAddToPlaylist={addToPlaylist} />} />
+          <Route path="/playlist" element={<PlaylistPage files={files} onNotify={pushToast} onLibraryChanged={refreshFiles} />} />
+          <Route path="/transcripts" element={<TranscriptsPage onNotify={pushToast} onTranscriptsChanged={refreshTranscriptCount} />} />
+          <Route path="/clips" element={<ClipsPage files={files} onNotify={pushToast} onClipsChanged={refreshClipsCount} />} />
           <Route path="/photos" element={<PhotosPage files={files} onDeleteFile={deleteFile} onRefreshFiles={refreshFiles} onNotify={pushToast} />} />
           <Route path="*" element={<Navigate to="/download" replace />} />
         </Routes>
@@ -2730,7 +3923,10 @@ export default function App() {
           </div>
         </>
       ) : null}
-      <ToastStack toasts={toasts} />
+      <ToastStack
+        toasts={toasts}
+        onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}
+      />
 
       {playlistPickerRequest ? (
         <PlaylistPicker
@@ -2748,6 +3944,24 @@ export default function App() {
           onChangePassword={setAccessPassword}
           onSubmit={handleUnlockSubmit}
         />
+      ) : null}
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        navigate={navigate}
+        downloads={downloads}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+      />
+      <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      <DownloadDock downloads={downloads} onCancel={cancelDownload} />
+      <ConfettiBurst burstId={celebrateId} />
+
+      {showScrollTop ? (
+        <button className="scroll-top-btn" type="button" onClick={scrollMainToTop} title="Scroll to top" aria-label="Scroll to top">
+          <ArrowUp size={18} />
+        </button>
       ) : null}
     </div>
   );
