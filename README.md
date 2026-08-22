@@ -67,6 +67,12 @@ Cookie files must stay local:
 - `backend/instagram_cookies.txt`
 - `backend/cookies.txt`
 
+For YouTube members-only/private videos, the backend also tries local browser
+cookies automatically when no cookie file is present, and when a YouTube 403
+stream retry is needed. By default it tries `firefox,chrome,edge,brave,opera`.
+Override this with `YOUTUBE_COOKIES_BROWSER=firefox,chrome` or disable it with
+`YOUTUBE_COOKIES_BROWSER=off`.
+
 ## Final Checks
 
 ```bash

@@ -23,11 +23,13 @@ from services.yt_dlp_options import (
     add_generic_impersonation,
     apply_reliable_ytdlp_options,
     cookiefile_report,
+    is_youtube_url,
     is_instagram_url,
     instagram_error_help,
     pretty_cookie_summary,
     social_cookies_browsers,
     validate_cookiefile_for_ytdlp,
+    youtube_cookies_browsers,
 )
 
 # Dictionary to hold the download progress of tasks
@@ -128,6 +130,7 @@ def _categorize_error(message: str) -> str:
         "connection aborted", "network is unreachable", "http error 5", "503", "502", "504",
         "fragment", "incomplete read",
     ]
+    forbidden_markers = ["http error 403", "403: forbidden", "forbidden", "unable to download video data"]
     auth_markers = [
         "sign in", "login", "cookies", "private video", "members-only", "members only",
         "join this channel", "permission", "not authorized", "account", "subscriber-only",
@@ -141,6 +144,8 @@ def _categorize_error(message: str) -> str:
         return "timeout"
     if any(marker in text for marker in bot_markers):
         return "bot_check"
+    if any(marker in text for marker in forbidden_markers):
+        return "forbidden"
     if any(marker in text for marker in transient_markers):
         return "network"
     if any(marker in text for marker in auth_markers):
@@ -155,7 +160,7 @@ def _categorize_error(message: str) -> str:
 
 
 def _is_retryable_error(category: str) -> bool:
-    return category in {"network", "timeout", "unknown"}
+    return category in {"network", "timeout", "forbidden", "unknown"}
 
 
 def _queue_position(task_id: str) -> int | None:
@@ -449,8 +454,9 @@ def _start_download_watchdog(task_id: str, url: str) -> tuple[Event, Thread]:
                 clean_error = (
                     f"Startup timeout: yt-dlp did not start media transfer within "
                     f"{YTDLP_STARTUP_TIMEOUT_SECONDS}s. This usually means YouTube auth/cookies, "
-                    "bot check, network, or player extraction is stuck. Try refreshing youtube_cookies.txt "
-                    "from the same browser where the members-only video plays, then retry."
+                    "bot check, network, or player extraction is stuck. Keep a logged-in supported browser "
+                    "available for automatic cookie fallback, or refresh youtube_cookies.txt from the "
+                    "browser/profile where the members-only video plays."
                 )
                 task = download_tasks.get(task_id)
                 if task and task.get("status") not in TERMINAL_STATUSES:
@@ -638,6 +644,73 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
     else:
         ydl_opts["merge_output_format"] = "mp4"
 
+    def _youtube_403_retry_options(browser: str | None = None) -> dict:
+        retry_opts = dict(ydl_opts)
+        retry_opts["continuedl"] = False
+        retry_opts["retries"] = max(5, int(retry_opts.get("retries") or 0))
+        retry_opts["fragment_retries"] = max(5, int(retry_opts.get("fragment_retries") or 0))
+        retry_opts["http_chunk_size"] = min(
+            int(retry_opts.get("http_chunk_size") or 10 * 1024 * 1024),
+            10 * 1024 * 1024,
+        )
+
+        extractor_args = dict(retry_opts.get("extractor_args") or {})
+        youtube_args = dict(extractor_args.get("youtube") or {})
+        youtube_args["player_client"] = ["web_safari", "mweb", "web_creator"]
+        extractor_args["youtube"] = youtube_args
+        retry_opts["extractor_args"] = extractor_args
+
+        if browser:
+            retry_opts.pop("cookiefile", None)
+            retry_opts["cookiesfrombrowser"] = (browser, None, None, None)
+
+        if format_ext != "mp3":
+            if quality in ("best", ""):
+                retry_opts["format"] = "bestvideo*+bestaudio/best"
+            else:
+                retry_opts["format"] = f"bestvideo*[height<={quality}]+bestaudio/best[height<={quality}]/best"
+            retry_opts["merge_output_format"] = "mp4"
+        return retry_opts
+
+    def _run_youtube_403_retry(clean_error: str) -> str | None:
+        if not is_youtube_url(url) or _categorize_error(clean_error) != "forbidden":
+            return clean_error
+
+        retry_profiles: list[tuple[str, dict]] = [
+            ("alternate web clients", _youtube_403_retry_options()),
+        ]
+        for browser in youtube_cookies_browsers():
+            retry_profiles.append((f"{browser} browser cookies", _youtube_403_retry_options(browser)))
+
+        for label, retry_opts in retry_profiles:
+            retry_stop: Event | None = None
+            try:
+                print(f"[download] YouTube 403 detected; retrying with {label}", flush=True)
+                _set_task_message(task_id, f"YouTube returned 403. Retrying with {label}...")
+                retry_stop, _retry_thread = _start_download_watchdog(task_id, url)
+                with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
+                    info = ydl_retry.extract_info(url, download=True)
+                    retry_stop.set()
+                    if not info or not isinstance(info, dict):
+                        raise RuntimeError("YouTube retry did not return media info.")
+                    download_tasks[task_id]["title"] = info.get("title", "Unknown")
+                    download_tasks[task_id]["video_id"] = info.get("id")
+                    if download_tasks[task_id].get("status") == "cancelled":
+                        return None
+                    if download_tasks[task_id].get("abort_requested") or download_tasks[task_id].get("status") == "error":
+                        return None
+                    time.sleep(0.5)
+                    _mark_completed(task_id, ydl_retry, info, format_ext)
+                    print(f"[download] completed after YouTube 403 retry ({label}) - {download_tasks[task_id].get('filename')}", flush=True)
+                    return None
+            except Exception as retry_error:
+                if retry_stop:
+                    retry_stop.set()
+                clean_error = _clean(str(retry_error))
+                print(f"[download] YouTube 403 retry with {label} failed - {clean_error}", flush=True)
+
+        return clean_error
+
     try:
         validate_cookiefile_for_ytdlp(url)
         print(
@@ -715,6 +788,11 @@ def start_download_sync(url: str, task_id: str, quality: str, format_ext: str):
 
         clean_error = _clean(str(e))
         print(f"[download] error - {clean_error}", flush=True)
+
+        youtube_retry_error = _run_youtube_403_retry(clean_error)
+        if youtube_retry_error is None:
+            return
+        clean_error = youtube_retry_error
 
         # Instagram blocks media without login. If we haven't used any cookies
         # yet (no cookie file, no browser cookies), retry once pulling cookies

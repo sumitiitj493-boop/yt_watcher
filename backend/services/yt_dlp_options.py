@@ -30,6 +30,7 @@ YTDLP_EXTRACTOR_RETRIES = max(0, int(os.environ.get("YTDLP_EXTRACTOR_RETRIES", "
 YTDLP_RETRIES = max(0, int(os.environ.get("YTDLP_RETRIES", "3") or "3"))
 YTDLP_FRAGMENT_RETRIES = max(0, int(os.environ.get("YTDLP_FRAGMENT_RETRIES", "3") or "3"))
 YTDLP_STARTUP_TIMEOUT_SECONDS = max(0, int(os.environ.get("YTDLP_STARTUP_TIMEOUT_SECONDS", "180") or "180"))
+YTDLP_YOUTUBE_HTTP_CHUNK_MB = max(0, int(os.environ.get("YTDLP_YOUTUBE_HTTP_CHUNK_MB", "10") or "10"))
 
 YOUTUBE_AUTH_COOKIE_NAMES = {
     "SID",
@@ -107,6 +108,19 @@ def social_cookies_browsers() -> list[str]:
     (comma-separated, e.g. ``chrome,edge,firefox``)."""
     raw = os.environ.get("SOCIAL_COOKIES_BROWSER", "").strip()
     if not raw:
+        return []
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def youtube_cookies_browsers() -> list[str]:
+    """Browsers to pull YouTube cookies from when no usable file is present.
+
+    Set YOUTUBE_COOKIES_BROWSER=off to disable this. Firefox is tried first
+    because yt-dlp can usually read it more reliably than Chromium profiles on
+    current Windows installs.
+    """
+    raw = os.environ.get("YOUTUBE_COOKIES_BROWSER", "firefox,chrome,edge,brave,opera").strip()
+    if raw.lower() in {"", "off", "none", "false", "0"}:
         return []
     return [part.strip().lower() for part in raw.split(",") if part.strip()]
 
@@ -342,6 +356,23 @@ def apply_cookiesfrombrowser(ydl_opts: dict[str, Any], url: str) -> dict[str, An
     return ydl_opts
 
 
+def apply_youtube_auth_options(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+    """Authentication helpers for YouTube URLs.
+
+    Prefer an uploaded Netscape cookie file when present. If there is no cookie
+    file, fall back to the local logged-in browser profile so users do not need
+    to keep exporting cookies for ordinary authenticated downloads.
+    """
+    if not is_youtube_url(url):
+        return ydl_opts
+    apply_cookiefile(ydl_opts, url)
+    if "cookiefile" not in ydl_opts:
+        browsers = youtube_cookies_browsers()
+        if browsers:
+            ydl_opts["cookiesfrombrowser"] = (browsers[0], None, None, None)
+    return ydl_opts
+
+
 def apply_social_auth_options(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
     """Authentication helpers for non-YouTube (Instagram / social) URLs."""
     if is_youtube_url(url):
@@ -396,8 +427,10 @@ def apply_youtube_runtime_options(ydl_opts: dict[str, Any], url: str) -> dict[st
             [component.strip() for component in remote_components.split(",") if component.strip()],
         )
 
-    configured_clients = os.environ.get("YTDLP_YOUTUBE_PLAYER_CLIENTS", "").strip()
-    if configured_clients:
+    # yt-dlp's default TV fallback can extract media URLs that later fail with
+    # HTTP 403 for authenticated/member videos. Exclude it unless overridden.
+    configured_clients = os.environ.get("YTDLP_YOUTUBE_PLAYER_CLIENTS", "default,-tv_downgraded").strip()
+    if configured_clients.lower() not in {"", "off", "none", "false", "0"}:
         _merge_extractor_args(
             ydl_opts,
             "youtube",
@@ -442,7 +475,9 @@ def apply_reliable_ytdlp_options(ydl_opts: dict[str, Any], url: str) -> dict[str
     add_generic_impersonation(ydl_opts)
     apply_youtube_runtime_options(ydl_opts, url)
     if is_youtube_url(url):
-        apply_cookiefile(ydl_opts, url)
+        if YTDLP_YOUTUBE_HTTP_CHUNK_MB > 0:
+            ydl_opts.setdefault("http_chunk_size", YTDLP_YOUTUBE_HTTP_CHUNK_MB * 1024 * 1024)
+        apply_youtube_auth_options(ydl_opts, url)
     else:
         apply_social_auth_options(ydl_opts, url)
     return ydl_opts

@@ -895,8 +895,9 @@ def _start_audio_download_watchdog(job: dict | None, url: str) -> Event:
             if YTDLP_STARTUP_TIMEOUT_SECONDS and elapsed >= YTDLP_STARTUP_TIMEOUT_SECONDS:
                 reason = (
                     f"Audio startup timeout: yt-dlp did not start audio transfer within "
-                    f"{YTDLP_STARTUP_TIMEOUT_SECONDS}s. Refresh youtube_cookies.txt from the browser "
-                    "where the members-only video plays, then retry."
+                    f"{YTDLP_STARTUP_TIMEOUT_SECONDS}s. Keep a logged-in supported browser available "
+                    "for automatic cookie fallback, or refresh youtube_cookies.txt from the browser/profile "
+                    "where the members-only video plays."
                 )
                 job.update({
                     "status": "error",
